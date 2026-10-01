@@ -50,7 +50,7 @@ Do not commit proprietary game assets, game binaries, runtime DLLs, headset data
 
 Track the initial bringup in [`issues/README.md`](issues/README.md):
 
-1. [#001 — Reproduce the x86 build](issues/open/001-reproduce-x86-build.md). The local `git submodule` command currently fails inside Git's Cygwin helper.
+1. [#001 — Reproduce the x86 build (closed)](issues/closed/001-reproduce-x86-build.md). Win32 Debug and Release ASI builds now succeed with VS 2026 MSBuild.
 2. [#002 — Record the flat-screen baseline](issues/open/002-flat-screen-baseline.md).
 3. [#003 — Map camera and rendering hooks](issues/open/003-map-rendering-hooks.md).
 4. [#004 — Select an OpenXR graphics bridge](issues/open/004-select-openxr-bridge.md).
