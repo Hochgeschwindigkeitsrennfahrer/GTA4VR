@@ -22,6 +22,7 @@ Track work in `issues/open/` and `issues/closed/` using `issues/README.md`. Star
 4. For local deployment, `premake5.lua` reads ignored `.env` with `GTAIV_DIR` pointing to the folder containing `GTAIV.exe`. It copies only the built ASI when the target plugin already exists. Back up that plugin and verify the target path before enabling deployment.
 5. Test flat-screen behavior after every rendering or camera change. Add focused automated checks for deterministic math or lifecycle state; verify headset behavior manually with a recorded runtime/headset configuration.
 6. Include in each change report: what changed, build/test results, game/runtime versions when relevant, observed frame-time data if performance is claimed, and remaining limitations.
+7. To launch this Steam Complete Edition install for runtime tests, run `steam.exe -applaunch 12210` outside the restricted command sandbox or start `GTAIV/PlayGTAIV.exe` directly. Both routes have worked, and either can exit intermittently during startup. Verify that `GTAIV.exe` appears and remains responsive; `PlayGTAIV.exe` or Rockstar Launcher alone does not establish success. Do not launch a second copy while `GTAIV.exe` is running.
 
 ## Safety and distribution
 

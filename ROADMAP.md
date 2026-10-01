@@ -4,7 +4,7 @@
 
 Add full 6DOF **single-player VR mode** to GTA IV: The Complete Edition using this FusionFix fork as the integration point. GTA IV, The Lost and Damned, and The Ballad of Gay Tony should be tracked separately; the first playable target is GTA IV free roam.
 
-This is a plan, not a claim that VR already works. The repository currently builds a 32-bit FusionFix ASI through `premake5.bat` and `premake5.lua`. The local Steam install has `GTAIV/GTAIV.exe`, but no VR runtime, headset, successful build, or in-game behavior has been verified for this fork. The existing change to `readme.md` identifies the fork's purpose and should be preserved.
+This is a plan, not a claim that VR already works. The repository builds a 32-bit FusionFix ASI through `premake5.bat` and `premake5.lua`. Issues [#001](issues/closed/001-reproduce-x86-build.md) and [#002](issues/closed/002-flat-screen-baseline.md) record successful x86 builds and a flat-screen GTA IV free-roam baseline. No OpenXR runtime, headset image, or VR gameplay has been verified for this fork. Preserve the existing change to `readme.md`.
 
 ## Working loop
 
@@ -52,9 +52,11 @@ Track the initial bringup in [`issues/README.md`](issues/README.md):
 
 1. [#001 — Reproduce the x86 build (closed)](issues/closed/001-reproduce-x86-build.md). Win32 Debug and Release ASI builds now succeed with VS 2026 MSBuild.
 2. [#002 — Record the flat-screen baseline (closed)](issues/closed/002-flat-screen-baseline.md). GTA IV free roam passes with the local ASI in borderless D3D9 mode.
-3. [#003 — Map camera and rendering hooks](issues/open/003-map-rendering-hooks.md).
+3. [#003 — Map camera and rendering hooks (closed)](issues/closed/003-map-rendering-hooks.md). A one-frame two-view test built separate G-buffer, lighting, and DrawScene command lists with distinct viewport snapshots after one observed game-process update; G-buffer and DrawScene commands for both views executed on the render thread. This is the measured scene-command boundary, not a headset image.
 4. [#004 — Select an OpenXR graphics bridge](issues/open/004-select-openxr-bridge.md).
 5. [#005 — Add opt-in OpenXR initialization](issues/open/005-openxr-initialization.md).
+6. [#006 — Route two eye views with safe visibility and targets](issues/open/006-eye-visibility-and-targets.md). Main-world culling ran only once in #003's test; conservative or independent per-eye visibility, target routing, and pixel verification remain required.
+7. [#007 — Attribute UI and post-processing draw order](issues/open/007-ui-composition-order.md). Exact HUD, subtitle, phone, radar, and map pixel order remains unmeasured.
 
 ## References
 

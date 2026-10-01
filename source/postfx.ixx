@@ -11,6 +11,7 @@ import d3dx9_43;
 import natives;
 import settings;
 import shaders;
+import vrtrace;
 
 #define IDR_FXAA                                 101
 #define IDR_SMAA                                 102
@@ -1059,6 +1060,7 @@ private:
 
     static void NewPostFX()
     {
+        VRTrace::Event("postfx_begin");
         IDirect3DPixelShader9* oldps = 0;
         IDirect3DVertexShader9* oldvs = 0;
         IDirect3DDevice9* pDevice = rage::grcDevice::GetD3DDevice();
@@ -1140,6 +1142,7 @@ private:
         PostFxResources.textureRead = nullptr;
         PostFxResources.renderTargetSurf = nullptr;
         PostFxResources.surfaceRead = nullptr;
+        VRTrace::Event("postfx_end");
     }
 
     static HRESULT PostFx3(LPDIRECT3DDEVICE9 pDevice, IDirect3DPixelShader9* pShader, IDirect3DVertexShader9* vShader)
@@ -1684,6 +1687,7 @@ private:
     static inline injector::hook_back<void(__fastcall*)(void*, void*, int, int, int)> hbDrawCallPostFX;
     static void __fastcall DrawCallPostFX(void* _this, void* edx, int a2, int a3, int a4)
     {
+        VRTrace::Event("postfx_draw_call");
         bInsteadDrawPrimitivePostFX = true;
         hbDrawCallPostFX.fun(_this, edx, a2, a3, a4);
         bInsteadDrawPrimitivePostFX = false;
