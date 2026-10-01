@@ -23,6 +23,8 @@
 
 This projects aims to fix some issues in Grand Theft Auto IV: The Complete Edition, as well as add various new features for modern systems.
 
+This fork uses FusionFix as a base to add VR to the game.
+
 Also available for [Max Payne 3](https://github.com/ThirteenAG/MaxPayne3.FusionFix#readme) and [other games](https://thirteenag.github.io/wfp).
 
 ## Installation:
