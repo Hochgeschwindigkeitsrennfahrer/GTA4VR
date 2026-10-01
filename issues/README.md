@@ -15,7 +15,7 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 ## Initial queue
 
 - [001 — Reproduce the x86 build (closed)](closed/001-reproduce-x86-build.md)
-- [002 — Record the flat-screen game baseline](open/002-flat-screen-baseline.md)
+- [002 — Record the flat-screen game baseline (closed)](closed/002-flat-screen-baseline.md)
 - [003 — Map camera and rendering hooks](open/003-map-rendering-hooks.md)
 - [004 — Select an OpenXR graphics bridge](open/004-select-openxr-bridge.md)
 - [005 — Add opt-in OpenXR initialization](open/005-openxr-initialization.md)
