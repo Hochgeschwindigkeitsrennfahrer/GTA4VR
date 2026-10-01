@@ -64,6 +64,19 @@ Track the initial bringup in [`issues/README.md`](issues/README.md):
 11. [#012 — Diagnose intermittent early startup exits](issues/open/012-intermittent-early-startup-exit.md). Separate pre-ASI launch failure evidence and recovery.
 12. [#013 — Profile and improve the native-refresh frame budget](issues/open/013-profile-native-refresh-frame-budget.md). Attribute scene-dependent CPU/GPU/interop costs and measure a fixed route; no all-scene native FPS claim.
 
+## Gameplay and rendering backlog
+
+Sequence camera/scale and controller foundations before dependent interactions. Rendering defect reproduction can proceed independently. Each issue owns its acceptance evidence; milestone completion still requires the combined route.
+
+| Area | Issues and order |
+| --- | --- |
+| Stage 3 camera and tracking | [#011 scale/pose validation](issues/open/011-camera-scale-and-auxiliary-views.md), then [#014 first-person camera, headset frusta and room-scale body movement](issues/open/014-first-person-headset-camera.md). Controller locomotion bindings come from #015. |
+| Stage 3 stereo defects | [#010 traffic lamps](issues/open/010-traffic-light-right-eye.md), [#023 objective markers](issues/open/023-objective-markers-both-eyes.md), and [#027 water shading/reflections](issues/open/027-stereo-water-shading.md). #027 provides the water repair evidence for #011. |
+| Stage 4 controller and weapon foundations | [#015 Vive Wand support](issues/open/015-vive-wand-controller-support.md), then [#016 6DOF hands/firearms](issues/open/016-six-dof-hands-and-firearms.md), [#019 vehicles](issues/open/019-vr-vehicles.md) and [#021 weapon wheel](issues/open/021-vr-weapon-wheel.md). Inventory actual vehicle classes before defining plane support. |
+| Stage 4 composition | [#007 draw attribution](issues/open/007-ui-composition-order.md), then [#020 minimap/subtitles/overlays](issues/open/020-vr-overlays-and-subtitles.md); physical phone interaction is #022. |
+| Stage 5 comfort and performance | [#013 frame-budget profile](issues/open/013-profile-native-refresh-frame-budget.md) and [#026 remove cinematic depth/focus blur](issues/open/026-disable-cinematic-depth-blur.md). |
+| Stage 6 physical interactions | After tracked hands: [#017 hand/knife combat](issues/open/017-six-dof-melee-combat.md), [#018 physics-object grabbing](issues/open/018-six-dof-physics-object-grabbing.md), [#022 physical phone](issues/open/022-physical-interactive-phone.md), [#024 physical reloads](issues/open/024-physical-weapon-reloading.md) and [#025 physical money/weapon drops](issues/open/025-physical-money-and-weapon-drops.md). Reloads/drops depend on the grab foundation. |
+
 ## References
 
 - [Upstream FusionFix README and build instructions](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix#building)
