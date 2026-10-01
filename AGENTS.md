@@ -24,6 +24,14 @@ Track work in `issues/open/` and `issues/closed/` using `issues/README.md`. Star
 6. Include in each change report: what changed, build/test results, game/runtime versions when relevant, observed frame-time data if performance is claimed, and remaining limitations.
 7. To launch this Steam Complete Edition install for runtime tests, run `steam.exe -applaunch 12210` outside the restricted command sandbox or start `GTAIV/PlayGTAIV.exe` directly. Both routes have worked, and either can exit intermittently during startup. Verify that `GTAIV.exe` appears and remains responsive; `PlayGTAIV.exe` or Rockstar Launcher alone does not establish success. Do not launch a second copy while `GTAIV.exe` is running.
 
+## Ghidra project workflow
+
+- Use the Ghidra MCP for game-binary analysis. At the start of a session, call `list_instances`, connect to `GTAIV` with `connect_instance` if needed, then call `list_open_programs`; confirm `/GTAIV.exe` is the intended program before editing. Pass `program: "GTAIV.exe"` on program-specific calls, especially if more than one program is open. The tested import is 32-bit x86 with Ghidra image base `0x00400000`.
+- Search existing functions, names, bookmarks, comments, and types before reanalyzing an address. Use MCP disassembly, decompilation, cross-references, and runtime evidence together. A decompiler guess alone is not proof of behavior. Record the game version and distinguish Ghidra addresses from relocated runtime addresses; obtain the live module base for each run instead of assuming a fixed offset.
+- Persist findings in the Ghidra project as the analysis proceeds. Rename a function when its role is supported by code and observations; add comments or bookmarks with the issue ID, evidence, and remaining uncertainty. Apply verified prototypes, types, and variable names when they improve later analysis. Use a bookmark or comment for a tentative interpretation rather than a confident symbol or type.
+- Preview edits with `dry_run` when the MCP tool supports it. Read back the changed function or annotation, then call `save_program`. Keep `docs/` and the local issue updated with the address, conclusion, and evidence so repository collaborators can understand project-only annotations. The Ghidra project is outside Git; do not copy its database or imported game binary into this repository.
+- Avoid destructive reanalysis, flow repair, rebasing, or bulk renaming without a specific finding that requires it. If the MCP is unavailable, record the evidence in the issue and state that the Ghidra project was not updated; do not imply a local note was saved there.
+
 ## Safety and distribution
 
 - Never commit game files, copyrighted assets, proprietary SDK binaries, headset logs, `.env`, or local build output.

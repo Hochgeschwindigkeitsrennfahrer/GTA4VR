@@ -21,3 +21,4 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [005 — Add opt-in OpenXR initialization](open/005-openxr-initialization.md)
 - [006 — Route two eye views with safe visibility and targets](open/006-eye-visibility-and-targets.md)
 - [007 — Attribute UI and post-processing draw order](open/007-ui-composition-order.md)
+- [008 — Persist reverse-engineering findings in Ghidra (closed)](closed/008-ghidra-project-workflow.md)
