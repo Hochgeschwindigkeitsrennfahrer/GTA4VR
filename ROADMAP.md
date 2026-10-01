@@ -68,6 +68,8 @@ Track the initial bringup in [`issues/README.md`](issues/README.md):
 
 Sequence camera/scale and controller foundations before dependent interactions. Rendering defect reproduction can proceed independently. Each issue owns its acceptance evidence; milestone completion still requires the combined route.
 
+Current priority: start #014 first-person camera bringup with #011 scale/pose validation. #007 remains open for render attribution but does not block #014; preserve radar/menu camera ownership and UI update behavior during camera changes. UI presentation choices in #020/#021/#022 are deferred at the user's request.
+
 | Area | Issues and order |
 | --- | --- |
 | Stage 3 camera and tracking | [#011 scale/pose validation](issues/open/011-camera-scale-and-auxiliary-views.md), then [#014 first-person camera, headset frusta and room-scale body movement](issues/open/014-first-person-headset-camera.md). Controller locomotion bindings come from #015. |
