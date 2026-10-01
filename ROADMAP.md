@@ -4,7 +4,7 @@
 
 Add full 6DOF **single-player VR mode** to GTA IV: The Complete Edition using this FusionFix fork as the integration point. GTA IV, The Lost and Damned, and The Ballad of Gay Tony should be tracked separately; the first playable target is GTA IV free roam.
 
-This is a plan, not a claim that VR already works. The repository builds a 32-bit FusionFix ASI through `premake5.bat` and `premake5.lua`. Issues [#001](issues/closed/001-reproduce-x86-build.md) and [#002](issues/closed/002-flat-screen-baseline.md) record successful x86 builds and a flat-screen GTA IV free-roam baseline. A standalone x86 OpenXR graphics bridge probe passed with SteamVR in [#004](issues/closed/004-select-openxr-bridge.md); it has not displayed an image in the headset or used GTA IV's rendering device. Preserve the existing change to `readme.md`.
+The repository builds a 32-bit FusionFix ASI through `premake5.bat` and `premake5.lua`. Issues [#001](issues/closed/001-reproduce-x86-build.md) and [#002](issues/closed/002-flat-screen-baseline.md) record successful x86 builds and a flat-screen GTA IV free-roam baseline. The bridge selected in [#004](issues/closed/004-select-openxr-bridge.md) now displays continuous stereo world images from the game's rendering device in SteamVR, verified in [#006](issues/closed/006-eye-visibility-and-targets.md). Full VR gameplay remains under development. Preserve the existing change to `readme.md`.
 
 ## Working loop
 
@@ -31,7 +31,7 @@ Do not commit proprietary game assets, game binaries, runtime DLLs, headset data
 
 ## Architectural questions to answer in Stage 1
 
-- **Graphics bridge:** [#004's design note](docs/openxr-graphics-bridge.md) selects x86 D3D9Ex shared texture → D3D11 → OpenXR for the first implementation after a standalone copy/readback passed on SteamVR. GTA IV device compatibility, game-target sharing, synchronization across frames, reset behavior, and latency remain integration gates in #006. Do not assume ordinary D3D9 surfaces can be submitted directly to OpenXR.
+- **Graphics bridge:** [#004's design note](docs/openxr-graphics-bridge.md) selects x86 D3D9Ex shared texture → D3D11 → OpenXR for the first implementation after a standalone copy/readback passed on SteamVR. Game device compatibility, independent eye targets, synchronization and reset passed in #006. Pose/transfer latency remains an explicit prototype limitation for #011/#013. Do not assume ordinary D3D9 surfaces can be submitted directly to OpenXR.
 - **Stereo scene generation:** Identify the point at which the world can be rendered twice with independent view/projection matrices while avoiding double game simulation, duplicated audio, and side effects. A final-frame stereo copy alone cannot create correct depth.
 - **Camera state:** Confirm which values in `source/comvars.ixx` are authoritative at draw time, how camera modes change in vehicles/cutscenes, and whether projection/culling can be overridden safely.
 - **Composition:** Decide which passes are world-space, per-eye, or head-locked. In particular test HUD, subtitles, phone, map, reflections, screen-space effects, and loading screens.
@@ -53,11 +53,16 @@ Track the initial bringup in [`issues/README.md`](issues/README.md):
 1. [#001 — Reproduce the x86 build (closed)](issues/closed/001-reproduce-x86-build.md). Win32 Debug and Release ASI builds now succeed with VS 2026 MSBuild.
 2. [#002 — Record the flat-screen baseline (closed)](issues/closed/002-flat-screen-baseline.md). GTA IV free roam passes with the local ASI in borderless D3D9 mode.
 3. [#003 — Map camera and rendering hooks (closed)](issues/closed/003-map-rendering-hooks.md). A one-frame two-view test built separate G-buffer, lighting, and DrawScene command lists with distinct viewport snapshots after one observed game-process update; G-buffer and DrawScene commands for both views executed on the render thread. This is the measured scene-command boundary, not a headset image.
-4. [#004 — Select an OpenXR graphics bridge (closed)](issues/closed/004-select-openxr-bridge.md). The x86 D3D9Ex → D3D11 → SteamVR OpenXR swapchain copy/readback passed in a standalone probe; game integration remains open.
+4. [#004 — Select an OpenXR graphics bridge (closed)](issues/closed/004-select-openxr-bridge.md). The x86 D3D9Ex → D3D11 → SteamVR OpenXR swapchain copy/readback passed in a standalone probe; the selected system-backend path is now integrated in #006.
 5. [#005 — Add opt-in OpenXR initialization (closed)](issues/closed/005-openxr-initialization.md). An x86 SteamVR D3D11 session and zero-layer frame loop run in the game. VR-off/on gameplay routes, reset recreation, missing-runtime fallback, controlled runtime loss, and command-driven shutdown passed. Headset visuals and frame pacing remain open; apartment-exit stutter needs measurement before performance claims.
-6. [#006 — Route two eye views with safe visibility and targets](issues/open/006-eye-visibility-and-targets.md). Main-world culling ran only once in #003's test; conservative or independent per-eye visibility, target routing, and pixel verification remain required.
+6. [#006 — Route two eye views with safe visibility and targets (closed)](issues/closed/006-eye-visibility-and-targets.md). Independent pose/FOV-correct eye color/depth and conservative visibility passed in apartment/street captures after one observed game-process update. Continuous SteamVR headset rendering, directional shadows, real device reset, explicit shutdown and a final VR-disabled Release launch/image check passed. Runtime pacing removes the gameplay limiter and desktop VSync in opted-in stereo; Release samples reached 89.8–90 Hz at 2560×1440 per eye, with a later outdoor sample at 49.8 Hz. This establishes the first-image gate, not all-scene native FPS or complete VR gameplay. Auxiliary views/scale/pose latency, startup reliability and profiling remain in #011–#013. See [integration evidence](docs/eye-target-integration.md).
 7. [#007 — Attribute UI and post-processing draw order](issues/open/007-ui-composition-order.md). Exact HUD, subtitle, phone, radar, and map pixel order remains unmeasured.
 8. [#009 — Local development command bridge (closed)](issues/closed/009-local-development-command-bridge.md). The opt-in named pipe supports live status and clean quit with explicit OpenXR shutdown; subsequent launches succeeded.
+
+9. [#010 — Traffic-light lamps missing in the right eye](issues/open/010-traffic-light-right-eye.md). Isolated light defect; user explicitly kept it separate from #006.
+10. [#011 — Validate camera scale, pose timing and auxiliary views](issues/open/011-camera-scale-and-auxiliary-views.md). Stage 3: measured scale/latency and broader reflection/weather/temporal validation.
+11. [#012 — Diagnose intermittent early startup exits](issues/open/012-intermittent-early-startup-exit.md). Separate pre-ASI launch failure evidence and recovery.
+12. [#013 — Profile and improve the native-refresh frame budget](issues/open/013-profile-native-refresh-frame-budget.md). Attribute scene-dependent CPU/GPU/interop costs and measure a fixed route; no all-scene native FPS claim.
 
 ## References
 

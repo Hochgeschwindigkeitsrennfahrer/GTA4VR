@@ -19,7 +19,11 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [003 — Map camera and rendering hooks (closed)](closed/003-map-rendering-hooks.md)
 - [004 — Select an OpenXR graphics bridge (closed)](closed/004-select-openxr-bridge.md)
 - [005 — Add opt-in OpenXR initialization (closed)](closed/005-openxr-initialization.md)
-- [006 — Route two eye views with safe visibility and targets](open/006-eye-visibility-and-targets.md)
+- [006 — Route two eye views with safe visibility and targets (closed)](closed/006-eye-visibility-and-targets.md)
 - [007 — Attribute UI and post-processing draw order](open/007-ui-composition-order.md)
 - [008 — Persist reverse-engineering findings in Ghidra (closed)](closed/008-ghidra-project-workflow.md)
 - [009 — Local development command bridge (closed)](closed/009-local-development-command-bridge.md)
+- [010 — Traffic-light lamps missing in the right eye](open/010-traffic-light-right-eye.md). Isolated follow-up; the user does not require it to block #006.
+- [011 — Validate camera scale, pose timing and auxiliary views](open/011-camera-scale-and-auxiliary-views.md). Roadmap stage 3 validation following the first stereo image.
+- [012 — Diagnose intermittent early startup exits](open/012-intermittent-early-startup-exit.md). Track launch reliability separately from stereo pixel correctness.
+- [013 — Profile and improve the native-refresh frame budget](open/013-profile-native-refresh-frame-budget.md). Explain the remaining scene-dependent submission drops.

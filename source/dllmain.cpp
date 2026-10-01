@@ -7,6 +7,11 @@ import fusiondxhook;
 import vrtrace;
 import openxrvr;
 import devcontrol;
+import vrinteropprobe;
+import vrd3d9ex;
+import vrviewprobe;
+import vrcamera;
+import vrstereo;
 
 std::vector<std::future<void>> initializationFutures;
 
@@ -47,9 +52,14 @@ void CGameProcessHook()
 
 void Init()
 {
+    VRD3D9Ex::Install();
     VRTrace::Install();
     OpenXRVR::Install();
     DevControl::Install();
+    VRInteropProbe::Install();
+    VRCamera::Install();
+    VRViewProbe::Install();
+    VRStereo::Install();
     auto pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9");
     hbCGameProcess.fun = injector::MakeCALL(pattern.get_first(0), CGameProcessHook, true).get();
 
@@ -144,6 +154,7 @@ extern "C"
     {
         std::call_once(CallbackHandler::flag, []()
         {
+            VRD3D9Ex::InstallDiagnostics();
             CompatibilityWarnings();
             CallbackHandler::RegisterCallback(Init, hook::pattern("F3 0F 10 44 24 ? F3 0F 59 05 ? ? ? ? EB ? E8"));
         });

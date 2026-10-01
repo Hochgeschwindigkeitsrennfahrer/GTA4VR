@@ -63,6 +63,7 @@ public:
     // --------- load --------- 
     IDirect3DTexture9* SMAA_areaTex = nullptr; // loaded from file
     IDirect3DTexture9* SMAA_searchTex = nullptr; // loaded from file
+    bool smaaDefaultPool = false;
 
     // --------- game textures --------- 
     IDirect3DTexture9* FullScreenTex = nullptr; // game hdr texture
@@ -535,6 +536,11 @@ public:
 
     void ReleaseTextures()
     {
+        if (smaaDefaultPool)
+        {
+            SAFE_RELEASE(SMAA_areaTex);
+            SAFE_RELEASE(SMAA_searchTex);
+        }
         // NormalTex = nullptr;
         DiffuseTex = nullptr;
         // SpecularTex = nullptr;
@@ -706,10 +712,16 @@ public:
         }
 
 
+        // Ex has no managed pool; preserve the existing pool on ordinary D3D9.
+        IDirect3DDevice9Ex* exDevice = nullptr;
+        smaaDefaultPool = SUCCEEDED(pDevice->QueryInterface(__uuidof(IDirect3DDevice9Ex),
+            reinterpret_cast<void**>(&exDevice)));
+        if (exDevice) exDevice->Release();
+        const auto smaaPool = smaaDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
         if (!SMAA_areaTex)
-            D3DXCreateTextureFromResourceExW(pDevice, hm, MAKEINTRESOURCEW(IDR_AreaTex), 160, 560, 1, 0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED, D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR, 0, NULL, NULL, &SMAA_areaTex);
+            D3DXCreateTextureFromResourceExW(pDevice, hm, MAKEINTRESOURCEW(IDR_AreaTex), 160, 560, 1, 0, D3DFMT_UNKNOWN, smaaPool, D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR, 0, NULL, NULL, &SMAA_areaTex);
         if (!SMAA_searchTex)
-            D3DXCreateTextureFromResourceExW(pDevice, hm, MAKEINTRESOURCEW(IDR_SearchTex), 64, 16, 1, 0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED, D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR, 0, NULL, NULL, &SMAA_searchTex);
+            D3DXCreateTextureFromResourceExW(pDevice, hm, MAKEINTRESOURCEW(IDR_SearchTex), 64, 16, 1, 0, D3DFMT_UNKNOWN, smaaPool, D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR, 0, NULL, NULL, &SMAA_searchTex);
     }
 };
 

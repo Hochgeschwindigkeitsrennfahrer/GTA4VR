@@ -7,11 +7,16 @@ From the repository's PowerShell prompt:
 ```powershell
 .\tools\game-command.ps1 status
 .\tools\game-command.ps1 quit
+.\tools\game-command.ps1 stereo-test
 # Specify the process if discovery is ambiguous:
 .\tools\game-command.ps1 status -GameProcessId 12345
 ```
 
 `status` reports protocol version, game PID, and OpenXR enabled/running/failure/session/frame state. `quit` releases OpenXR on the EndScene callback thread and posts `WM_CLOSE` to the game-owned window, requesting its usual close path. The response acknowledges command acceptance; confirm actual exit from the process list. Neither command saves the game or modifies player saves.
+
+Issue 006 adds stereo readiness, built-frame/budget, continuous mode and submitted-layer counts to `status`. Set `[VR] ExperimentalStereoFrames=0` for continuous development rendering; this is the user's preferred mode for headset checks. Values 1–600 retain the bounded diagnostic mode and hold the last pair afterward. `stereo-test` resets the counter and requests a fresh capture on the next game-process callback when resources and valid OpenXR views are ready. It does not repeat simulation, launch another process, save or inject input. Check status/logs and actual images; command acceptance alone is not rendering evidence.
+
+`openxr.displayRefreshHz` is the current hardware rate returned by the optional OpenXR display-refresh extension (zero if unavailable). `openxr.submittedHz` is a five-second projection-layer submission average; it does not count compositor-generated frames or prove the headset displayed every submitted frame. `[VR] MatchHeadsetRefresh=1` skips the ordinary gameplay limiter while OpenXR requests rendered eye images, letting `xrWaitFrame` supply timing. Loading/cutscene/minigame safety limits still apply, and ordinary gameplay caps resume when VR stops or fails. This pacing works without the optional refresh-rate query.
 
 If a restricted command sandbox denies pipe access, run the same client in the normal Windows user context through the approved tool path. Keep the pipe ACL restricted; do not broaden it to work around the sandbox.
 

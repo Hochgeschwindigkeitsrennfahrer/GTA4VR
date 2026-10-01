@@ -12,6 +12,9 @@ module;
 #include <cwchar>
 #include <vector>
 #include <string>
+#include <wrl/client.h>
+#include <atomic>
+#include <cmath>
 
 export module openxrvr;
 
@@ -19,9 +22,21 @@ import common;
 
 export namespace OpenXRVR
 {
+    struct EyeView
+    {
+        float position[3]{};
+        float orientation[4]{}; // x, y, z, w in OpenXR's reference space.
+        float fov[4]{}; // left, right, up, down angles in radians.
+    };
     void Install();
     void Shutdown(); // Call from the EndScene callback thread, never DllMain.
     std::string Status();
+    bool GetEyeViews(EyeView (&views)[2], long long& displayTime);
+    bool CanAcceptEyeImages(); // Render callback thread; false while stopped or recreating.
+    bool PacesGameplay(); // Atomic; true while the runtime requests stereo frames.
+    bool SetEyeImages(const HANDLE (&shared)[2], unsigned width, unsigned height,
+        const EyeView (&views)[2], long long poseTime); // Render callback thread after D3D9 GPU completion.
+    void SetEyeImageProvider(void (*provider)()); // Called on EndScene before any D3D11 eye copy.
 }
 
 namespace
@@ -43,6 +58,17 @@ namespace
         PFN_xrWaitFrame waitFrame = nullptr;
         PFN_xrBeginFrame beginFrame = nullptr;
         PFN_xrEndFrame endFrame = nullptr;
+        PFN_xrCreateReferenceSpace createReferenceSpace = nullptr;
+        PFN_xrDestroySpace destroySpace = nullptr;
+        PFN_xrLocateViews locateViews = nullptr;
+        PFN_xrEnumerateSwapchainFormats enumerateSwapchainFormats = nullptr;
+        PFN_xrCreateSwapchain createSwapchain = nullptr;
+        PFN_xrDestroySwapchain destroySwapchain = nullptr;
+        PFN_xrEnumerateSwapchainImages enumerateSwapchainImages = nullptr;
+        PFN_xrAcquireSwapchainImage acquireSwapchainImage = nullptr;
+        PFN_xrWaitSwapchainImage waitSwapchainImage = nullptr;
+        PFN_xrReleaseSwapchainImage releaseSwapchainImage = nullptr;
+        PFN_xrGetDisplayRefreshRateFB getDisplayRefreshRate = nullptr;
     } api;
     HMODULE loader = nullptr;
 
@@ -65,6 +91,11 @@ namespace
     HANDLE logFile = INVALID_HANDLE_VALUE;
     XrInstance instance = XR_NULL_HANDLE;
     XrSession session = XR_NULL_HANDLE;
+    XrSpace localSpace = XR_NULL_HANDLE;
+    SRWLOCK eyeLock = SRWLOCK_INIT;
+    OpenXRVR::EyeView eyeViews[2]{};
+    long long eyeDisplayTime = 0;
+    bool eyeViewsValid = false;
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -74,6 +105,25 @@ namespace
     bool pendingRecreate = false;
     bool permanentFailure = false;
     unsigned frameCount = 0;
+    std::atomic<float> displayRefreshHz{0};
+    std::atomic<bool> gameplayPacing{false};
+    std::atomic<float> submittedHz{0};
+    ULONGLONG rateWindowStart=0;
+    unsigned rateWindowLayers=0;
+    struct EyeSwapchain
+    {
+        XrSwapchain handle=XR_NULL_HANDLE;
+        std::vector<XrSwapchainImageD3D11KHR> images;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> shared;
+        HANDLE sharedHandle=nullptr;
+    };
+    EyeSwapchain* eyeChains=nullptr; // Explicit render-thread cleanup, never loader-lock COM destruction.
+    OpenXRVR::EyeView imageViews[2]{};
+    unsigned imageWidth=0,imageHeight=0;
+    long long imagePoseTime=0;
+    bool haveEyeImages=false;
+    unsigned submittedFrames=0;
+    void (*eyeImageProvider)()=nullptr;
 
     void Log(const char* message)
     {
@@ -122,6 +172,13 @@ namespace
         }
     }
 
+    bool CheckImageStep(const char* step,XrResult result)
+    {
+        if(result==XR_SUCCESS) return true;
+        Check(step,result);
+        return false;
+    }
+
     bool LoadApi()
     {
         wchar_t path[MAX_PATH]{};
@@ -154,14 +211,49 @@ namespace
         LOAD_XR(waitFrame, xrWaitFrame)
         LOAD_XR(beginFrame, xrBeginFrame)
         LOAD_XR(endFrame, xrEndFrame)
+        LOAD_XR(createReferenceSpace, xrCreateReferenceSpace)
+        LOAD_XR(destroySpace, xrDestroySpace)
+        LOAD_XR(locateViews, xrLocateViews)
+        LOAD_XR(enumerateSwapchainFormats, xrEnumerateSwapchainFormats)
+        LOAD_XR(createSwapchain, xrCreateSwapchain)
+        LOAD_XR(destroySwapchain, xrDestroySwapchain)
+        LOAD_XR(enumerateSwapchainImages, xrEnumerateSwapchainImages)
+        LOAD_XR(acquireSwapchainImage, xrAcquireSwapchainImage)
+        LOAD_XR(waitSwapchainImage, xrWaitSwapchainImage)
+        LOAD_XR(releaseSwapchainImage, xrReleaseSwapchainImage)
 #undef LOAD_XR
         return true;
     }
 
     void DestroyRuntime()
     {
+        displayRefreshHz=0;
+        gameplayPacing=false;
+        submittedHz=0;
+        rateWindowStart=0;
+        rateWindowLayers=0;
+        haveEyeImages=false;
+        for(unsigned i=0;eyeChains && i<2;++i)
+        {
+            auto& eye=eyeChains[i];
+            eye.shared.Reset();
+            eye.images.clear();
+            if(eye.handle!=XR_NULL_HANDLE) api.destroySwapchain(eye.handle);
+            eye.handle=XR_NULL_HANDLE;
+            eye.sharedHandle=nullptr;
+        }
+        delete[] eyeChains; eyeChains=nullptr;
+        imageWidth=imageHeight=submittedFrames=0;
+        AcquireSRWLockExclusive(&eyeLock);
+        eyeViewsValid = false;
+        ReleaseSRWLockExclusive(&eyeLock);
         running = false;
         sessionState = XR_SESSION_STATE_UNKNOWN;
+        if (localSpace != XR_NULL_HANDLE)
+        {
+            Check("xrDestroySpace(LOCAL)", api.destroySpace(localSpace));
+            localSpace = XR_NULL_HANDLE;
+        }
         if (session != XR_NULL_HANDLE)
         {
             Check("xrDestroySession", xrDestroySession(session));
@@ -189,9 +281,12 @@ namespace
         for (auto& item : extensions) item.type = XR_TYPE_EXTENSION_PROPERTIES;
         if (!Check("xrEnumerateInstanceExtensionProperties(list)",
             xrEnumerateInstanceExtensionProperties(nullptr, count, &count, extensions.data()))) return false;
-        bool hasD3D11 = false;
+        bool hasD3D11 = false, hasRefreshRate=false;
         for (const auto& item : extensions)
+        {
             hasD3D11 |= std::strcmp(item.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
+            hasRefreshRate |= std::strcmp(item.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0;
+        }
         if (!hasD3D11) { Log("OpenXR fallback: XR_KHR_D3D11_enable unavailable"); return false; }
 
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -200,10 +295,13 @@ namespace
         strcpy_s(create.applicationInfo.engineName, "FusionFix");
         create.applicationInfo.engineVersion = 1;
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        const char* names[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
-        create.enabledExtensionCount = 1;
+        const char* names[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME,XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
+        create.enabledExtensionCount = hasRefreshRate ? 2 : 1;
         create.enabledExtensionNames = names;
         if (!Check("xrCreateInstance", xrCreateInstance(&create, &instance))) return false;
+        if(hasRefreshRate)
+            xrGetInstanceProcAddr(instance,"xrGetDisplayRefreshRateFB",
+                reinterpret_cast<PFN_xrVoidFunction*>(&api.getDisplayRefreshRate));
         XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
         if (Check("xrGetInstanceProperties", xrGetInstanceProperties(instance, &props)))
         {
@@ -269,6 +367,20 @@ namespace
         sessionInfo.next = &binding;
         sessionInfo.systemId = systemId;
         if (!Check("xrCreateSession(D3D11)", xrCreateSession(instance, &sessionInfo, &session))) return false;
+        if(api.getDisplayRefreshRate)
+        {
+            float hz=0;
+            if(XR_SUCCEEDED(api.getDisplayRefreshRate(session,&hz)) && std::isfinite(hz) && hz>=30 && hz<=240)
+            {
+                displayRefreshHz=hz;
+                char line[100]; sprintf_s(line,"Headset display refresh rate %.3f Hz",hz); Log(line);
+            }
+        }
+        XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        spaceInfo.poseInReferenceSpace.orientation.w = 1;
+        if (!Check("xrCreateReferenceSpace(LOCAL)", api.createReferenceSpace(session, &spaceInfo, &localSpace)))
+            return false;
         frameCount = 0;
         Log("OpenXR session created; game rendering remains flat-screen");
         return true;
@@ -315,6 +427,10 @@ namespace
                     if (!Check("xrEndSession", xrEndSession(session)))
                     { Fallback("OpenXR end session failed"); return; }
                     running = false;
+                    gameplayPacing=false;
+                    AcquireSRWLockExclusive(&eyeLock);
+                    eyeViewsValid = false;
+                    ReleaseSRWLockExclusive(&eyeLock);
                 }
                 else if (sessionState == XR_SESSION_STATE_LOSS_PENDING ||
                     sessionState == XR_SESSION_STATE_EXITING)
@@ -322,17 +438,51 @@ namespace
             }
             else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
             { Fallback("OpenXR instance loss pending"); return; }
+            else if(event.type==XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB && api.getDisplayRefreshRate)
+            {
+                const auto hz=reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&event)->toDisplayRefreshRate;
+                if(std::isfinite(hz) && hz>=30 && hz<=240) displayRefreshHz=hz;
+            }
             event = {XR_TYPE_EVENT_DATA_BUFFER};
         }
         if (result != XR_EVENT_UNAVAILABLE)
         { Fallback("xrPollEvent failed"); return; }
         if (!running) return;
+        // The provider fences this frame's D3D9 writes before D3D11 reads.
+        // Relying on the preceding frame's fence races a reused eye texture.
+        if(eyeImageProvider) eyeImageProvider();
+        if(permanentFailure || !running) return;
 
         XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState state{XR_TYPE_FRAME_STATE};
         result = xrWaitFrame(session, &wait, &state);
         if (XR_FAILED(result))
         { Check("xrWaitFrame", result); Fallback("OpenXR frame wait failed"); return; }
+        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate.displayTime = state.predictedDisplayTime;
+        locate.space = localSpace;
+        XrViewState viewState{XR_TYPE_VIEW_STATE};
+        XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t viewCount = 0;
+        result = api.locateViews(session, &locate, &viewState, 2, &viewCount, views);
+        if (XR_FAILED(result))
+        { Check("xrLocateViews", result); Fallback("OpenXR eye locate failed"); return; }
+        const auto required = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+        AcquireSRWLockExclusive(&eyeLock);
+        eyeViewsValid = viewCount == 2 && (viewState.viewStateFlags & required) == required;
+        if (eyeViewsValid)
+        {
+            for (unsigned i = 0; i < 2; ++i)
+            {
+                eyeViews[i] = {{views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z},
+                    {views[i].pose.orientation.x, views[i].pose.orientation.y, views[i].pose.orientation.z,
+                        views[i].pose.orientation.w},
+                    {views[i].fov.angleLeft, views[i].fov.angleRight, views[i].fov.angleUp, views[i].fov.angleDown}};
+            }
+            eyeDisplayTime = state.predictedDisplayTime;
+        }
+        ReleaseSRWLockExclusive(&eyeLock);
         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
         result = xrBeginFrame(session, &begin);
         if (XR_FAILED(result))
@@ -340,9 +490,85 @@ namespace
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = state.predictedDisplayTime;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        XrCompositionLayerProjectionView projectionViews[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+            {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
+        bool copied=haveEyeImages && state.shouldRender;
+        gameplayPacing=haveEyeImages && state.shouldRender;
+        for(unsigned eye=0;eye<2 && copied;++eye)
+        {
+            auto& chain=eyeChains[eye];
+            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            uint32_t index=0;
+            if(!CheckImageStep("xrAcquireSwapchainImage(eye)",api.acquireSwapchainImage(chain.handle,&acquire,&index)))
+                {copied=false; break;}
+            XrSwapchainImageWaitInfo imageWait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            imageWait.timeout=1000000000; // One second, including timeout as failure.
+            const auto waited=api.waitSwapchainImage(chain.handle,&imageWait);
+            if(!CheckImageStep("xrWaitSwapchainImage(eye)",waited) || index>=chain.images.size())
+                {copied=false; break;}
+            context->CopyResource(chain.images[index].texture,chain.shared.Get());
+            // Complete this diagnostic copy before releasing ownership to the
+            // runtime. A bounded event query avoids relying on cross-device
+            // driver scheduling for correctness.
+            D3D11_QUERY_DESC queryDesc{D3D11_QUERY_EVENT,0};
+            Microsoft::WRL::ComPtr<ID3D11Query> query;
+            bool gpuDone=false;
+            if(SUCCEEDED(device->CreateQuery(&queryDesc,&query)))
+            {
+                context->End(query.Get()); context->Flush();
+                const auto deadline=GetTickCount64()+1000;
+                HRESULT status=S_FALSE;
+                do {status=context->GetData(query.Get(),nullptr,0,0); if(status==S_FALSE) Sleep(0);}
+                while(status==S_FALSE && GetTickCount64()<deadline);
+                gpuDone=status==S_OK;
+            }
+            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            const bool released=CheckImageStep("xrReleaseSwapchainImage(eye)",api.releaseSwapchainImage(chain.handle,&release));
+            if(!gpuDone || !released) {copied=false; Log("Eye transfer synchronization failed"); break;}
+            auto& view=projectionViews[eye];
+            const auto& source=imageViews[eye];
+            view.pose={{source.orientation[0],source.orientation[1],source.orientation[2],source.orientation[3]},
+                {source.position[0],source.position[1],source.position[2]}};
+            view.fov={source.fov[0],source.fov[1],source.fov[2],source.fov[3]};
+            view.subImage.swapchain=chain.handle;
+            view.subImage.imageRect={{0,0},{static_cast<int32_t>(imageWidth),static_cast<int32_t>(imageHeight)}};
+            view.subImage.imageArrayIndex=0;
+        }
+        if(copied)
+        {
+            layer.space=localSpace;
+            layer.viewCount=2;
+            layer.views=projectionViews;
+            end.layerCount=1; end.layers=layers;
+        }
+        else if(haveEyeImages && state.shouldRender)
+        {
+            // Destroying the session releases any outstanding acquisition.
+            Fallback("OpenXR eye transfer failed; returning to desktop"); return;
+        }
         result = xrEndFrame(session, &end);
         if (XR_FAILED(result))
         { Check("xrEndFrame", result); Fallback("OpenXR frame end failed"); return; }
+        if(copied)
+        {
+            const auto now=GetTickCount64();
+            if(!rateWindowStart) {rateWindowStart=now; rateWindowLayers=0;}
+            ++rateWindowLayers;
+            if(now-rateWindowStart>=5000)
+            {
+                submittedHz=1000.0f*rateWindowLayers/static_cast<float>(now-rateWindowStart);
+                rateWindowStart=now; rateWindowLayers=0;
+            }
+        }
+        if(copied && (++submittedFrames==1 || submittedFrames%600==0))
+        {
+            char line[180];
+            sprintf_s(line,"Submitted stereo layer %u sourcePoseTime=%lld displayTime=%lld size=%ux%u",
+                submittedFrames,imagePoseTime,static_cast<long long>(state.predictedDisplayTime),imageWidth,imageHeight);
+            Log(line);
+        }
         if (++frameCount == 1 || frameCount % 600 == 0)
         {
             char line[120];
@@ -363,11 +589,99 @@ void OpenXRVR::Shutdown()
 
 std::string OpenXRVR::Status()
 {
-    char text[256];
-    sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u}",
+    char text[360];
+    sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u,\"eyeImages\":%s,\"stereoLayers\":%u,\"displayRefreshHz\":%.3f,\"submittedHz\":%.2f}",
         enabled ? "true" : "false", running ? "true" : "false",
-        permanentFailure ? "true" : "false", StateName(sessionState), frameCount);
+        permanentFailure ? "true" : "false", StateName(sessionState), frameCount,
+        haveEyeImages ? "true" : "false",submittedFrames,displayRefreshHz.load(),submittedHz.load());
     return text;
+}
+
+bool OpenXRVR::PacesGameplay()
+{
+    return gameplayPacing.load();
+}
+
+bool OpenXRVR::GetEyeViews(EyeView (&views)[2], long long& displayTime)
+{
+    AcquireSRWLockShared(&eyeLock);
+    const auto valid = eyeViewsValid;
+    if (valid)
+    {
+        views[0] = eyeViews[0];
+        views[1] = eyeViews[1];
+        displayTime = eyeDisplayTime;
+    }
+    ReleaseSRWLockShared(&eyeLock);
+    return valid;
+}
+
+bool OpenXRVR::SetEyeImages(const HANDLE (&shared)[2], unsigned width,unsigned height,
+    const EyeView (&views)[2],long long poseTime)
+{
+    if(!enabled || permanentFailure || !running || !device || !width || !height) return false;
+    if(haveEyeImages && (imageWidth!=width || imageHeight!=height)) return false;
+    if(!haveEyeImages)
+    {
+        if(!eyeChains) eyeChains=new EyeSwapchain[2];
+        uint32_t count=0;
+        if(!Check("xrEnumerateSwapchainFormats(count)",api.enumerateSwapchainFormats(session,0,&count,nullptr))) return false;
+        std::vector<int64_t> formats(count);
+        if(!Check("xrEnumerateSwapchainFormats(list)",api.enumerateSwapchainFormats(session,count,&count,formats.data()))) return false;
+        // FusionFix's final color is display encoded. SteamVR's tested format
+        // is SRGB; D3D11 permits a resource copy within this format family.
+        const auto format=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if(std::find(formats.begin(),formats.end(),format)==formats.end())
+            {Log("OpenXR BGRA8 SRGB eye format unavailable"); return false;}
+        for(unsigned eye=0;eye<2;++eye)
+        {
+            auto& chain=eyeChains[eye];
+            const auto opened=shared[eye] ? device->OpenSharedResource(shared[eye],__uuidof(ID3D11Texture2D),
+                reinterpret_cast<void**>(chain.shared.GetAddressOf())) : E_HANDLE;
+            if(FAILED(opened))
+            {
+                char diagnostic[128];
+                sprintf_s(diagnostic,"OpenSharedResource eye=%u HRESULT=0x%08lX",eye,static_cast<unsigned long>(opened));
+                Log(diagnostic);
+                Fallback("OpenXR could not open game eye texture on runtime GPU"); return false;
+            }
+            D3D11_TEXTURE2D_DESC desc{};
+            chain.shared->GetDesc(&desc);
+            if(desc.Width!=width || desc.Height!=height || desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count!=1)
+                {Fallback("OpenXR eye texture descriptor mismatch"); return false;}
+            XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+            create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+            create.format=format; create.sampleCount=1;
+            create.width=width; create.height=height; create.faceCount=1; create.arraySize=1; create.mipCount=1;
+            if(!Check("xrCreateSwapchain(eye)",api.createSwapchain(session,&create,&chain.handle)))
+                {Fallback("OpenXR eye swapchain creation failed"); return false;}
+            uint32_t images=0;
+            if(!Check("xrEnumerateSwapchainImages(count)",api.enumerateSwapchainImages(chain.handle,0,&images,nullptr)))
+                {Fallback("OpenXR eye image enumeration failed"); return false;}
+            chain.images.resize(images);
+            for(auto& image:chain.images) image.type=XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+            if(!Check("xrEnumerateSwapchainImages(list)",api.enumerateSwapchainImages(chain.handle,images,&images,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images.data()))))
+                {Fallback("OpenXR eye image enumeration failed"); return false;}
+            chain.sharedHandle=shared[eye];
+        }
+        imageWidth=width; imageHeight=height;
+        Log("Game eye textures opened; two BGRA8 SRGB OpenXR swapchains created");
+    }
+    if(eyeChains[0].sharedHandle!=shared[0] || eyeChains[1].sharedHandle!=shared[1]) return false;
+    imageViews[0]=views[0]; imageViews[1]=views[1]; imagePoseTime=poseTime;
+    haveEyeImages=true;
+    return true;
+}
+
+bool OpenXRVR::CanAcceptEyeImages()
+{
+    return enabled && !permanentFailure && running && device;
+}
+
+void OpenXRVR::SetEyeImageProvider(void (*provider)())
+{
+    eyeImageProvider=provider;
 }
 
 void OpenXRVR::Install()

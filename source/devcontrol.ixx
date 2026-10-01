@@ -13,6 +13,7 @@ export module devcontrol;
 import common;
 import comvars;
 import openxrvr;
+import vrstereo;
 
 export namespace DevControl { void Install(); }
 
@@ -88,7 +89,12 @@ namespace
         {
             response = "{\"ok\":true,\"protocol\":1,\"pid\":" +
                 std::to_string(GetCurrentProcessId()) + ",\"openxr\":" +
-                OpenXRVR::Status() + "}";
+                OpenXRVR::Status() + ",\"stereo\":" + VRStereo::Status() + "}";
+        }
+        else if(command=="stereo-test")
+        {
+            response=VRStereo::RestartExperiment() ? "{\"ok\":true,\"command\":\"stereo-test\",\"accepted\":true}" :
+                "{\"ok\":false,\"error\":\"experimental stereo not ready\"}";
         }
         else if (command == "quit")
         {
@@ -130,6 +136,7 @@ namespace
             if (transferred == 3 && std::memcmp(input, "ack", 3) == 0 && quitWindow)
             {
                 OpenXRVR::Shutdown();
+                VRStereo::Shutdown();
                 PostMessageW(quitWindow, WM_CLOSE, 0, 0);
             }
             Connect();

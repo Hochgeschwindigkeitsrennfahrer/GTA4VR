@@ -11,6 +11,7 @@ import common;
 import comvars;
 import settings;
 import natives;
+import openxrvr;
 
 int32_t nFrameLimitType;
 float fFpsLimit;
@@ -144,10 +145,14 @@ bool bNeedsToLimitFpsForThisMinigame = false;
 void __cdecl sub_855640()
 {
     static auto preset = FusionFixSettings.GetRef("PREF_FPS_LIMIT_PRESET");
+    static const bool matchHeadset=CIniReader("").ReadInteger("VR","MatchHeadsetRefresh",1)!=0;
+    // xrWaitFrame on the render thread supplies backpressure while stereo is
+    // active. A second wall-clock limiter can fight the runtime's schedule.
+    const bool runtimePacing=matchHeadset && OpenXRVR::PacesGameplay();
 
     if ((CMenuManager::bLoadscreenShown && !*CMenuManager::bLoadscreenShown && !bLoadingShown) || !bUnlockFramerateDuringLoadscreens)
     {
-        if (preset && *preset >= FusionFixSettings.FpsCaps.eCustom)
+        if (!runtimePacing && preset && *preset >= FusionFixSettings.FpsCaps.eCustom)
         {
             if (fFpsLimit != 0.0f || (*preset > FusionFixSettings.FpsCaps.eCustom && *preset < int32_t(FusionFixSettings.FpsCaps.data.size())))
                 FpsLimiter.Sync();
