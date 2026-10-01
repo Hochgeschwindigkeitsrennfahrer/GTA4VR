@@ -5,6 +5,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "sign.ps1" -SearchPaths ".\b
 
 copy bin\GTAIV.EFLC.FusionFix.asi data\plugins\GTAIV.EFLC.FusionFix.asi
 copy bin\d3d9.dll data\d3d9.dll
+if not exist build\openxr-loader-win32\src\loader\Release\openxr_loader.dll (
+    echo Missing x86 OpenXR loader. Build the Release openxr_loader target first.
+    exit /b 1
+)
+copy /Y build\openxr-loader-win32\src\loader\Release\openxr_loader.dll data\plugins\openxr_loader.dll
+copy /Y external\openxr-sdk\LICENSE data\plugins\openxr_loader.LICENSE.txt
 
 call buildimg.bat
 call buildwtd.bat

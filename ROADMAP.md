@@ -54,9 +54,10 @@ Track the initial bringup in [`issues/README.md`](issues/README.md):
 2. [#002 — Record the flat-screen baseline (closed)](issues/closed/002-flat-screen-baseline.md). GTA IV free roam passes with the local ASI in borderless D3D9 mode.
 3. [#003 — Map camera and rendering hooks (closed)](issues/closed/003-map-rendering-hooks.md). A one-frame two-view test built separate G-buffer, lighting, and DrawScene command lists with distinct viewport snapshots after one observed game-process update; G-buffer and DrawScene commands for both views executed on the render thread. This is the measured scene-command boundary, not a headset image.
 4. [#004 — Select an OpenXR graphics bridge (closed)](issues/closed/004-select-openxr-bridge.md). The x86 D3D9Ex → D3D11 → SteamVR OpenXR swapchain copy/readback passed in a standalone probe; game integration remains open.
-5. [#005 — Add opt-in OpenXR initialization](issues/open/005-openxr-initialization.md).
+5. [#005 — Add opt-in OpenXR initialization (closed)](issues/closed/005-openxr-initialization.md). An x86 SteamVR D3D11 session and zero-layer frame loop run in the game. VR-off/on gameplay routes, reset recreation, missing-runtime fallback, controlled runtime loss, and command-driven shutdown passed. Headset visuals and frame pacing remain open; apartment-exit stutter needs measurement before performance claims.
 6. [#006 — Route two eye views with safe visibility and targets](issues/open/006-eye-visibility-and-targets.md). Main-world culling ran only once in #003's test; conservative or independent per-eye visibility, target routing, and pixel verification remain required.
 7. [#007 — Attribute UI and post-processing draw order](issues/open/007-ui-composition-order.md). Exact HUD, subtitle, phone, radar, and map pixel order remains unmeasured.
+8. [#009 — Local development command bridge (closed)](issues/closed/009-local-development-command-bridge.md). The opt-in named pipe supports live status and clean quit with explicit OpenXR shutdown; subsequent launches succeeded.
 
 ## References
 

@@ -24,6 +24,12 @@ Track work in `issues/open/` and `issues/closed/` using `issues/README.md`. Star
 6. Include in each change report: what changed, build/test results, game/runtime versions when relevant, observed frame-time data if performance is claimed, and remaining limitations.
 7. To launch this Steam Complete Edition install for runtime tests, run `steam.exe -applaunch 12210` outside the restricted command sandbox or start `GTAIV/PlayGTAIV.exe` directly. Both routes have worked, and either can exit intermittently during startup. Verify that `GTAIV.exe` appears and remains responsive; `PlayGTAIV.exe` or Rockstar Launcher alone does not establish success. Do not launch a second copy while `GTAIV.exe` is running.
 
+## Development command bridge
+
+- Prefer the local named-pipe bridge over UI automation for supported game commands. Enable `[DEVELOPMENT] EnableCommandBridge=1` in the installed ASI's INI for development; the distributed default remains off. Preserve the installed INI and ASI before deployment.
+- Run `tools/game-command.ps1 status` to inspect the current game/OpenXR session and `tools/game-command.ps1 quit` to release OpenXR on the EndScene callback thread and request the game's normal window close. Use `-GameProcessId` when discovery is ambiguous. Verify that `GTAIV.exe` actually exits before deploying or launching another copy; command acceptance alone is not exit evidence.
+- The user has authorized closing and relaunching the game for tests. Do not repeatedly ask them to launch or quit manually. The bridge does not save the game; do not add save-writing or arbitrary-execution commands without a specific user request. See `docs/development-command-bridge.md` for protocol and limits.
+
 ## Ghidra project workflow
 
 - Use the Ghidra MCP for game-binary analysis. At the start of a session, call `list_instances`, connect to `GTAIV` with `connect_instance` if needed, then call `list_open_programs`; confirm `/GTAIV.exe` is the intended program before editing. Pass `program: "GTAIV.exe"` on program-specific calls, especially if more than one program is open. The tested import is 32-bit x86 with Ghidra image base `0x00400000`.

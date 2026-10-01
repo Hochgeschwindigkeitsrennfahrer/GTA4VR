@@ -5,6 +5,8 @@ import comvars;
 import compat;
 import fusiondxhook;
 import vrtrace;
+import openxrvr;
+import devcontrol;
 
 std::vector<std::future<void>> initializationFutures;
 
@@ -46,6 +48,8 @@ void CGameProcessHook()
 void Init()
 {
     VRTrace::Install();
+    OpenXRVR::Install();
+    DevControl::Install();
     auto pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9");
     hbCGameProcess.fun = injector::MakeCALL(pattern.get_first(0), CGameProcessHook, true).get();
 

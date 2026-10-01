@@ -65,6 +65,11 @@ jobs:
     - name: Configure build
       run: ./premake5 vs2026 --with-version=${{ steps.versioning.outputs.version }}
 
+    - name: Build x86 OpenXR loader
+      run: |
+        cmake -S external/openxr-sdk -B build/openxr-loader-win32 -G "Visual Studio 18 2026" -A Win32 -DDYNAMIC_LOADER=ON -DBUILD_TESTS=OFF
+        cmake --build build/openxr-loader-win32 --config Release --target openxr_loader --parallel 4
+
     - name: Build
       run: msbuild -m build/GTAIV.EFLC.FusionFix.slnx /property:Configuration=Release /property:Platform=Win32
 

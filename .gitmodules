@@ -14,3 +14,6 @@
 [submodule "external/modupdater"]
 	path = external/modupdater
 	url = https://github.com/ThirteenAG/modupdater
+[submodule "external/openxr-sdk"]
+	path = external/openxr-sdk
+	url = https://github.com/KhronosGroup/OpenXR-SDK-Source.git

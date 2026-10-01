@@ -159,6 +159,8 @@ workspace "GTAIV.EFLC.FusionFix"
 
 project "GTAIV.EFLC.FusionFix"
    targetdir "bin"
+   includedirs { "external/openxr-sdk/include" }
+   links { "d3d11.lib", "dxgi.lib", "advapi32.lib" }
 
    local gamedir = envdir("GTAIV_DIR")
    if gamedir then
