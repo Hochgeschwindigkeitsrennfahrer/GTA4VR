@@ -3,14 +3,27 @@ module;
 #include "includes/vrmath.hpp"
 #include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <cwchar>
+#include <intrin.h>
 export module vrcamera;
 import common;
 import comvars;
 import openxrvr;
+import natives;
 
 export namespace VRCamera
 {
     void Install();
+    void Recenter(); // Atomic request, consumed by the world list builder.
+    bool RestartAnchorProbe();
+    std::string MovementStatus();
+    std::string AimStatus();
+    void SetVisibilityAvailable(bool available);
+    bool HideLocalCharacter(const void* entity);
+    bool ShowLocalBody(const void* entity);
+    void SetHeadlessBodyAvailable(bool available);
+    bool IsFirstPersonActive();
     bool Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (&eyes)[2],
         rage::grcViewport (&output)[2]);
 }
@@ -21,11 +34,775 @@ namespace
     Setter setCamera=nullptr, setProjection=nullptr;
     std::atomic<bool> recenter{true};
     VRMath::Matrix referenceInverse{};
+    bool probeAnchor=false;
+    bool firstPerson=false;
+    std::atomic<bool> firstPersonActive{false};
+    bool visibilityAvailable=false;
+    bool debugBody=false;
+    std::atomic<bool> headlessBodyAvailable{false};
+    VRMath::Matrix trackingBasis{};
+    float headHeight=0;
+    Vehicle anchorVehicle=0;
+    std::atomic<bool> vehicleView{false};
+    std::atomic<bool> crouchedView{false},airborneView{false};
+    std::atomic<bool> animatedView{false},ragdollView{false};
+    std::atomic<bool> vehicleExitView{false};
+    SRWLOCK animationLock=SRWLOCK_INIT;
+    void* animationOwner=nullptr;
+    Ped animationPed=0;
+    bool animationDriven=false,animationRagdoll=false,animationVehicleExit=false;
+    uint64_t animationSampledAt=0;
+    bool physicalCrouchEnabled=false;
+    std::atomic<bool> physicalCrouchOwnsDuck{false};
+    bool physicalDuckAcknowledged=false;
+    Ped physicalCrouchOwner=0;
+    VRMath::PhysicalCrouch physicalCrouch{};
+    Vehicle seatVehicle=0;
+    Ped seatPed=0;
+    bool seatAnchorValid=false;
+    VRMath::Vector seatOffset{};
+    float vehicleEyeHeightOffset=.075f;
+    unsigned anchorFrames=0, anchorSamples=0;
+    unsigned probeSamples=8;
+    using ColliderLookup=void* (__thiscall*)(void*);
+    ColliderLookup colliderLookup=nullptr;
+    SafetyHookInline colliderVelocity{};
+    SafetyHookInline moveBlendOutput{};
+    std::atomic<void*> localPed{nullptr};
+    std::atomic<bool> motionProbeComplete{false};
+    std::atomic<bool> restartAnchorProbe{false};
+    std::atomic<void*> localCollider{nullptr};
+    SRWLOCK motionLock=SRWLOCK_INIT;
+    unsigned velocityCalls=0;
+    float lastVelocity[3]{};
+    unsigned moveBlendCalls=0;
+    uintptr_t moveBlendCaller=0;
+    float lastMoveBlend[3]{}, lastMoveTarget[3]{}, lastMoveDt=0;
+    bool headRelativeMovement=false;
+    SafetyHookInline movementHeading{};
+    SRWLOCK headingLock=SRWLOCK_INIT;
+    bool headingValid=false;
+    void* headingOwner=nullptr;
+    float headHeading=0,lastOriginalHeading=0,lastAppliedHeading=0;
+    uint64_t headingSampledAt=0;
+    unsigned headingQueries=0,headingOverrides=0;
+    bool headsetAim=false;
+    SafetyHookInline weaponCameraUpdate{};
+    SafetyHookMid weaponBasis[2]{};
+    SRWLOCK aimLock=SRWLOCK_INIT;
+    bool aimValid=false;
+    void* aimOwner=nullptr;
+    VRMath::Matrix aimCamera{};
+    float aimPitch=0,aimYaw=0;
+    uint64_t aimSampledAt=0;
+    unsigned aimUpdates=0,aimOverrides=0;
+    std::atomic<bool> lockonSuppressed{false};
+    // Only accessed by the simulation callback, never by the render hooks.
+    void* lockonOwner=nullptr;
+    bool savedLockon=false;
+    bool roomScale=false;
+    SRWLOCK roomLock=SRWLOCK_INIT;
+    VRMath::RoomMotion roomMotion{};
+    VRMath::Vector lastRoomPosition{};
+    VRMath::Vector processedRoomPosition{};
+    bool roomSampleValid=false;
+    void* roomOwner=nullptr;
+    uint64_t roomSampledAt=0;
+    unsigned roomMotorCalls=0;
+    VRMath::Vector roomAchieved{}, lastBodyPosition{}, normalTarget{};
+    VRMath::Vector lastRoomVelocity{},diagnosticBody{},diagnosticView{};
+    bool bodySampleValid=false;
+    uint64_t roomDrivingAt=0;
+    float gameGroundZ=NAN,physicalEyeHeight=NAN;
+    float bodyRootAboveFloor=.9f;
+    using VolumeQuery=bool (__cdecl*)(const float*,const float*,float,void*,void*,uint32_t,uint32_t,int,int);
+    VolumeQuery volumeQuery=nullptr;
+    using PositionSetter=void (__thiscall*)(void*,const float*,int,int);
+    using PhysicsSync=void (__thiscall*)(void*,int);
+    PositionSetter positionSetter=nullptr;
+    PhysicsSync physicsSync=nullptr;
+    unsigned collisionProbeSamples=0;
+    uint64_t collisionProbeAt=0;
+
+    // Bounded diagnostic on the existing pedestrian motor callback thread.
+    // These native scene queries do not move the entity. Their two query modes
+    // and result fields must be measured before using them to resolve movement.
+    void ProbeRoomCollision(void* owner)
+    {
+        if(!probeAnchor || !volumeQuery || collisionProbeSamples>=8 ||
+            !owner || owner!=localPed.load() || GetTickCount64()-collisionProbeAt<1000) return;
+        auto* matrix=*reinterpret_cast<float**>(static_cast<char*>(owner)+0x20);
+        if(!matrix) return;
+        alignas(16) float start[4]{matrix[12],matrix[13],matrix[14]+.085f,0};
+        if(!std::isfinite(start[0]+start[1]+start[2])) return;
+        wchar_t path[MAX_PATH]{};
+        if(!GetModuleFileNameW(nullptr,path,MAX_PATH)) return;
+        auto* name=wcsrchr(path,L'\\');
+        if(!name) return;
+        name[1]=0;
+        if(wcscat_s(path,L"FusionFix.vr-collision-probe.log")) return;
+        FILE* file=nullptr;
+        if(_wfopen_s(&file,path,collisionProbeSamples ? L"a" : L"w")) return;
+        collisionProbeAt=GetTickCount64();
+        const unsigned direction=collisionProbeSamples%4;
+        alignas(16) float end[4]{start[0],start[1],start[2],0};
+        end[direction/2]+=(direction%2 ? -2.f : 2.f);
+        for(int mode=0;mode<2;++mode)
+        {
+            // Native callers initialize 0x60-byte results. Guard the following
+            // bytes to detect a wrong capacity assumption in this diagnostic.
+            alignas(16) unsigned char result[0x80]{};
+            const uint32_t invalidPair=0x0000ffff;
+            std::memcpy(result+0x54,&invalidPair,sizeof(invalidPair));
+            std::memset(result+0x60,0xA5,0x20);
+            const bool hit=volumeQuery(start,end,.25f,owner,result,0x8E,0xffffffff,mode,0);
+            bool guard=true;
+            for(unsigned i=0x60;i<sizeof(result);++i) guard=guard && result[i]==0xA5;
+            fprintf(file,"sample=%u mode=%d start=(%.6f %.6f %.6f) end=(%.6f %.6f %.6f) radius=.25 hit=%u guard=%u raw=",
+                collisionProbeSamples,mode,start[0],start[1],start[2],end[0],end[1],end[2],hit,guard);
+            for(unsigned i=0;i<0x60;++i) fprintf(file,"%02X",result[i]);
+            fprintf(file,"\n");
+            if(!guard) {volumeQuery=nullptr; break;}
+        }
+        fclose(file);
+        ++collisionProbeSamples;
+    }
+
+    void StopRoomMotion()
+    {
+        AcquireSRWLockExclusive(&roomLock);
+        roomOwner=nullptr;
+        roomSampleValid=false;
+        bodySampleValid=false;
+        roomDrivingAt=0;
+        roomMotion.ClearPending();
+        ReleaseSRWLockExclusive(&roomLock);
+    }
+
+    bool MoveRoomBody(void* owner,const VRMath::Vector& delta,VRMath::Vector& body)
+    {
+        if(!positionSetter || !physicsSync || !volumeQuery || !owner ||
+            !*reinterpret_cast<void**>(static_cast<char*>(owner)+0x38)) return false;
+        auto* matrix=*reinterpret_cast<float**>(static_cast<char*>(owner)+0x20);
+        if(!matrix || reinterpret_cast<PositionSetter>((*reinterpret_cast<uintptr_t**>(owner))[2])!=positionSetter)
+            return false;
+        alignas(16) float position[4]{matrix[12],matrix[13],matrix[14],matrix[15]};
+        const float distance=std::hypot(delta[0],delta[1]);
+        if(!std::isfinite(position[0]+position[1]+position[2]+distance) || distance>.3f) return false;
+        float fraction=1.f;
+        if(distance>1.e-5f)
+        {
+            // Conservative sphere cover of the measured standing torso capsule:
+            // axis z=[-.4,.57], radius .25. Inflation covers the space between
+            // samples. Native floor/support physics still owns vertical travel;
+            // this is not a complete composite/crouched-body sweep.
+            for(unsigned sample=0;sample<=10 && fraction>0;++sample)
+            {
+                alignas(16) float start[4]{position[0],position[1],position[2]-.4f+.097f*sample,0};
+                alignas(16) float end[4]{start[0]+delta[0],start[1]+delta[1],start[2],0};
+                alignas(16) unsigned char hit[0x60]{};
+                const uint32_t invalidPair=0xffff;
+                std::memcpy(hit+0x54,&invalidPair,sizeof(invalidPair));
+                if(volumeQuery(start,end,.256f,owner,hit,0x8E,0xffffffff,1,0))
+                {
+                    float contactFraction=0;
+                    std::memcpy(&contactFraction,hit+0x40,sizeof(contactFraction));
+                    fraction=std::min(fraction,VRMath::SafeSweepFraction(contactFraction,distance));
+                }
+            }
+            position[0]+=delta[0]*fraction;
+            position[1]+=delta[1]*fraction;
+            // Skip the ped's full relocation/reset path. Synchronize the
+            // physics matrices/broadphase directly, including previous collider
+            // transform, without clearing ped contact/motor/IK history.
+            positionSetter(owner,position,1,0);
+            physicsSync(owner,1);
+            ++roomMotorCalls;
+        }
+        for(unsigned axis=0;axis<3;++axis) body[axis]=matrix[12+axis];
+        body[3]=1;
+        return true;
+    }
+
+    bool AnimationControlsBody(Ped ped,void* owner,bool& ragdoll,bool* exiting=nullptr)
+    {
+        if(exiting) *exiting=false;
+        ragdoll=NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_PED_RAGDOLL)) &&
+            Natives::IsPedRagdoll(ped);
+        if(ragdoll) return true;
+        if(!owner || !*reinterpret_cast<void**>(static_cast<char*>(owner)+0x224)) return false;
+        const auto address=reinterpret_cast<uintptr_t>(owner);
+        for(auto task:{TaskID::TaskComplexNewExitVehicle,TaskID::TaskSimpleCarGetOut,
+            TaskID::TaskSimpleCarJumpOut,TaskID::TaskSimpleCarSlowBeDraggedOut})
+            if(CPed::ComparePedTasks(address,task))
+            {if(exiting) *exiting=true; return true;}
+        // ComparePedTasks combines its arguments with AND; test alternatives
+        // separately. These task IDs already drive FusionFix's climb/jump code.
+        for(auto task:{TaskID::TaskSimpleClimb,TaskID::TaskSimpleClimbLadder,
+            TaskID::TaskSimpleGetUp,TaskID::TaskSimpleBlendFromNM})
+            if(CPed::ComparePedTasks(address,task)) return true;
+        return false;
+    }
+
+    void SampleAnimationState()
+    {
+        Ped ped=0; void* owner=nullptr; bool animated=false,ragdoll=false,exiting=false;
+        using Hash=Natives::NativeHashes;
+        if(NativeInvoke::GetNativeHandler(std::to_underlying(Hash::GET_PLAYER_ID)) &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Hash::GET_PLAYER_CHAR)) &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Hash::DOES_CHAR_EXIST)))
+        {
+            Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+            if(ped && Natives::DoesCharExist(ped))
+            {
+                owner=FindPlayerPed ? FindPlayerPed(0) : nullptr;
+                animated=AnimationControlsBody(ped,owner,ragdoll,&exiting);
+            }
+        }
+        AcquireSRWLockExclusive(&animationLock);
+        animationOwner=owner; animationPed=ped;
+        animationDriven=animated; animationRagdoll=ragdoll;
+        animationVehicleExit=exiting;
+        animationSampledAt=GetTickCount64();
+        ReleaseSRWLockExclusive(&animationLock);
+    }
+
+    void ProcessRoomBody()
+    {
+        // Simulation owns entity/physics writes. Camera preparation only
+        // publishes tracking and renders the unconsumed immediate head delta.
+        if(!roomScale || !OpenXRVR::HasFocusedViews() ||
+            (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive)) return;
+        // A render sample can still describe on-foot play on the simulation
+        // tick that enters a vehicle, dies or starts a cutscene. Recheck the
+        // current native state before moving the ped's physics transform.
+        using Hash=Natives::NativeHashes;
+        for(auto hash:{Hash::GET_PLAYER_ID,Hash::GET_PLAYER_CHAR,Hash::DOES_CHAR_EXIST,
+            Hash::IS_CHAR_IN_ANY_CAR,Hash::IS_CHAR_DEAD,Hash::HAS_CUTSCENE_LOADED,
+            Hash::HAS_CUTSCENE_FINISHED})
+            if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return;
+        Ped ped=0;
+        Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+        if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharInAnyCar(ped) ||
+            Natives::IsCharDead(ped) ||
+            (Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished())) return;
+        void* owner=FindPlayerPed ? FindPlayerPed(0) : nullptr;
+        bool ragdoll=false;
+        if(AnimationControlsBody(ped,owner,ragdoll)) {StopRoomMotion(); return;}
+        AcquireSRWLockExclusive(&roomLock);
+        if(owner && owner==roomOwner && roomSampleValid && GetTickCount64()-roomSampledAt<=100)
+        {
+            VRMath::Vector delta{},body{};
+            for(unsigned axis=0;axis<2;++axis) delta[axis]=lastRoomPosition[axis]-processedRoomPosition[axis];
+            auto* matrix=*reinterpret_cast<float**>(static_cast<char*>(owner)+0x20);
+            VRMath::Vector before{};
+            if(matrix) for(unsigned axis=0;axis<3;++axis) before[axis]=matrix[12+axis];
+            if(MoveRoomBody(owner,delta,body))
+                for(unsigned axis=0;axis<2;++axis)
+                {
+                    roomMotion.consumed[axis]+=delta[axis];
+                    roomAchieved[axis]+=body[axis]-before[axis];
+                }
+            processedRoomPosition=lastRoomPosition;
+        }
+        ReleaseSRWLockExclusive(&roomLock);
+    }
+
+    void InvalidateHeading()
+    {
+        AcquireSRWLockExclusive(&headingLock);
+        headingValid=false;
+        headingOwner=nullptr;
+        ReleaseSRWLockExclusive(&headingLock);
+        AcquireSRWLockExclusive(&aimLock);
+        aimValid=false;
+        aimOwner=nullptr;
+        ReleaseSRWLockExclusive(&aimLock);
+    }
+
+    bool ReadAim(void* ped,VRMath::Matrix& camera,float& pitch,float& yaw)
+    {
+        const bool focused=OpenXRVR::HasFocusedViews();
+        AcquireSRWLockShared(&aimLock);
+        const bool valid=headsetAim && focused && firstPersonActive && !vehicleView && !animatedView &&
+            !(CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) && aimValid && ped && ped==aimOwner &&
+            GetTickCount64()-aimSampledAt<=250;
+        if(valid) {camera=aimCamera; pitch=aimPitch; yaw=aimYaw;}
+        ReleaseSRWLockShared(&aimLock);
+        return valid;
+    }
+
+    void SuppressAimLockon()
+    {
+        void* ped=FindPlayerPed ? FindPlayerPed(0) : nullptr;
+        VRMath::Matrix camera{};
+        float pitch=0,yaw=0;
+        const bool apply=ReadAim(ped,camera,pitch,yaw);
+        // DISABLE_PLAYER_LOCKON's verified native storage. Preserve its prior
+        // bit rather than blindly enabling lock-on on VR fallback. Never follow
+        // an old ped pointer after the player owner changes.
+        if(lockonOwner && lockonOwner!=ped) {lockonOwner=nullptr; lockonSuppressed=false;}
+        if(!ped) return;
+        auto& flags=*reinterpret_cast<uint32_t*>(static_cast<char*>(ped)+0x264);
+        if(apply)
+        {
+            if(!lockonOwner) {savedLockon=(flags&0x800000)!=0; lockonOwner=ped;}
+            flags|=0x800000;
+            lockonSuppressed=true;
+        }
+        else if(lockonOwner==ped)
+        {
+            flags=(flags&~0x800000u)|(savedLockon ? 0x800000u : 0u);
+            lockonOwner=nullptr;
+            lockonSuppressed=false;
+        }
+    }
+
+    void HeadsetWeaponBasis(SafetyHookContext& regs)
+    {
+        auto* cam=reinterpret_cast<char*>(regs.edi);
+        VRMath::Matrix camera{};
+        float pitch=0,yaw=0;
+        if(!ReadAim(*reinterpret_cast<void**>(cam+0x204),camera,pitch,yaw)) return;
+        // Immediately before native thiscall matrix.SetPitchYaw(pitch,yaw).
+        // Both aim branches have allocated its two stack arguments here.
+        regs.xmm0.f32[0]=pitch;
+        *reinterpret_cast<float*>(regs.esp+4)=yaw;
+        *reinterpret_cast<float*>(cam+0x218)=pitch;
+        *reinterpret_cast<float*>(cam+0x21C)=yaw;
+        AcquireSRWLockExclusive(&aimLock);
+        ++aimOverrides;
+        ReleaseSRWLockExclusive(&aimLock);
+    }
+
+    char __fastcall UpdateWeaponCamera(void* self,void* edx)
+    {
+        const char result=weaponCameraUpdate.unsafe_fastcall<char>(self,edx);
+        VRMath::Matrix camera{};
+        float pitch=0,yaw=0;
+        auto* cam=static_cast<char*>(self);
+        if(result && ReadAim(*reinterpret_cast<void**>(cam+0x204),camera,pitch,yaw))
+        {
+            // Native camera matrix rows are right/forward/up, unlike the
+            // viewport's right/up/back. Publish the eye midpoint for gameplay
+            // ray queries after update, rather than the chase-camera origin.
+            const VRMath::Vector rows[4]{camera[0],
+                {-camera[2][0],-camera[2][1],-camera[2][2],0},camera[1],camera[3]};
+            for(unsigned row=0;row<4;++row)
+                std::memcpy(cam+0x10+row*16,rows[row].data(),3*sizeof(float));
+            AcquireSRWLockExclusive(&aimLock);
+            ++aimUpdates;
+            ReleaseSRWLockExclusive(&aimLock);
+        }
+        return result;
+    }
+
+    // CE camera helper: thiscall(camera*, ped*, bool), ret 8, x87 return.
+    // It supplies a reference angle; it does not own axis magnitude or motion.
+    float __fastcall WalkingHeading(void* self,void* edx,void* ped,int reverse)
+    {
+        const float original=movementHeading.unsafe_fastcall<float>(self,edx,ped,reverse);
+        const bool focused=OpenXRVR::HasFocusedViews();
+        AcquireSRWLockExclusive(&headingLock);
+        // This helper is called during loading, before player-info lookup is
+        // necessarily safe. Compare against the owner published with a valid
+        // on-foot camera, rather than looking up the player in this callback.
+        if(!headingOwner || ped!=headingOwner)
+        {
+            ReleaseSRWLockExclusive(&headingLock);
+            return original;
+        }
+        ++headingQueries;
+        lastOriginalHeading=original;
+        const bool apply=focused && headingValid && GetTickCount64()-headingSampledAt<=250;
+        const float result=apply ? headHeading : original;
+        if(apply) ++headingOverrides;
+        lastAppliedHeading=result;
+        ReleaseSRWLockExclusive(&headingLock);
+        return result;
+    }
+
+    // CE CPedMoveBlendOnFoot virtual +0x10, thiscall(output*, dt), ret 8.
+    // Call the original motor unchanged, then correct horizontal delta velocity
+    // for room motion. The physics consumer still owns force/collision; no ped
+    // transform, velocity setter or animation-target field is overwritten.
+    float* __fastcall ObserveMoveBlend(void* self,void* edx,float* output,float dt)
+    {
+        const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress());
+        auto* owner=*reinterpret_cast<void**>(static_cast<char*>(self)+0x24);
+        auto* result=moveBlendOutput.unsafe_fastcall<float*>(self,edx,output,dt);
+        if(caller-reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0x400000==0x009E3337)
+            ProbeRoomCollision(owner);
+        if(owner && owner==localPed.load() && result)
+        {
+            AcquireSRWLockExclusive(&motionLock);
+            ++moveBlendCalls;
+            moveBlendCaller=caller;
+            lastMoveDt=dt;
+            std::memcpy(lastMoveBlend,result,sizeof(lastMoveBlend));
+            std::memcpy(lastMoveTarget,static_cast<char*>(owner)+0xA90,sizeof(lastMoveTarget));
+            ReleaseSRWLockExclusive(&motionLock);
+        }
+        return result;
+    }
+
+    void __fastcall ObserveVelocity(void* self,void* edx,const float* velocity)
+    {
+        if(self==localCollider.load() && velocity)
+        {
+            AcquireSRWLockExclusive(&motionLock);
+            ++velocityCalls;
+            std::memcpy(lastVelocity,velocity,sizeof(lastVelocity));
+            ReleaseSRWLockExclusive(&motionLock);
+        }
+        colliderVelocity.unsafe_fastcall(self,edx,velocity);
+    }
+
+    void ProcessPhysicalCrouch()
+    {
+        if(!physicalCrouchEnabled || !firstPersonActive || vehicleView || !OpenXRVR::HasFocusedViews() ||
+            (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive)) return;
+        using Hash=Natives::NativeHashes;
+        for(auto hash:{Hash::GET_PLAYER_ID,Hash::GET_PLAYER_CHAR,Hash::DOES_CHAR_EXIST,
+            Hash::IS_CHAR_IN_ANY_CAR,Hash::IS_CHAR_DEAD,Hash::IS_CHAR_DUCKING,Hash::SET_CHAR_DUCKING,Hash::IS_CHAR_IN_AIR,
+            Hash::HAS_CUTSCENE_LOADED,Hash::HAS_CUTSCENE_FINISHED})
+            if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return;
+        Ped ped=0; Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+        if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharInAnyCar(ped) || Natives::IsCharDead(ped) || Natives::IsCharInAir(ped) ||
+            (Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished())) return;
+        bool ragdoll=false;
+        if(AnimationControlsBody(ped,FindPlayerPed ? FindPlayerPed(0) : nullptr,ragdoll)) return;
+        if(ped!=physicalCrouchOwner)
+        {physicalCrouchOwner=ped; physicalCrouchOwnsDuck=false; physicalDuckAcknowledged=false;}
+        const bool ducking=Natives::IsCharDucking(ped);
+        // Observe the game's response, so keyboard and gamepad bindings both
+        // work. Once duck was acknowledged, its cancellation must not be
+        // immediately replaced by the still-low physical height.
+        const bool canceled=physicalDuckAcknowledged && !ducking;
+        AcquireSRWLockExclusive(&roomLock);
+        if(canceled) physicalCrouch.CancelUntilStanding();
+        const float height=physicalEyeHeight;
+        const bool valid=std::isfinite(height) && height>=.45f && height<=2.5f;
+        const bool lowered=valid && physicalCrouch.Update(height);
+        ReleaseSRWLockExclusive(&roomLock);
+        if(canceled) {physicalCrouchOwnsDuck=false; physicalDuckAcknowledged=false;}
+        if(!valid) return;
+        if(ducking) physicalDuckAcknowledged=true;
+        if(lowered && !ducking)
+        {Natives::SetCharDucking(ped,true); physicalCrouchOwnsDuck=true; physicalDuckAcknowledged=false;}
+        else if(!lowered && physicalCrouchOwnsDuck)
+        {
+            if(ducking) Natives::SetCharDucking(ped,false);
+            physicalCrouchOwnsDuck=false;
+            physicalDuckAcknowledged=false;
+        }
+    }
+
+    Vector3 HeadPosition(Ped ped)
+    {
+        Vector3 head{NAN,NAN,NAN};
+        NativeContext context;
+        context.Push(ped); context.Push(uint32_t{1205});
+        context.Push(0.f); context.Push(0.f); context.Push(0.f); context.Push(&head);
+        auto handler=NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::GET_PED_BONE_POSITION));
+        if(!handler) return head;
+        handler(&context);
+        // Explicit vector output finalization; generic Invoke<void> skips it.
+        (void)context.scrNativeCallContext::GetResult<uint32_t>(0);
+        return head;
+    }
+
+    bool GameplayAnchor(VRMath::Vector& position,float& heading,float& height,float& groundZ,
+        Vehicle& vehicle,bool& ducking,bool& airborne,VRMath::Matrix& vehicleBasis,bool& animated,bool& ragdoll,bool& exiting)
+    {
+        using Hash=Natives::NativeHashes;
+        for(auto hash:{Hash::GET_PLAYER_ID,Hash::GET_PLAYER_CHAR,Hash::DOES_CHAR_EXIST,
+            Hash::GET_CHAR_COORDINATES,Hash::GET_CHAR_HEADING,Hash::IS_CHAR_IN_ANY_CAR,
+            Hash::IS_CHAR_DEAD,Hash::HAS_CUTSCENE_LOADED,Hash::HAS_CUTSCENE_FINISHED})
+            if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return false;
+        if(Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished()) return false;
+        Ped ped=0;
+        Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+        if(!ped || !Natives::DoesCharExist(ped)) return false;
+        position={NAN,NAN,NAN,1}; heading=NAN;
+        Natives::GetCharCoordinates(ped,&position[0],&position[1],&position[2]);
+        Natives::GetCharHeading(ped,&heading);
+        auto head=HeadPosition(ped);
+        void* owner=FindPlayerPed ? FindPlayerPed(0) : nullptr;
+        // Task lists are traversed only by simulation callbacks. Rendering
+        // consumes a short-lived snapshot belonging to this same player.
+        AcquireSRWLockShared(&animationLock);
+        if(owner && owner==animationOwner && ped==animationPed && GetTickCount64()-animationSampledAt<=250)
+        {animated=animationDriven; ragdoll=animationRagdoll; exiting=animationVehicleExit;}
+        ReleaseSRWLockShared(&animationLock);
+        // Ejection can be fatal: retain the ragdoll anchor while that body
+        // still exists, rather than selecting the ordinary death/chase camera.
+        if(Natives::IsCharDead(ped) && !ragdoll) return false;
+        if(ragdoll && owner && NaturalMotion::GetRagdollComponentMatrixInternal)
+        {
+            NaturalMotion::RagdollComponentMatrix neck{};
+            if(NaturalMotion::GetRagdollComponentMatrixInternal(reinterpret_cast<uintptr_t>(owner),&neck,
+                static_cast<int32_t>(NaturalMotion::RagdollComponent::Neck)) &&
+                std::isfinite(neck.values[12]+neck.values[13]+neck.values[14]))
+                head={neck.values[12],neck.values[13],neck.values[14]+.12f};
+        }
+        height=head.fZ-position[2];
+        ducking=NativeInvoke::GetNativeHandler(std::to_underlying(Hash::IS_CHAR_DUCKING)) && Natives::IsCharDucking(ped);
+        airborne=NativeInvoke::GetNativeHandler(std::to_underlying(Hash::IS_CHAR_IN_AIR)) && Natives::IsCharInAir(ped);
+        if((!animated || exiting) && !ragdoll && Natives::IsCharInAnyCar(ped))
+        {
+            for(auto hash:{Hash::GET_CAR_CHAR_IS_USING,Hash::GET_CAR_HEADING,Hash::DOES_VEHICLE_EXIST,
+                Hash::GET_OFFSET_FROM_CAR_IN_WORLD_COORDS,Hash::GET_OFFSET_FROM_CAR_GIVEN_WORLD_COORDS,
+                Hash::IS_CHAR_SITTING_IN_ANY_CAR})
+                if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return false;
+            Natives::GetCarCharIsUsing(ped,&vehicle);
+            if(!vehicle || !Natives::DoesVehicleExist(vehicle)) return false;
+            Natives::GetCarHeading(vehicle,&heading);
+            if(seatVehicle!=vehicle || seatPed!=ped)
+            {seatVehicle=vehicle; seatPed=ped; seatAnchorValid=false;}
+            // Calibrate once after the ped is seated. Animated bone transforms
+            // can lag the vehicle and must not supply the moving camera origin.
+            if(!seatAnchorValid && Natives::IsCharSittingInAnyCar(ped) &&
+                std::isfinite(head.fX+head.fY+head.fZ) &&
+                std::hypot(head.fX-position[0],head.fY-position[1])<5 && std::abs(height)<5)
+            {
+                seatOffset={NAN,NAN,NAN,1};
+                Natives::GetOffsetFromCarGivenWorldCoords(vehicle,head.fX,head.fY,head.fZ,
+                    &seatOffset[0],&seatOffset[1],&seatOffset[2]);
+                seatAnchorValid=std::isfinite(seatOffset[0]+seatOffset[1]+seatOffset[2]) &&
+                    std::hypot(seatOffset[0],seatOffset[1])<5 && std::abs(seatOffset[2])<5;
+            }
+            auto carPoint=[vehicle](float x,float y,float z)
+            {
+                VRMath::Vector point{NAN,NAN,NAN,1};
+                Natives::GetOffsetFromCarInWorldCoords(vehicle,x,y,z,&point[0],&point[1],&point[2]);
+                return point;
+            };
+            const auto origin=carPoint(0,0,0);
+            const auto right=carPoint(1,0,0),up=carPoint(0,0,1),back=carPoint(0,-1,0);
+            vehicleBasis=VRMath::Identity();
+            for(unsigned axis=0;axis<3;++axis)
+            {
+                vehicleBasis[0][axis]=right[axis]-origin[axis];
+                vehicleBasis[1][axis]=up[axis]-origin[axis];
+                vehicleBasis[2][axis]=back[axis]-origin[axis];
+            }
+            if(seatAnchorValid && !exiting)
+                position=carPoint(seatOffset[0],seatOffset[1],seatOffset[2]+vehicleEyeHeightOffset);
+            else if(std::isfinite(head.fX+head.fY+head.fZ))
+            {
+                position={head.fX,head.fY,head.fZ,1};
+                for(unsigned axis=0;axis<3;++axis)
+                    position[axis]+=vehicleEyeHeightOffset*vehicleBasis[1][axis];
+            }
+            else return false;
+            groundZ=NAN;
+            return std::isfinite(position[0]+position[1]+position[2]+heading);
+        }
+        seatVehicle=0; seatPed=0; seatAnchorValid=false;
+        // Jump/fall/get-up animation can move the head below the root. That
+        // is not a reason to return to a third-person camera.
+        if(!std::isfinite(height) || std::abs(height)>5) height=headHeight>.1f ? headHeight : .7f;
+        float aboveGround=NAN;
+        if(NativeInvoke::GetNativeHandler(std::to_underlying(Hash::GET_CHAR_HEIGHT_ABOVE_GROUND)))
+            Natives::GetCharHeightAboveGround(ped,&aboveGround);
+        groundZ=std::isfinite(aboveGround) && aboveGround>=0 && aboveGround<20 ? position[2]-aboveGround : NAN;
+        if(animated && std::isfinite(head.fX+head.fY+head.fZ))
+        {
+            // Vaults and ragdolls can move the skeleton without moving the
+            // script-native root. Follow translation, never forced body roll.
+            position={head.fX,head.fY,head.fZ,1};
+            groundZ=NAN;
+        }
+        return std::isfinite(position[0]+position[1]+position[2]+heading+height);
+    }
+
+    // Runs on the world list-building thread. Read-only native queries; keep
+    // this bounded and disabled by default while establishing camera ownership.
+    void ProbeAnchor(const rage::grcViewport& base)
+    {
+        if(!probeAnchor || anchorSamples>=probeSamples || ++anchorFrames<180 ||
+            (anchorFrames-180)%120) return;
+        using Hash=Natives::NativeHashes;
+        for(auto hash:{Hash::GET_PLAYER_ID,Hash::GET_PLAYER_CHAR,
+            Hash::GET_CHAR_COORDINATES,Hash::GET_CHAR_HEADING,Hash::IS_CHAR_IN_ANY_CAR,
+            Hash::GET_PED_BONE_POSITION})
+            if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return;
+        Ped ped=0;
+        Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+        if(!ped) return;
+        float position[3]{NAN,NAN,NAN},heading=NAN;
+        Natives::GetCharCoordinates(ped,&position[0],&position[1],&position[2]);
+        Natives::GetCharHeading(ped,&heading);
+        if(!std::isfinite(position[0]+position[1]+position[2]+heading)) return;
+        // GTA IV Head=1205 in Sanny Builder's gta_iv/enums.json. Treat the
+        // resulting point as a candidate until paired runtime samples verify it.
+        const auto head=HeadPosition(ped);
+        wchar_t path[MAX_PATH]{};
+        if(!GetModuleFileNameW(nullptr,path,MAX_PATH)) return;
+        auto* name=wcsrchr(path,L'\\');
+        if(!name) return;
+        name[1]=L'\0';
+        if(wcscat_s(path,L"FusionFix.vr-camera.log")) return;
+        FILE* file=nullptr;
+        if(_wfopen_s(&file,path,anchorSamples ? L"a" : L"w")) return;
+        fprintf(file,"issue014 sample=%u frame=%u pedHandle=%d pedPointer=%p inVehicle=%u char=(%.6f %.6f %.6f) heading=%.6f\n",
+            anchorSamples,anchorFrames,ped,FindPlayerPed ? FindPlayerPed(0) : nullptr,
+            Natives::IsCharInAnyCar(ped),position[0],position[1],position[2],heading);
+        fprintf(file,"candidateHeadBone1205=(%.6f %.6f %.6f)\n",head.fX,head.fY,head.fZ);
+        fprintf(file,"firstPersonConfigured=%u firstPersonActive=%u\n",firstPerson,firstPersonActive.load());
+        AcquireSRWLockShared(&motionLock);
+        fprintf(file,"motionProbe collider=%p velocityCalls=%u lastVelocity=(%.6f %.6f %.6f)\n",
+            localCollider.load(),velocityCalls,lastVelocity[0],lastVelocity[1],lastVelocity[2]);
+        const auto moduleBase=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        fprintf(file,"moveBlendProbe installed=%u calls=%u callerVA=%08X dt=%.6f output=(%.6f %.6f %.6f) target=(%.6f %.6f %.6f)\n",
+            bool(moveBlendOutput),moveBlendCalls,
+            moveBlendCaller ? unsigned(moveBlendCaller-moduleBase+0x400000) : 0,lastMoveDt,
+            lastMoveBlend[0],lastMoveBlend[1],lastMoveBlend[2],
+            lastMoveTarget[0],lastMoveTarget[1],lastMoveTarget[2]);
+        ReleaseSRWLockShared(&motionLock);
+        for(unsigned row=0;row<4;++row)
+            fprintf(file,"gameCamera[%u]=(%.6f %.6f %.6f %.6f)\n",row,
+                base.mViewInverseMatrix[row][0],base.mViewInverseMatrix[row][1],
+                base.mViewInverseMatrix[row][2],base.mViewInverseMatrix[row][3]);
+        fclose(file);
+        ++anchorSamples;
+        if(anchorSamples>=probeSamples) motionProbeComplete=true;
+    }
 }
+
+void VRCamera::SetVisibilityAvailable(bool available) {visibilityAvailable=available; if(!available) {InvalidateHeading(); StopRoomMotion();}}
+void VRCamera::Recenter() {InvalidateHeading(); StopRoomMotion(); recenter=true;}
+std::string VRCamera::AimStatus()
+{
+    AcquireSRWLockShared(&aimLock);
+    char text[512];
+    sprintf_s(text,"{\"configured\":%s,\"installed\":%s,\"fresh\":%s,\"pitchRadians\":%.6f,\"yawRadians\":%.6f,\"basisOverrides\":%u,\"cameraUpdates\":%u,\"lockonSuppressed\":%s}",
+        headsetAim ? "true":"false",weaponCameraUpdate && weaponBasis[0] && weaponBasis[1] ? "true":"false",
+        aimValid && GetTickCount64()-aimSampledAt<=250 ? "true":"false",aimPitch,aimYaw,aimOverrides,aimUpdates,
+        lockonSuppressed ? "true":"false");
+    ReleaseSRWLockShared(&aimLock);
+    return text;
+}
+std::string VRCamera::MovementStatus()
+{
+    const bool focused=OpenXRVR::HasFocusedViews();
+    AcquireSRWLockShared(&headingLock);
+    char text[512];
+    sprintf_s(text,"{\"configured\":%s,\"installed\":%s,\"active\":%s,\"headingRadians\":%.6f,\"queries\":%u,\"overrides\":%u,\"originalRadians\":%.6f,\"appliedRadians\":%.6f,\"firstPerson\":%s,\"vehicle\":%s,\"ducking\":%s,\"airborne\":%s,\"animated\":%s,\"ragdoll\":%s,\"vehicleExiting\":%s}",
+        headRelativeMovement ? "true" : "false",movementHeading ? "true" : "false",
+        focused && headingValid && GetTickCount64()-headingSampledAt<=250 ? "true" : "false",
+        headHeading,headingQueries,headingOverrides,lastOriginalHeading,lastAppliedHeading,
+        firstPersonActive ? "true" : "false",vehicleView ? "true" : "false",
+        crouchedView ? "true" : "false",airborneView ? "true" : "false",animatedView ? "true" : "false",ragdollView ? "true" : "false",vehicleExitView ? "true" : "false");
+    ReleaseSRWLockShared(&headingLock);
+    AcquireSRWLockShared(&roomLock);
+    char room[640];
+    sprintf_s(room,",\"physicalCrouchInhibited\":%s,\"roomScale\":{\"configured\":%s,\"installed\":%s,\"ownerReady\":%s,\"motorCalls\":%u,\"pending\":[%.6f,%.6f],\"consumed\":[%.6f,%.6f],\"achieved\":[%.6f,%.6f],\"groundZ\":%.6f,\"floorEyeHeight\":%.6f,\"body\":[%.6f,%.6f,%.6f],\"view\":[%.6f,%.6f,%.6f]}}",
+        physicalCrouch.inhibited ? "true" : "false",roomScale ? "true" : "false",positionSetter && physicsSync && volumeQuery ? "true" : "false",roomOwner ? "true" : "false",
+        roomMotorCalls,roomMotion.pending[0],roomMotion.pending[1],roomMotion.consumed[0],roomMotion.consumed[1],
+        roomAchieved[0],roomAchieved[1],std::isfinite(gameGroundZ)?gameGroundZ:0,std::isfinite(physicalEyeHeight)?physicalEyeHeight:0,
+        diagnosticBody[0],diagnosticBody[1],diagnosticBody[2],diagnosticView[0],diagnosticView[1],diagnosticView[2]);
+    ReleaseSRWLockShared(&roomLock);
+    std::string result=text;
+    result.pop_back();
+    return result+room;
+}
+bool VRCamera::RestartAnchorProbe()
+{
+    if(!probeAnchor) return false;
+    restartAnchorProbe=true;
+    return true;
+}
+
+bool VRCamera::HideLocalCharacter(const void* entity)
+{
+    return firstPersonActive && visibilityAvailable && FindPlayerPed && entity==FindPlayerPed(0) &&
+        !(debugBody && headlessBodyAvailable.load());
+}
+
+bool VRCamera::ShowLocalBody(const void* entity)
+{
+    return firstPersonActive && visibilityAvailable && debugBody && headlessBodyAvailable.load() &&
+        FindPlayerPed && entity==FindPlayerPed(0);
+}
+void VRCamera::SetHeadlessBodyAvailable(bool available) {headlessBodyAvailable=available;}
 
 void VRCamera::Install()
 {
     CIniReader ini("");
+    debugBody=ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0)!=0;
+    probeAnchor=ini.ReadInteger("DEVELOPMENT","ProbeFirstPersonAnchor",0)!=0;
+    probeSamples=std::clamp(ini.ReadInteger("DEVELOPMENT","FirstPersonProbeSamples",8),1,240);
+    firstPerson=ini.ReadInteger("VR","ExperimentalFirstPerson",0)!=0;
+    roomScale=firstPerson && ini.ReadInteger("VR","ExperimentalRoomScale",0)!=0;
+    physicalCrouchEnabled=firstPerson && ini.ReadInteger("VR","ExperimentalPhysicalCrouch",0)!=0;
+    const float crouchReference=ini.ReadFloat("VR","PlayerHeight",1.75f);
+    const float vehicleHeight=ini.ReadFloat("VR","VehicleEyeHeightOffset",.075f);
+    if(std::isfinite(vehicleHeight)) vehicleEyeHeightOffset=std::clamp(vehicleHeight,-.3f,.5f);
+    if(std::isfinite(crouchReference) && crouchReference>=.45f && crouchReference<=2.5f)
+        physicalCrouch.reference=crouchReference;
+    if(firstPerson) FusionFix::onGameProcessEvent() += SampleAnimationState;
+    if(physicalCrouchEnabled) FusionFix::onGameProcessEvent() += ProcessPhysicalCrouch;
+    headRelativeMovement=firstPerson && ini.ReadInteger("VR","ExperimentalHeadRelativeMovement",0)!=0;
+    headsetAim=firstPerson && ini.ReadInteger("VR","ExperimentalHeadsetAim",0)!=0;
+    if(headsetAim)
+    {
+        auto update=hook::pattern("55 8B EC 83 E4 F0 81 EC A4 01 00 00 53 56 57 8B F9 C6 87 C4 02 00 00 00");
+        auto basis0=hook::pattern("F3 0F 11 04 24 E8 ? ? ? ? F3 0F 10 4F 20 F3 0F 10 57 28");
+        auto basis1=hook::pattern("F3 0F 11 04 24 E8 ? ? ? ? F3 0F 10 47 20 F3 0F 10 5C 24 10");
+        if(update.size()==1 && basis0.size()==1 && basis1.size()==1)
+        {
+            weaponBasis[0]=safetyhook::create_mid(basis0.get_first(),HeadsetWeaponBasis);
+            weaponBasis[1]=safetyhook::create_mid(basis1.get_first(),HeadsetWeaponBasis);
+            weaponCameraUpdate=safetyhook::create_inline(update.get_first(),UpdateWeaponCamera);
+            if(weaponCameraUpdate && weaponBasis[0] && weaponBasis[1])
+                FusionFix::onGameProcessEvent() += SuppressAimLockon;
+            else headsetAim=false;
+        }
+        else headsetAim=false;
+    }
+    if(headRelativeMovement)
+    {
+        auto heading=hook::pattern("56 57 6A 00 8B F9 8B 0D ? ? ? ? 6A 01 E8 ? ? ? ? 8B F0 85 F6 74 75 8B 16 8B CE FF 52 0C");
+        if(heading.size()==1) movementHeading=safetyhook::create_inline(heading.get_first(),WalkingHeading);
+    }
+    if(probeAnchor || roomScale)
+    {
+        if(probeAnchor || roomScale)
+        {
+            auto query=hook::pattern("8B 4C 24 10 53 8B 5C 24 1C 56 33 F6 85 C9 74 39 8B 41 28 C1 E8 06 83 E0 0F 83 F8 03 75 17 F6 C3");
+            if(query.size()==1) volumeQuery=reinterpret_cast<VolumeQuery>(query.get_first());
+        }
+        if(roomScale)
+        {
+            auto position=hook::pattern("56 8B 71 20 85 F6 74 25 8B 54 24 08 8B 02 F3 0F 10 42 04 F3 0F 10 4A 08 89 46 30");
+            auto sync=hook::pattern("56 8B F1 83 7E 38 00 0F 84 ? ? ? ? 8B 46 20 8B 16 53 57 83 C0 30 50 FF 92 0C 01 00 00");
+            if(position.size()==1 && sync.size()==1 && volumeQuery)
+            {
+                positionSetter=reinterpret_cast<PositionSetter>(position.get_first());
+                physicsSync=reinterpret_cast<PhysicsSync>(sync.get_first());
+            }
+        }
+        auto lookup=hook::pattern("8B 41 38 85 C0 74 38 0F B7 40 08 B9 FF FF 00 00 66 3B C1 74 2A 8B C8 A1 ? ? ? ? 8B 50 04");
+        auto velocity=hook::pattern("8B 54 24 04 8B 02 89 81 10 01 00 00 8B 42 04 89 81 14 01 00 00");
+        auto moveBlend=hook::pattern("55 8B EC 83 E4 F0 83 EC 48 56 8B F1 57 8B 46 24 0F 57 C9 8B 88 B0 0A 00 00 F3 0F 10 98 90 0A 00 00");
+        if(moveBlend.size()==1)
+            moveBlendOutput=safetyhook::create_inline(moveBlend.get_first(),ObserveMoveBlend);
+        if(lookup.size()==1 && velocity.size()==1)
+        {
+            colliderLookup=reinterpret_cast<ColliderLookup>(lookup.get_first());
+            colliderVelocity=safetyhook::create_inline(velocity.get_first(),ObserveVelocity);
+        }
+        if(colliderVelocity || moveBlendOutput) FusionFix::onGameProcessEvent() += []()
+        {
+            void* ped=!motionProbeComplete.load() && FindPlayerPed ? FindPlayerPed(0) : nullptr;
+            localPed=ped;
+            localCollider=ped && colliderLookup ? colliderLookup(ped) : nullptr;
+        };
+        if(roomScale && positionSetter && physicsSync && volumeQuery)
+            FusionFix::onGameProcessEvent() += ProcessRoomBody;
+    }
     if (!ini.ReadInteger("DEVELOPMENT","ProbeEyeViewport",0) &&
         !ini.ReadInteger("VR","ExperimentalStereo",0)) return;
     auto camera=hook::pattern("55 8B EC 83 E4 F0 83 EC 48 56 8B 75 08 57 8B 06 8B F9 56");
@@ -34,26 +811,141 @@ void VRCamera::Install()
     if (camera.size()!=1 || projection.size()!=1) return;
     setCamera=reinterpret_cast<Setter>(camera.get(0).get<void>());
     setProjection=reinterpret_cast<Setter>(projection.get(0).get<void>());
-    FusionFix::onBeforeReset() += [](){recenter=true;};
+    FusionFix::onBeforeReset() += [](){VRCamera::Recenter();};
 }
+
+bool VRCamera::IsFirstPersonActive() {return firstPersonActive;}
 
 bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (&eyes)[2],
     rage::grcViewport (&output)[2])
 {
     if (!setCamera || !setProjection || !base.mIsPerspective || base.mInvertZInProjectionMatrix)
-        return false;
+        {InvalidateHeading(); StopRoomMotion(); return false;}
+    if(restartAnchorProbe.exchange(false))
+    {
+        anchorFrames=anchorSamples=0;
+        AcquireSRWLockExclusive(&motionLock);
+        velocityCalls=moveBlendCalls=0;
+        moveBlendCaller=0;
+        lastMoveDt=0;
+        std::memset(lastVelocity,0,sizeof(lastVelocity));
+        std::memset(lastMoveBlend,0,sizeof(lastMoveBlend));
+        std::memset(lastMoveTarget,0,sizeof(lastMoveTarget));
+        ReleaseSRWLockExclusive(&motionLock);
+        motionProbeComplete=false;
+    }
+    ProbeAnchor(base);
     try
     {
+        VRMath::Vector anchor{};
+        float heading=0,measuredHeight=0;
+        float groundZ=NAN;
+        Vehicle vehicle=0; bool ducking=false,airborne=false;
+        bool animated=false,ragdoll=false,exiting=false;
+        VRMath::Matrix vehicleBasis{};
+        const bool useFirstPerson=firstPerson && visibilityAvailable &&
+            GameplayAnchor(anchor,heading,measuredHeight,groundZ,vehicle,ducking,airborne,vehicleBasis,animated,ragdoll,exiting);
+        auto bodyAnchor=anchor;
+        if(useFirstPerson!=firstPersonActive || vehicle!=anchorVehicle) recenter=true;
+        anchorVehicle=vehicle;
+        vehicleView=useFirstPerson && vehicle!=0;
+        crouchedView=useFirstPerson && ducking;
+        airborneView=useFirstPerson && airborne;
+        animatedView=useFirstPerson && animated;
+        ragdollView=useFirstPerson && ragdoll;
+        vehicleExitView=useFirstPerson && exiting;
+        firstPersonActive=useFirstPerson;
+        if(!useFirstPerson) {InvalidateHeading(); StopRoomMotion();}
+        VRMath::Matrix gameCamera{};
+        std::memcpy(gameCamera.data(),base.mViewInverseMatrix,sizeof(gameCamera));
         if (recenter.exchange(false))
         {
             float center[3]{};
             for(unsigned i=0;i<3;++i) center[i]=(eyes[0].position[i]+eyes[1].position[i])*.5f;
             // Initial prototype uses the first eye orientation as the center
             // orientation. Both sampled SteamVR views had the same orientation.
-            referenceInverse=VRMath::InverseRigid(VRMath::Pose(center,eyes[0].orientation));
+            referenceInverse=VRMath::InverseRigid(VRMath::LevelTrackingReference(
+                VRMath::Pose(center,eyes[0].orientation),useFirstPerson && !vehicle &&
+                eyes[0].floorRelative && eyes[1].floorRelative));
+            AcquireSRWLockExclusive(&roomLock);
+            roomMotion.Reset(); roomSampleValid=false; roomOwner=nullptr;
+            processedRoomPosition={}; lastRoomPosition={};
+            roomAchieved={}; bodySampleValid=false; roomDrivingAt=0;
+            ReleaseSRWLockExclusive(&roomLock);
+            if(useFirstPerson)
+            {
+                trackingBasis=VRMath::UprightGameCamera(heading,{0,0,0,1});
+                if(!vehicle && !animated && !ducking && !airborne && measuredHeight>.1f && measuredHeight<2.f)
+                    headHeight=measuredHeight;
+                const float rootClearance=anchor[2]-groundZ;
+                if(!animated && std::isfinite(rootClearance) && rootClearance>.1f && rootClearance<1.5f)
+                    bodyRootAboveFloor=rootClearance;
+            }
         }
-        VRMath::Matrix gameCamera{};
-        std::memcpy(gameCamera.data(),base.mViewInverseMatrix,sizeof(gameCamera));
+        if(useFirstPerson)
+        {
+            if(vehicle) trackingBasis=vehicleBasis;
+            gameCamera=trackingBasis;
+            // Initial eye placement: measured head height with small eye/face
+            // offsets. Calibration, mesh clipping and crouch behavior remain #014.
+            const bool floorRelative=!vehicle && eyes[0].floorRelative && eyes[1].floorRelative;
+            // Track the body's vertical travel (stairs/jumps), with a floor
+            // offset measured independently of the startup headset height.
+            if(!vehicle)
+            {
+                if(animated)
+                    anchor[2]+=floorRelative ? -headHeight-bodyRootAboveFloor : .08f;
+                else anchor[2]=floorRelative ? anchor[2]-bodyRootAboveFloor : anchor[2]+headHeight+.08f;
+                AcquireSRWLockShared(&roomLock);
+                const float physicalDrop=floorRelative && physicalCrouchEnabled ?
+                    physicalCrouch.reference-(eyes[0].position[1]+eyes[1].position[1])*.5f : 0;
+                ReleaseSRWLockShared(&roomLock);
+                if(!animated && ducking)
+                {
+                    const float rootDrop=std::isfinite(groundZ) ? bodyRootAboveFloor-(bodyAnchor[2]-groundZ) : 0;
+                    anchor[2]+=VRMath::CrouchAnchorAdjustment(headHeight,measuredHeight,rootDrop,physicalDrop,
+                        physicalCrouchOwnsDuck.load());
+                }
+                else if(!animated) anchor[2]+=VRMath::JumpCameraRise(headHeight,measuredHeight);
+            }
+            AcquireSRWLockExclusive(&roomLock);
+            gameGroundZ=groundZ;
+            physicalEyeHeight=floorRelative ? (eyes[0].position[1]+eyes[1].position[1])*.5f : NAN;
+            ReleaseSRWLockExclusive(&roomLock);
+            for(unsigned axis=0;axis<3;++axis)
+                gameCamera[3][axis]=anchor[axis]-.10f*trackingBasis[2][axis];
+            if(animated && roomScale)
+            {
+                AcquireSRWLockShared(&roomLock);
+                for(unsigned axis=0;axis<2;++axis) gameCamera[3][axis]-=processedRoomPosition[axis];
+                ReleaseSRWLockShared(&roomLock);
+            }
+        }
+        if(vehicle || animated || !useFirstPerson) StopRoomMotion();
+        if(roomScale && useFirstPerson && !vehicle && !animated && positionSetter && physicsSync && volumeQuery)
+        {
+            float midpoint[3]{};
+            for(unsigned axis=0;axis<3;++axis) midpoint[axis]=(eyes[0].position[axis]+eyes[1].position[axis])*.5f;
+            const auto relative=VRMath::Multiply(VRMath::Multiply(
+                VRMath::Pose(midpoint,eyes[0].orientation),referenceInverse),trackingBasis);
+            const bool valid=OpenXRVR::HasFocusedViews() &&
+                NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_PAUSE_MENU_ACTIVE)) &&
+                !Natives::IsPauseMenuActive();
+            void* owner=valid && FindPlayerPed ? FindPlayerPed(0) : nullptr;
+            const auto now=GetTickCount64();
+            AcquireSRWLockExclusive(&roomLock);
+            if(!owner || !roomSampleValid || owner!=roomOwner || now-roomSampledAt>100 ||
+                std::hypot(relative[3][0]-lastRoomPosition[0],relative[3][1]-lastRoomPosition[1])>.3f)
+                processedRoomPosition=relative[3];
+            roomOwner=owner; roomSampleValid=owner!=nullptr; roomSampledAt=now;
+            lastRoomPosition=relative[3];
+            // Absolute consumed tracking sample, rather than accumulated
+            // movement attribution. The fresh unconsumed head delta remains
+            // immediate until the next simulation resolves it against geometry.
+            for(unsigned axis=0;axis<2;++axis)
+                gameCamera[3][axis]=bodyAnchor[axis]-processedRoomPosition[axis];
+            ReleaseSRWLockExclusive(&roomLock);
+        }
         for(const auto& row:gameCamera)
             for(float value:row)
                 if(!std::isfinite(value)) throw std::invalid_argument("Invalid game camera");
@@ -78,11 +970,44 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
             setProjection(&generated,projection.data());
             std::memcpy(&output[eye],&generated,sizeof(generated));
         }
+        if(useFirstPerson && !vehicle && !animated && ((headRelativeMovement && movementHeading) || headsetAim))
+        {
+            VRMath::Matrix headCamera{};
+            std::memcpy(headCamera.data(),output[0].mViewInverseMatrix,sizeof(headCamera));
+            float angle=0;
+            const bool level=VRMath::LevelHeading(headCamera,angle);
+            void* owner=FindPlayerPed ? FindPlayerPed(0) : nullptr;
+            AcquireSRWLockExclusive(&headingLock);
+            if(level) {headHeading=angle; headingValid=true;}
+            headingOwner=owner;
+            headingSampledAt=GetTickCount64();
+            ReleaseSRWLockExclusive(&headingLock);
+            AcquireSRWLockExclusive(&aimLock);
+            if(headsetAim && VRMath::AimAngles(headCamera,aimPitch,aimYaw))
+            {
+                aimCamera=headCamera;
+                for(unsigned axis=0;axis<3;++axis)
+                    aimCamera[3][axis]=(output[0].mViewInverseMatrix[3][axis]+output[1].mViewInverseMatrix[3][axis])*.5f;
+                aimOwner=owner;
+                aimValid=true;
+                aimSampledAt=GetTickCount64();
+            }
+            else aimValid=false;
+            ReleaseSRWLockExclusive(&aimLock);
+        }
+        else InvalidateHeading();
+        AcquireSRWLockExclusive(&roomLock);
+        diagnosticBody=bodyAnchor;
+        for(unsigned axis=0;axis<3;++axis)
+            diagnosticView[axis]=(output[0].mViewInverseMatrix[3][axis]+output[1].mViewInverseMatrix[3][axis])*.5f;
+        ReleaseSRWLockExclusive(&roomLock);
         return true;
     }
     catch(const std::exception&)
     {
         recenter=true;
+        InvalidateHeading();
+        StopRoomMotion();
         return false;
     }
 }

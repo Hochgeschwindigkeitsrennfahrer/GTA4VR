@@ -20,4 +20,6 @@ Measured scale and pose timing are documented, the repeatable on-foot/vehicle ro
 
 ## Notes / evidence
 
+- 2026-10-04 #014's first-person, collision-resolved room movement and normal headset-aiming route is user-accepted and closed, including the combined gameplay route and final flat-screen check. This does not measure world units per meter or pose latency, or establish controlled tracking-loss/auxiliary-view coverage; retain those checks here. Existing keyboard/gamepad locomotion intentionally uses level headset facing as requested; revise the earlier decoupled-direction test to validate this intended reference without allowing pitch/roll into movement.
+
 - Initial baseline from #006: CE 1.2.0.59, SteamVR/OpenXR 2.17.10, RTX 4070 Ti, system D3D9Ex → D3D11, 2560×1440 per eye. Directional shadows passed the user's outdoor head-rotation check. Shared reflection/weather views remain based on the game camera, one game unit per meter is a prototype assumption, and rendered poses come from the previous OpenXR callback. Final Release runtime pacing sampled 90.00 projection layers/sec against a queried 90 Hz headset; no frame-time distribution or all-scene performance claim exists.

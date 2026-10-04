@@ -13,6 +13,152 @@ static void Near(float actual, float expected, float tolerance=1e-4f)
 
 int main()
 {
+    // Reconstruct native weapon forward from the extracted headset angles.
+    // Sweep pitch and yaw, including wrap and the vertical singularity.
+    for(float pitch:{-1.5707963f,-1.1f,0.f,.8f,1.5707963f})
+        for(float yaw:{-3.13f,-1.5f,0.f,1.5f,3.13f})
+        {
+            auto camera=VRMath::Identity();
+            camera[2]={std::sin(yaw)*std::cos(pitch),-std::cos(yaw)*std::cos(pitch),-std::sin(pitch),0};
+            float actualPitch=0,actualYaw=yaw;
+            if(!VRMath::AimAngles(camera,actualPitch,actualYaw)) return 1;
+            Near(-std::sin(actualYaw)*std::cos(actualPitch),-camera[2][0]);
+            Near(std::cos(actualYaw)*std::cos(actualPitch),-camera[2][1]);
+            Near(std::sin(actualPitch),-camera[2][2]);
+        }
+    auto invalidAim=VRMath::Identity(); invalidAim[2]={NAN,0,0,0};
+    float invalidPitch=0,invalidYaw=0;
+    if(VRMath::AimAngles(invalidAim,invalidPitch,invalidYaw)) return 1;
+    invalidAim[2]={0,0,0,0};
+    if(VRMath::AimAngles(invalidAim,invalidPitch,invalidYaw)) return 1;
+    VRMath::PhysicalCrouch crouch{};
+    Near(crouch.Update(1.75f),false);
+    Near(crouch.Update(1.14f),false); // just above 65% of 1.75m
+    Near(crouch.Update(.65f*1.75f),true);
+    Near(crouch.Update(1.25f),true); // hysteresis avoids threshold chatter
+    Near(crouch.Update(.75f*1.75f),false);
+    Near(crouch.Update(NAN),false);
+    VRMath::PhysicalCrouch seated{};
+    seated.reference=1.1f;
+    Near(seated.Update(1.1f),false);
+    Near(seated.Update(.72f),false);
+    Near(seated.Update(.70f),true);
+    Near(seated.Update(.80f),true);
+    Near(seated.Update(.83f),false);
+    Near(seated.reference,1.1f); // tracked poses do not change configuration
+    crouch.Update(1.0f);
+    crouch.CancelUntilStanding();
+    Near(crouch.Update(1.0f),false); // releasing native crouch cannot retrigger
+    Near(crouch.Update(1.2f),false);
+    Near(crouch.Update(NAN),false); // tracking gap does not rearm
+    Near(crouch.Update(.75f*1.75f-.001f),false);
+    Near(crouch.inhibited,true);
+    Near(crouch.Update(.75f*1.75f),false);
+    Near(crouch.inhibited,false);
+    Near(crouch.Update(1.0f),true); // only a fresh crouch after standing rearms
+    Near(VRMath::CrouchCameraDrop(.7f,.3f,0),.4f); // ordinary control crouch
+    Near(VRMath::CrouchCameraDrop(.7f,.3f,.4f),0); // physical pose already lowers view
+    Near(VRMath::CrouchCameraDrop(.7f,.3f,.2f),.2f);
+    Near(VRMath::CrouchCameraDrop(.7f,NAN,0),0);
+    Near(VRMath::CrouchAnchorAdjustment(.7f,.4f,.3f,0),-.3f);
+    Near(VRMath::CrouchAnchorAdjustment(.7f,.4f,.3f,.6f),.3f);
+    Near(VRMath::CrouchAnchorAdjustment(.7f,.4f,.3f,.2f),-.1f);
+    Near(VRMath::JumpCameraRise(.7f,1.2f),.5f); // skeleton jump with stationary root
+    Near(VRMath::JumpCameraRise(.7f,.7f),0); // root-only jump is already in anchor
+    Near(VRMath::JumpCameraRise(.7f,.4f),0); // crouch must not become jump movement
+    Near(VRMath::JumpCameraRise(.7f,NAN),0);
+    // Native duck can lower the model farther than a small physical crouch.
+    // Its root/animation must not introduce additional camera lowering.
+    Near(-.2f-.3f+VRMath::CrouchAnchorAdjustment(.7f,.1f,.2f,.3f,true),-.3f);
+    Near(-.3f+VRMath::CrouchAnchorAdjustment(.7f,.1f,0,.3f,true),-.3f);
+    Near(VRMath::SafeSweepFraction(.5f,.1f),.48f);
+    Near(VRMath::SafeSweepFraction(.01f,.1f),0);
+    Near(VRMath::SafeSweepFraction(NAN,.1f),0);
+    Near(VRMath::SafeSweepFraction(1.1f,.1f),0);
+    // A wall stopping ordinary movement cannot manufacture room compensation.
+    auto share=VRMath::RoomDisplacementShare({0,0,0,0},{0,4,0,0},{.1f,0,0,0},true);
+    Near(share[0],0); Near(share[1],0);
+    share=VRMath::RoomDisplacementShare({.02f,-.01f,0,0},{0,0,0,0},{.3f,0,0,0},true);
+    Near(share[0],.02f); Near(share[1],-.01f);
+    share=VRMath::RoomDisplacementShare({0,.04f,0,0},{0,4,0,0},{0,0,0,0},true);
+    Near(share[0],0); Near(share[1],0); // pure keyboard motion stays in rig origin
+    share=VRMath::RoomDisplacementShare({.02f,.02f,0,0},{0,1,0,0},{1,0,0,0},true);
+    Near(share[0],.01f); Near(share[1],.01f); // bounded mixed-motion estimate
+    // STAGE floor survives table-height startup and recenter while seated.
+    // Both calibrations yield the same world height for the same worn pose.
+    for(float startupHeight:{.4f,1.2f,1.8f})
+    {
+        const float startup[]{2,startupHeight,-3}, worn[]{2,1.2f,-3}, q[]{0,0,0,1};
+        const auto reference=VRMath::LevelTrackingReference(VRMath::Pose(startup,q),true);
+        const auto relative=VRMath::Multiply(VRMath::Pose(worn,q),VRMath::InverseRigid(reference));
+        Near(relative[3][1],1.2f);
+        const auto world=VRMath::Multiply(relative,VRMath::UprightGameCamera(30,{0,0,18.5f,1}));
+        Near(world[3][2],19.7f);
+    }
+    VRMath::RoomMotion room;
+    if(!room.Add({.1f,0,1,0})) return 1;
+    auto velocity=room.Consume(.01f);
+    Near(velocity[0],1.5f); Near(velocity[1],0); Near(velocity[2],0);
+    Near(room.consumed[0],.015f); Near(room.pending[0],.085f);
+    for(unsigned i=0;i<20;++i) room.Consume(.01f);
+    Near(room.consumed[0],.1f); Near(room.pending[0],0);
+    Near(room.Consume(.01f)[0],0); // second eye/ticks cannot replay distance
+    room.Add({.1f,.1f,0,0}); room.Consume(.1f);
+    Near(room.pending[0],0); Near(room.pending[1],0); // physics stall drops backlog
+    if(room.Add({1,0,0,0})) return 1; // tracking jump cannot teleport body
+    room.Reset(); room.Add({.1f,0,0,0}); room.Add({-.1f,0,0,0});
+    Near(room.Consume(.01f)[0],0);
+    room.Add({.2f,.2f,0,0});
+    Near(std::hypot(room.pending[0],room.pending[1]),.15f);
+    room.ClearPending(); Near(room.Consume(.01f)[0],0);
+    // Calibrating while pitched vertically must keep OpenXR Y-up and retain
+    // real headset pitch when composed with the game's upright camera.
+    for(float pitch:{0.f,1.57079632679f,-1.57079632679f,.7f})
+        for(float yaw:{0.f,.9f,-2.f})
+        {
+            const float p[]{2,1.2f,-3};
+            const float qPitch[]{std::sin(pitch/2),0,0,std::cos(pitch/2)};
+            const float qYaw[]{0,std::sin(yaw/2),0,std::cos(yaw/2)};
+            const float zero[]{0,0,0};
+            auto startup=VRMath::Multiply(VRMath::Pose(zero,qPitch),VRMath::Pose(p,qYaw));
+            auto reference=VRMath::LevelTrackingReference(startup);
+            Near(reference[1][0],0); Near(reference[1][1],1); Near(reference[1][2],0);
+            auto relative=VRMath::Multiply(startup,VRMath::InverseRigid(reference));
+            Near(relative[3][0],0); Near(relative[3][1],0); Near(relative[3][2],0);
+            Near(relative[2][1],-std::sin(pitch));
+            const auto levelNow=VRMath::Multiply(VRMath::Pose(p,qYaw),VRMath::InverseRigid(reference));
+            Near(levelNow[2][0],0); Near(levelNow[2][1],0); Near(levelNow[2][2],1);
+        }
+    float heading=0;
+    for(float degrees:{0.f,90.f,-90.f,179.f,-179.f})
+    {
+        auto level=VRMath::UprightGameCamera(degrees,{0,0,0,1});
+        if(!VRMath::LevelHeading(level,heading)) return 1;
+        Near(heading,degrees*3.14159265358979323846f/180.f);
+        // Tilt the forward vector toward world up without changing its yaw.
+        level[2][0]*=.2f; level[2][1]*=.2f; level[2][2]=std::sqrt(.96f);
+        if(!VRMath::LevelHeading(level,heading)) return 1;
+        Near(heading,degrees*3.14159265358979323846f/180.f);
+        // Roll only changes the right/up rows, not the facing reference.
+        std::swap(level[0],level[1]);
+        if(!VRMath::LevelHeading(level,heading)) return 1;
+        Near(heading,degrees*3.14159265358979323846f/180.f);
+    }
+    auto vertical=VRMath::Identity(); vertical[2]={0,0,1,0};
+    heading=.7f;
+    if(VRMath::LevelHeading(vertical,heading)) return 1;
+    Near(heading,.7f);
+    // Independently measured local character heading/right axis from #014.
+    const auto upright=VRMath::UprightGameCamera(187.954895f,{892.437927f,-499.804688f,20.162432f,1});
+    Near(upright[0][0],-.990377f);
+    Near(upright[0][1],-.138393f);
+    const auto up=VRMath::Transform({0,1,0,0},upright);
+    Near(up[0],0); Near(up[1],0); Near(up[2],1);
+    const auto forward=VRMath::Transform({0,0,-1,0},upright);
+    Near(forward[0],.138393f); Near(forward[1],-.990377f); Near(forward[2],0);
+    const auto uprightIdentity=VRMath::Multiply(upright,VRMath::InverseRigid(upright));
+    for(unsigned i=0;i<4;++i) for(unsigned j=0;j<4;++j)
+        Near(uprightIdentity[i][j],i==j ? 1.f : 0.f,.0002f);
     // Asymmetric OpenXR frustum: every corner must map to the D3D clip cube.
     const float fov[]{-.932127f,.88042f,.958711f,-.956876f};
     const auto projection=VRMath::Projection(fov,.05f,1500);
@@ -87,5 +233,38 @@ int main()
                         if(side < -.001f) {std::fputs("Union clipped eye corner\n",stderr); return 1;}
                     }
                 }
-    std::puts("VR math: clip corners, pose inverse, game matrix/plane regression, and conservative union passed");
+    // Vertical head rotation must keep every eye-frustum corner inside the
+    // visibility union, including near-vertical orientations in both directions.
+    for(float pitch:{-.5f,.5f,-1.55f,1.55f})
+    {
+        const float q[]{std::sin(pitch/2),0,0,std::cos(pitch/2)},origin[]{0,0,0};
+        VRMath::Matrix tilted[2]{VRMath::Pose(origin,q),VRMath::Pose(origin,q)};
+        tilted[0][3][0]=-.034f; tilted[1][3][0]=.034f;
+        const auto verticalBounds=VRMath::UnionBounds(tilted,eyeFov,.05f,1500);
+        for(const auto& eye:tilted)
+            for(float distance:{.05f,1500.f})
+                for(unsigned x=0;x<2;++x)
+                    for(unsigned y=0;y<2;++y)
+                    {
+                        const auto corner=VRMath::Transform({distance*std::tan(fov[x]),
+                            distance*std::tan(fov[y ? 2 : 3]),-distance,1},eye);
+                        for(const auto& plane:verticalBounds)
+                        {
+                            float side=0;
+                            for(unsigned i=0;i<4;++i) side+=corner[i]*plane[i];
+                            if(side<-.001f) {std::fputs("Vertical union clipped eye corner\n",stderr); return 1;}
+                        }
+                    }
+    }
+    // A rear-facing headset frustum must retain furniture behind the ordinary
+    // camera. Boundary-crossing spheres remain visible, including near clip.
+    VRMath::Matrix rearCameras[2]{VRMath::Identity(),VRMath::Identity()};
+    rearCameras[0][0][0]=rearCameras[1][0][0]=-1;
+    rearCameras[0][2][2]=rearCameras[1][2][2]=-1;
+    const auto rearBounds=VRMath::UnionBounds(rearCameras,eyeFov,.05f,10);
+    const float behind[]{0,0,2}, inFront[]{0,0,-2}, boundary[]{0,0,0};
+    if(VRMath::SphereOutside(rearBounds,behind,.2f) ||
+        !VRMath::SphereOutside(rearBounds,inFront,.2f) ||
+        VRMath::SphereOutside(rearBounds,boundary,.1f)) return 1;
+    std::puts("VR math: clip corners, pose inverse, game matrix/plane regression, conservative union and rear-view spheres passed");
 }

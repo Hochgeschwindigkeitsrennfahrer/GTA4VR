@@ -14,6 +14,7 @@ import common;
 import comvars;
 import openxrvr;
 import vrstereo;
+import vrcamera;
 
 export namespace DevControl { void Install(); }
 
@@ -91,10 +92,37 @@ namespace
                 std::to_string(GetCurrentProcessId()) + ",\"openxr\":" +
                 OpenXRVR::Status() + ",\"stereo\":" + VRStereo::Status() + "}";
         }
+        else if(command=="input-status")
+        {
+            response="{\"ok\":true,\"input\":"+OpenXRVR::InputStatus()+"}";
+        }
+        else if(command=="movement-status")
+        {
+            response="{\"ok\":true,\"movement\":"+VRCamera::MovementStatus()+"}";
+        }
+        else if(command=="aim-status")
+        {
+            response="{\"ok\":true,\"aim\":"+VRCamera::AimStatus()+"}";
+        }
         else if(command=="stereo-test")
         {
             response=VRStereo::RestartExperiment() ? "{\"ok\":true,\"command\":\"stereo-test\",\"accepted\":true}" :
                 "{\"ok\":false,\"error\":\"experimental stereo not ready\"}";
+        }
+        else if(command=="lod-probe")
+        {
+            response=VRStereo::RestartLodProbe() ? "{\"ok\":true,\"command\":\"lod-probe\",\"accepted\":true}" :
+                "{\"ok\":false,\"error\":\"development LOD probe unavailable or stereo not ready\"}";
+        }
+        else if(command=="recenter")
+        {
+            VRCamera::Recenter();
+            response="{\"ok\":true,\"command\":\"recenter\",\"accepted\":true}";
+        }
+        else if(command=="camera-probe")
+        {
+            response=VRCamera::RestartAnchorProbe() ? "{\"ok\":true,\"command\":\"camera-probe\",\"accepted\":true}" :
+                "{\"ok\":false,\"error\":\"anchor probe disabled in development configuration\"}";
         }
         else if (command == "quit")
         {

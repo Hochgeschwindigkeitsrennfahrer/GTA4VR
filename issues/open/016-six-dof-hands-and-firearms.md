@@ -17,5 +17,7 @@ Representative firearms move in six degrees of freedom and aim/fire correctly fr
 
 ## Notes / evidence
 
+- 2026-10-04 #014 closes with user-accepted normal headset-directed on-foot gun shots, right-stick independence and controller lock-on suppression. This is the interim aiming model. Separate FPS/sniper camera/scopes and special weapon modes remain unverified; include those in this issue's per-weapon coverage and coordinate a scope presentation policy with #020. See docs/headset-aiming.md and Ghidra Issue014HeadsetAimBasis; do not infer 6DOF muzzle ownership from camera aiming acceptance.
+
 - User explicitly requests guns and other weapons to work with proper 6DOF aiming and shooting. Reload handling must coordinate with #024 rather than declare conventional reload input the final result.
 - Requested on 2026-10-01. Implementation and runtime acceptance remain pending.

@@ -66,18 +66,26 @@ Track the initial bringup in [`issues/README.md`](issues/README.md):
 
 ## Gameplay and rendering backlog
 
+Closed [#029](issues/closed/029-diagnose-free-roam-crashes.md) on2026-10-04 after native model-reference corruption and render-command exhaustion fixes, repeated gameplay testing, final flat-screen acceptance and the user's confirmation that free-roam crashes are fixed. Startup reliability remains #012 and performance profiling #013.
+
+Closed [#014](issues/closed/014-first-person-headset-camera.md) on2026-10-04: the user accepts the implemented first-person/room-scale/crouch/action/car/headset-aiming route together and separately confirms the final flat-screen check. Extra vehicle classes/passenger routes remain #019, scopes/special weapons #016, and measured scale/pose behavior #011. Other special camera transitions are deferred; cutscenes retain their existing camera path.
+
 Sequence camera/scale and controller foundations before dependent interactions. Rendering defect reproduction can proceed independently. Each issue owns its acceptance evidence; milestone completion still requires the combined route.
 
-Current priority: start #014 first-person camera bringup with #011 scale/pose validation. #007 remains open for render attribution but does not block #014; preserve radar/menu camera ownership and UI update behavior during camera changes. UI presentation choices in #020/#021/#022 are deferred at the user's request.
+The #014 camera foundation now supports the accepted route using existing keyboard/gamepad controls with headset-relative forward/back/strafe. Next foundations are #015 Vive Wand input and #011 measured scale/pose validation, followed by #016 independent tracked weapons. Vehicle controls/interactions remain #019. #007 remains open for render attribution; preserve radar/menu camera ownership and UI update behavior during later changes. UI presentation choices in #020/#021/#022 remain deferred at the user's request.
+
+[#028](issues/open/028-independent-desktop-view.md) tracks an ordinary third-person desktop image with its existing HUD alongside the headset views, including VR-only character hiding. It requires separate render/visibility ownership and an explicit cost measurement; it does not require choosing a new headset UI layout.
 
 | Area | Issues and order |
 | --- | --- |
-| Stage 3 camera and tracking | [#011 scale/pose validation](issues/open/011-camera-scale-and-auxiliary-views.md), then [#014 first-person camera, headset frusta and room-scale body movement](issues/open/014-first-person-headset-camera.md). Controller locomotion bindings come from #015. |
+| Stage 3 camera and tracking | [#014 first-person camera, headset frusta and room-scale body movement (closed)](issues/closed/014-first-person-headset-camera.md); [#011 scale/pose validation](issues/open/011-camera-scale-and-auxiliary-views.md) remains open. Controller locomotion and combined controller/room-scale tests are owned by #015. |
 | Stage 3 stereo defects | [#010 traffic lamps](issues/open/010-traffic-light-right-eye.md), [#023 objective markers](issues/open/023-objective-markers-both-eyes.md), and [#027 water shading/reflections](issues/open/027-stereo-water-shading.md). #027 provides the water repair evidence for #011. |
 | Stage 4 controller and weapon foundations | [#015 Vive Wand support](issues/open/015-vive-wand-controller-support.md), then [#016 6DOF hands/firearms](issues/open/016-six-dof-hands-and-firearms.md), [#019 vehicles](issues/open/019-vr-vehicles.md) and [#021 weapon wheel](issues/open/021-vr-weapon-wheel.md). Inventory actual vehicle classes before defining plane support. |
 | Stage 4 composition | [#007 draw attribution](issues/open/007-ui-composition-order.md), then [#020 minimap/subtitles/overlays](issues/open/020-vr-overlays-and-subtitles.md); physical phone interaction is #022. |
 | Stage 5 comfort and performance | [#013 frame-budget profile](issues/open/013-profile-native-refresh-frame-budget.md) and [#026 remove cinematic depth/focus blur](issues/open/026-disable-cinematic-depth-blur.md). |
 | Stage 6 physical interactions | After tracked hands: [#017 hand/knife combat](issues/open/017-six-dof-melee-combat.md), [#018 physics-object grabbing](issues/open/018-six-dof-physics-object-grabbing.md), [#022 physical phone](issues/open/022-physical-interactive-phone.md), [#024 physical reloads](issues/open/024-physical-weapon-reloading.md) and [#025 physical money/weapon drops](issues/open/025-physical-money-and-weapon-drops.md). Reloads/drops depend on the grab foundation. |
+
+VR settings and explicit height calibration are tracked in [#030](issues/open/030-pause-menu-vr-settings-and-height-calibration.md). Until that pause-menu workflow exists, #014 uses INI `[VR] PlayerHeight=1.75` meters with physical crouch entry/exit at65%/75%. Settings UI and calibration do not block the current configured-height camera route.
 
 ## References
 

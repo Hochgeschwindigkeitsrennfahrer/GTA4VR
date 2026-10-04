@@ -17,5 +17,8 @@ A documented route passes for each supported vehicle class with usable controls 
 
 ## Notes / evidence
 
+- 2026-10-04 user accepts #014's current car camera coverage for its closure. Bike/aircraft/passenger and unusual vehicle exit camera routes are deferred here; do not infer those classes passed from the accepted car route.
+
+- 2026-10-02: first-person vehicle camera support and entry/exit camera continuity are now required before #014 closes. Coordinate seated/riding anchors there; this issue retains VR vehicle controls, physical interactions and the broader vehicle route.
 - User requests cars/bikes/planes. Do not assume the base game has playable planes or silently replace that requirement with helicopters. Split class-specific implementation issues when the inventory establishes scope.
 - Requested on 2026-10-01. Implementation and runtime acceptance remain pending.

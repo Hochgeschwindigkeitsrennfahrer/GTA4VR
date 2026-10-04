@@ -27,11 +27,21 @@ export namespace OpenXRVR
         float position[3]{};
         float orientation[4]{}; // x, y, z, w in OpenXR's reference space.
         float fov[4]{}; // left, right, up, down angles in radians.
+        bool floorRelative=false; // STAGE Y=0 is the runtime-calibrated floor.
     };
+    struct ControllerInput
+    {
+        bool active[2]{},clicked[2]{},poseValid[2]{};
+        float trackpad[2][2]{},position[2][3]{},orientation[2][4]{};
+        unsigned long long sampledAt=0;
+    };
+    bool GetControllerInput(ControllerInput& input);
+    std::string InputStatus();
     void Install();
     void Shutdown(); // Call from the EndScene callback thread, never DllMain.
     std::string Status();
     bool GetEyeViews(EyeView (&views)[2], long long& displayTime);
+    bool HasFocusedViews(); // Fresh pose and focus gate for gameplay direction.
     bool CanAcceptEyeImages(); // Render callback thread; false while stopped or recreating.
     bool PacesGameplay(); // Atomic; true while the runtime requests stereo frames.
     bool SetEyeImages(const HANDLE (&shared)[2], unsigned width, unsigned height,
@@ -69,6 +79,18 @@ namespace
         PFN_xrWaitSwapchainImage waitSwapchainImage = nullptr;
         PFN_xrReleaseSwapchainImage releaseSwapchainImage = nullptr;
         PFN_xrGetDisplayRefreshRateFB getDisplayRefreshRate = nullptr;
+        PFN_xrStringToPath stringToPath=nullptr;
+        PFN_xrCreateActionSet createActionSet=nullptr;
+        PFN_xrDestroyActionSet destroyActionSet=nullptr;
+        PFN_xrCreateAction createAction=nullptr;
+        PFN_xrSuggestInteractionProfileBindings suggestBindings=nullptr;
+        PFN_xrAttachSessionActionSets attachActionSets=nullptr;
+        PFN_xrCreateActionSpace createActionSpace=nullptr;
+        PFN_xrSyncActions syncActions=nullptr;
+        PFN_xrGetActionStateVector2f getVector2=nullptr;
+        PFN_xrGetActionStateBoolean getBoolean=nullptr;
+        PFN_xrGetActionStatePose getPose=nullptr;
+        PFN_xrLocateSpace locateSpace=nullptr;
     } api;
     HMODULE loader = nullptr;
 
@@ -92,10 +114,19 @@ namespace
     XrInstance instance = XR_NULL_HANDLE;
     XrSession session = XR_NULL_HANDLE;
     XrSpace localSpace = XR_NULL_HANDLE;
+    bool floorSpace=false;
     SRWLOCK eyeLock = SRWLOCK_INIT;
     OpenXRVR::EyeView eyeViews[2]{};
     long long eyeDisplayTime = 0;
     bool eyeViewsValid = false;
+    bool focusedEyeViews=false;
+    uint64_t eyeSampledAt=0;
+    bool controllerEnabled=false,inputReady=false;
+    XrActionSet inputActions=XR_NULL_HANDLE;
+    XrAction padAction=XR_NULL_HANDLE,clickAction=XR_NULL_HANDLE,aimAction=XR_NULL_HANDLE;
+    XrPath handPaths[2]{};
+    XrSpace aimSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
+    OpenXRVR::ControllerInput controllerInput{}; // Published with eyeLock.
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -221,6 +252,21 @@ namespace
         LOAD_XR(acquireSwapchainImage, xrAcquireSwapchainImage)
         LOAD_XR(waitSwapchainImage, xrWaitSwapchainImage)
         LOAD_XR(releaseSwapchainImage, xrReleaseSwapchainImage)
+        if(controllerEnabled)
+        {
+            LOAD_XR(stringToPath,xrStringToPath)
+            LOAD_XR(createActionSet,xrCreateActionSet)
+            LOAD_XR(destroyActionSet,xrDestroyActionSet)
+            LOAD_XR(createAction,xrCreateAction)
+            LOAD_XR(suggestBindings,xrSuggestInteractionProfileBindings)
+            LOAD_XR(attachActionSets,xrAttachSessionActionSets)
+            LOAD_XR(createActionSpace,xrCreateActionSpace)
+            LOAD_XR(syncActions,xrSyncActions)
+            LOAD_XR(getVector2,xrGetActionStateVector2f)
+            LOAD_XR(getBoolean,xrGetActionStateBoolean)
+            LOAD_XR(getPose,xrGetActionStatePose)
+            LOAD_XR(locateSpace,xrLocateSpace)
+        }
 #undef LOAD_XR
         return true;
     }
@@ -246,19 +292,32 @@ namespace
         imageWidth=imageHeight=submittedFrames=0;
         AcquireSRWLockExclusive(&eyeLock);
         eyeViewsValid = false;
+        focusedEyeViews=false;
+        controllerInput={};
         ReleaseSRWLockExclusive(&eyeLock);
         running = false;
         sessionState = XR_SESSION_STATE_UNKNOWN;
+        inputReady=false;
+        for(auto& space:aimSpaces)
+        {
+            if(space!=XR_NULL_HANDLE) api.destroySpace(space);
+            space=XR_NULL_HANDLE;
+        }
         if (localSpace != XR_NULL_HANDLE)
         {
-            Check("xrDestroySpace(LOCAL)", api.destroySpace(localSpace));
+            Check("xrDestroySpace(tracking)", api.destroySpace(localSpace));
             localSpace = XR_NULL_HANDLE;
+            floorSpace=false;
         }
         if (session != XR_NULL_HANDLE)
         {
             Check("xrDestroySession", xrDestroySession(session));
             session = XR_NULL_HANDLE;
         }
+        if(inputActions!=XR_NULL_HANDLE) api.destroyActionSet(inputActions);
+        inputActions=XR_NULL_HANDLE;
+        padAction=clickAction=aimAction=XR_NULL_HANDLE;
+        handPaths[0]=handPaths[1]=XR_NULL_PATH;
         if (context) { context->Release(); context = nullptr; }
         if (device) { device->Release(); device = nullptr; }
         if (instance != XR_NULL_HANDLE)
@@ -269,6 +328,96 @@ namespace
         systemId = XR_NULL_SYSTEM_ID;
         if (loader) { FreeLibrary(loader); loader = nullptr; }
         api = {};
+    }
+
+    bool CreateControllerActions()
+    {
+        if(!controllerEnabled) return true;
+        XrActionSetCreateInfo set{XR_TYPE_ACTION_SET_CREATE_INFO};
+        strcpy_s(set.actionSetName,"gameplay"); strcpy_s(set.localizedActionSetName,"GTA IV gameplay");
+        if(!Check("xrCreateActionSet",api.createActionSet(instance,&set,&inputActions))) return false;
+        if(!Check("left hand path",api.stringToPath(instance,"/user/hand/left",&handPaths[0])) ||
+            !Check("right hand path",api.stringToPath(instance,"/user/hand/right",&handPaths[1]))) return false;
+        auto create=[&](const char* name,const char* label,XrActionType type,XrAction& action)
+        {
+            XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+            strcpy_s(info.actionName,name); strcpy_s(info.localizedActionName,label);
+            info.actionType=type; info.countSubactionPaths=2; info.subactionPaths=handPaths;
+            return Check(name,api.createAction(inputActions,&info,&action));
+        };
+        if(!create("trackpad","Trackpad",XR_ACTION_TYPE_VECTOR2F_INPUT,padAction) ||
+            !create("trackpad_click","Trackpad click",XR_ACTION_TYPE_BOOLEAN_INPUT,clickAction) ||
+            !create("aim_pose","Controller aim",XR_ACTION_TYPE_POSE_INPUT,aimAction)) return false;
+        std::vector<XrActionSuggestedBinding> bindings;
+        for(unsigned hand=0;hand<2;++hand)
+            for(auto binding: {std::pair{padAction,"/input/trackpad"},
+                std::pair{clickAction,"/input/trackpad/click"},std::pair{aimAction,"/input/aim/pose"}})
+            {
+                const std::string path=std::string(hand ? "/user/hand/right" : "/user/hand/left")+binding.second;
+                XrPath xrPath=XR_NULL_PATH;
+                if(!Check("Vive binding path",api.stringToPath(instance,path.c_str(),&xrPath))) return false;
+                bindings.push_back({binding.first,xrPath});
+            }
+        XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        if(!Check("Vive profile path",api.stringToPath(instance,"/interaction_profiles/htc/vive_controller",&suggest.interactionProfile))) return false;
+        suggest.countSuggestedBindings=static_cast<uint32_t>(bindings.size()); suggest.suggestedBindings=bindings.data();
+        if(!Check("Vive suggested bindings",api.suggestBindings(instance,&suggest))) return false;
+        XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+        attach.countActionSets=1; attach.actionSets=&inputActions;
+        if(!Check("xrAttachSessionActionSets",api.attachActionSets(session,&attach))) return false;
+        for(unsigned hand=0;hand<2;++hand)
+        {
+            XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+            space.action=aimAction; space.subactionPath=handPaths[hand]; space.poseInActionSpace.orientation.w=1;
+            if(!Check("xrCreateActionSpace(aim)",api.createActionSpace(session,&space,&aimSpaces[hand]))) return false;
+        }
+        inputReady=true;
+        Log("Vive Wand actions attached; input observation enabled, no game input injection");
+        return true;
+    }
+
+    void SampleControllerInput(XrTime time)
+    {
+        OpenXRVR::ControllerInput sample{};
+        if(inputReady && sessionState==XR_SESSION_STATE_FOCUSED)
+        {
+            XrActiveActionSet active{inputActions,XR_NULL_PATH};
+            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=1; sync.activeActionSets=&active;
+            if(api.syncActions(session,&sync)==XR_SUCCESS)
+                for(unsigned hand=0;hand<2;++hand)
+                {
+                    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO}; get.subactionPath=handPaths[hand];
+                    XrActionStateVector2f pad{XR_TYPE_ACTION_STATE_VECTOR2F}; get.action=padAction;
+                    if(api.getVector2(session,&get,&pad)==XR_SUCCESS && pad.isActive &&
+                        std::isfinite(pad.currentState.x) && std::isfinite(pad.currentState.y))
+                    {
+                        sample.active[hand]=true;
+                        sample.trackpad[hand][0]=std::clamp(pad.currentState.x,-1.f,1.f);
+                        sample.trackpad[hand][1]=std::clamp(pad.currentState.y,-1.f,1.f);
+                    }
+                    XrActionStateBoolean click{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=clickAction;
+                    if(api.getBoolean(session,&get,&click)==XR_SUCCESS && click.isActive) sample.clicked[hand]=click.currentState;
+                    XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE}; get.action=aimAction;
+                    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+                    constexpr auto required=XR_SPACE_LOCATION_ORIENTATION_VALID_BIT|XR_SPACE_LOCATION_POSITION_VALID_BIT;
+                    if(api.getPose(session,&get,&pose)==XR_SUCCESS && pose.isActive &&
+                        api.locateSpace(aimSpaces[hand],localSpace,time,&location)==XR_SUCCESS &&
+                        (location.locationFlags & required)==required)
+                    {
+                        const auto& p=location.pose;
+                        const float finite=p.position.x+p.position.y+p.position.z+p.orientation.x+p.orientation.y+p.orientation.z+p.orientation.w;
+                        if(std::isfinite(finite))
+                        {
+                            sample.poseValid[hand]=true;
+                            sample.position[hand][0]=p.position.x; sample.position[hand][1]=p.position.y; sample.position[hand][2]=p.position.z;
+                            sample.orientation[hand][0]=p.orientation.x; sample.orientation[hand][1]=p.orientation.y;
+                            sample.orientation[hand][2]=p.orientation.z; sample.orientation[hand][3]=p.orientation.w;
+                        }
+                    }
+                }
+        }
+        sample.sampledAt=GetTickCount64();
+        AcquireSRWLockExclusive(&eyeLock); controllerInput=sample; ReleaseSRWLockExclusive(&eyeLock);
     }
 
     bool CreateRuntime()
@@ -377,10 +526,17 @@ namespace
             }
         }
         XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
         spaceInfo.poseInReferenceSpace.orientation.w = 1;
-        if (!Check("xrCreateReferenceSpace(LOCAL)", api.createReferenceSpace(session, &spaceInfo, &localSpace)))
-            return false;
+        floorSpace=XR_SUCCEEDED(api.createReferenceSpace(session,&spaceInfo,&localSpace));
+        if(floorSpace) Log("Tracking reference STAGE: floor-relative eye height");
+        else
+        {
+            spaceInfo.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL;
+            if(!Check("xrCreateReferenceSpace(LOCAL)",api.createReferenceSpace(session,&spaceInfo,&localSpace))) return false;
+            Log("STAGE unavailable: LOCAL fallback has no calibrated floor height");
+        }
+        if(!CreateControllerActions()) Log("Controller actions unavailable; headset rendering retained without controller input");
         frameCount = 0;
         Log("OpenXR session created; game rendering remains flat-screen");
         return true;
@@ -430,6 +586,8 @@ namespace
                     gameplayPacing=false;
                     AcquireSRWLockExclusive(&eyeLock);
                     eyeViewsValid = false;
+                    focusedEyeViews=false;
+                    controllerInput={};
                     ReleaseSRWLockExclusive(&eyeLock);
                 }
                 else if (sessionState == XR_SESSION_STATE_LOSS_PENDING ||
@@ -458,6 +616,7 @@ namespace
         result = xrWaitFrame(session, &wait, &state);
         if (XR_FAILED(result))
         { Check("xrWaitFrame", result); Fallback("OpenXR frame wait failed"); return; }
+        SampleControllerInput(state.predictedDisplayTime);
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
         locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         locate.displayTime = state.predictedDisplayTime;
@@ -471,6 +630,8 @@ namespace
         const auto required = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
         AcquireSRWLockExclusive(&eyeLock);
         eyeViewsValid = viewCount == 2 && (viewState.viewStateFlags & required) == required;
+        focusedEyeViews=eyeViewsValid && sessionState==XR_SESSION_STATE_FOCUSED;
+        eyeSampledAt=GetTickCount64();
         if (eyeViewsValid)
         {
             for (unsigned i = 0; i < 2; ++i)
@@ -478,7 +639,7 @@ namespace
                 eyeViews[i] = {{views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z},
                     {views[i].pose.orientation.x, views[i].pose.orientation.y, views[i].pose.orientation.z,
                         views[i].pose.orientation.w},
-                    {views[i].fov.angleLeft, views[i].fov.angleRight, views[i].fov.angleUp, views[i].fov.angleDown}};
+                    {views[i].fov.angleLeft, views[i].fov.angleRight, views[i].fov.angleUp, views[i].fov.angleDown},floorSpace};
             }
             eyeDisplayTime = state.predictedDisplayTime;
         }
@@ -599,13 +760,21 @@ std::string OpenXRVR::Status()
 
 bool OpenXRVR::PacesGameplay()
 {
-    return gameplayPacing.load();
+    // The native renderer can stop executing while simulation continues.
+    // xrWaitFrame no longer provides backpressure in that case (#029).
+    AcquireSRWLockShared(&eyeLock);
+    const bool fresh=eyeSampledAt && GetTickCount64()-eyeSampledAt<=250;
+    ReleaseSRWLockShared(&eyeLock);
+    return gameplayPacing.load() && fresh;
 }
 
 bool OpenXRVR::GetEyeViews(EyeView (&views)[2], long long& displayTime)
 {
     AcquireSRWLockShared(&eyeLock);
-    const auto valid = eyeViewsValid;
+    // Never keep overriding the game camera from an indefinitely cached pose
+    // when the EndScene/OpenXR producer stops. Ordinary rendering may recover
+    // while simulation is still advancing; fresh views enable stereo again.
+    const auto valid = eyeViewsValid && eyeSampledAt && GetTickCount64()-eyeSampledAt<=250;
     if (valid)
     {
         views[0] = eyeViews[0];
@@ -614,6 +783,33 @@ bool OpenXRVR::GetEyeViews(EyeView (&views)[2], long long& displayTime)
     }
     ReleaseSRWLockShared(&eyeLock);
     return valid;
+}
+
+bool OpenXRVR::GetControllerInput(ControllerInput& input)
+{
+    AcquireSRWLockShared(&eyeLock); input=controllerInput; ReleaseSRWLockShared(&eyeLock);
+    if(!input.sampledAt || GetTickCount64()-input.sampledAt>250) {input={}; return false;}
+    return true;
+}
+
+bool OpenXRVR::HasFocusedViews()
+{
+    AcquireSRWLockShared(&eyeLock);
+    const bool valid=eyeViewsValid && focusedEyeViews && eyeSampledAt && GetTickCount64()-eyeSampledAt<=250;
+    ReleaseSRWLockShared(&eyeLock);
+    return valid;
+}
+
+std::string OpenXRVR::InputStatus()
+{
+    ControllerInput input{};
+    const bool fresh=GetControllerInput(input);
+    char text[400];
+    sprintf_s(text,"{\"enabled\":%s,\"ready\":%s,\"fresh\":%s,\"left\":{\"active\":%s,\"poseValid\":%s,\"click\":%s,\"pad\":[%.3f,%.3f]},\"right\":{\"active\":%s,\"poseValid\":%s,\"click\":%s,\"pad\":[%.3f,%.3f]}}",
+        controllerEnabled ? "true" : "false",inputReady ? "true" : "false",fresh ? "true" : "false",
+        input.active[0] ? "true" : "false",input.poseValid[0] ? "true" : "false",input.clicked[0] ? "true" : "false",input.trackpad[0][0],input.trackpad[0][1],
+        input.active[1] ? "true" : "false",input.poseValid[1] ? "true" : "false",input.clicked[1] ? "true" : "false",input.trackpad[1][0],input.trackpad[1][1]);
+    return text;
 }
 
 bool OpenXRVR::SetEyeImages(const HANDLE (&shared)[2], unsigned width,unsigned height,
@@ -688,6 +884,7 @@ void OpenXRVR::Install()
 {
     CIniReader ini("");
     enabled = ini.ReadInteger("VR", "EnableOpenXR", 0) != 0;
+    controllerEnabled=ini.ReadInteger("VR","ExperimentalControllerInput",0)!=0;
     if (!enabled) return;
     wchar_t path[MAX_PATH]{};
     if (GetModuleFileNameW(nullptr, path, MAX_PATH))

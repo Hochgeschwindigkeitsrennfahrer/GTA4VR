@@ -27,7 +27,7 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [011 — Validate camera scale, pose timing and auxiliary views](open/011-camera-scale-and-auxiliary-views.md). Roadmap stage 3 validation following the first stereo image.
 - [012 — Diagnose intermittent early startup exits](open/012-intermittent-early-startup-exit.md). Track launch reliability separately from stereo pixel correctness.
 - [013 — Profile and improve the native-refresh frame budget](open/013-profile-native-refresh-frame-budget.md). Explain the remaining scene-dependent submission drops.
-- [014 — First-person headset camera and locomotion](open/014-first-person-headset-camera.md)
+- [014 — First-person headset camera and room-scale movement (closed)](closed/014-first-person-headset-camera.md)
 - [015 — OpenXR controller support with Vive Wands](open/015-vive-wand-controller-support.md)
 - [016 — 6DOF hands, firearm aiming and shooting](open/016-six-dof-hands-and-firearms.md)
 - [017 — 6DOF hand and knife combat](open/017-six-dof-melee-combat.md)
@@ -41,3 +41,7 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [025 — Physics-based money and weapon drops](open/025-physical-money-and-weapon-drops.md)
 - [026 — Remove cinematic depth and focus blur in VR](open/026-disable-cinematic-depth-blur.md)
 - [027 — Fix stereo water shimmer and reflections](open/027-stereo-water-shading.md)
+- [028 — Independent third-person desktop view with VR-only character visibility](open/028-independent-desktop-view.md)
+- [029 — Diagnose crashes during first-person free roam (closed)](closed/029-diagnose-free-roam-crashes.md)
+
+- [030 — Pause-menu VR settings and player-height calibration](open/030-pause-menu-vr-settings-and-height-calibration.md)

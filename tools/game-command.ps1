@@ -21,7 +21,7 @@ try {
     $client.ReadMode = [System.IO.Pipes.PipeTransmissionMode]::Message
     $client.Write($bytes, 0, $bytes.Length)
     $client.Flush()
-    $buffer = [byte[]]::new(512)
+    $buffer = [byte[]]::new(1024)
     $read = $client.ReadAsync($buffer, 0, $buffer.Length)
     if (-not $read.Wait($TimeoutMs)) { throw 'Game command response timed out.' }
     $reply = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read.Result)
