@@ -3,8 +3,10 @@ module;
 #include <common.hxx>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include "includes/dxvk_vulkan_bridge.hpp"
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
+#define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <cstdio>
@@ -15,10 +17,14 @@ module;
 #include <wrl/client.h>
 #include <atomic>
 #include <cmath>
+#include <filesystem>
 
 export module openxrvr;
 
 import common;
+import vrprofile;
+import comvars;
+import settings;
 
 export namespace OpenXRVR
 {
@@ -40,12 +46,17 @@ export namespace OpenXRVR
     void Install();
     void Shutdown(); // Call from the EndScene callback thread, never DllMain.
     std::string Status();
+    bool RequestProducerTest(bool enable);
+    std::string ProducerTestStatus();
     bool GetEyeViews(EyeView (&views)[2], long long& displayTime);
     bool HasFocusedViews(); // Fresh pose and focus gate for gameplay direction.
     bool CanAcceptEyeImages(); // Render callback thread; false while stopped or recreating.
     bool PacesGameplay(); // Atomic; true while the runtime requests stereo frames.
     bool SetEyeImages(const HANDLE (&shared)[2], unsigned width, unsigned height,
         const EyeView (&views)[2], long long poseTime); // Render callback thread after D3D9 GPU completion.
+    bool UsesVulkan();
+    bool SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsigned width,unsigned height,
+        const EyeView (&views)[2],long long poseTime);
     void SetEyeImageProvider(void (*provider)()); // Called on EndScene before any D3D11 eye copy.
 }
 
@@ -133,10 +144,24 @@ namespace
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool running = false;
     bool enabled = false;
+    bool vulkanEnabled=false;
+    DxvkVulkan::Bridge* vulkanBridge=nullptr;
+    template<class F> auto RuntimeQueueCall(VRProfile::Metric metric,F&& call) {
+        if(!vulkanBridge) return call();
+        const auto start=VRProfile::Begin();
+        return vulkanBridge->WithQueue([&](){
+            VRProfile::End(metric,start); // Only lock acquisition, not runtime work.
+            return call();
+        });
+    }
+    HMODULE openvrBootstrap=nullptr; // Retained until process exit: DXVK may use it.
     bool pendingRecreate = false;
     bool permanentFailure = false;
     unsigned frameCount = 0;
     std::atomic<float> displayRefreshHz{0};
+    std::atomic<unsigned> producerRequest{2};
+    std::atomic<bool> producerActive{false};
+    std::atomic<ULONGLONG> producerDeadline{0},producerPairs{0};
     std::atomic<bool> gameplayPacing{false};
     std::atomic<float> submittedHz{0};
     ULONGLONG rateWindowStart=0;
@@ -145,6 +170,7 @@ namespace
     {
         XrSwapchain handle=XR_NULL_HANDLE;
         std::vector<XrSwapchainImageD3D11KHR> images;
+        std::vector<XrSwapchainImageVulkanKHR> vulkanImages;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> shared;
         HANDLE sharedHandle=nullptr;
     };
@@ -273,12 +299,25 @@ namespace
 
     void DestroyRuntime()
     {
+        producerRequest=2;producerActive=false;producerDeadline=0;
         displayRefreshHz=0;
         gameplayPacing=false;
         submittedHz=0;
         rateWindowStart=0;
         rateWindowLayers=0;
         haveEyeImages=false;
+        if(vulkanBridge && !vulkanBridge->Destroy())
+        {
+            // Keep session/images alive until the pending GPU work completes.
+            // A timed-out command must not leave the runtime holding freed memory.
+            running=false; permanentFailure=true;
+            AcquireSRWLockExclusive(&eyeLock);
+            eyeViewsValid=focusedEyeViews=false;
+            ReleaseSRWLockExclusive(&eyeLock);
+            Log("Vulkan copy still pending; quarantining runtime resources until process exit");
+            return;
+        }
+        delete vulkanBridge; vulkanBridge=nullptr;
         for(unsigned i=0;eyeChains && i<2;++i)
         {
             auto& eye=eyeChains[i];
@@ -289,7 +328,7 @@ namespace
             eye.sharedHandle=nullptr;
         }
         delete[] eyeChains; eyeChains=nullptr;
-        imageWidth=imageHeight=submittedFrames=0;
+        imageWidth=imageHeight=0;submittedFrames=0;
         AcquireSRWLockExclusive(&eyeLock);
         eyeViewsValid = false;
         focusedEyeViews=false;
@@ -433,10 +472,10 @@ namespace
         bool hasD3D11 = false, hasRefreshRate=false;
         for (const auto& item : extensions)
         {
-            hasD3D11 |= std::strcmp(item.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
+            hasD3D11 |= std::strcmp(item.extensionName, vulkanEnabled ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
             hasRefreshRate |= std::strcmp(item.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0;
         }
-        if (!hasD3D11) { Log("OpenXR fallback: XR_KHR_D3D11_enable unavailable"); return false; }
+        if (!hasD3D11) { Log("OpenXR fallback: required graphics binding unavailable"); return false; }
 
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
         strcpy_s(create.applicationInfo.applicationName, "GTA IV VR");
@@ -444,7 +483,7 @@ namespace
         strcpy_s(create.applicationInfo.engineName, "FusionFix");
         create.applicationInfo.engineVersion = 1;
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        const char* names[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME,XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
+        const char* names[] = {vulkanEnabled ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_D3D11_ENABLE_EXTENSION_NAME,XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
         create.enabledExtensionCount = hasRefreshRate ? 2 : 1;
         create.enabledExtensionNames = names;
         if (!Check("xrCreateInstance", xrCreateInstance(&create, &instance))) return false;
@@ -471,6 +510,30 @@ namespace
             sprintf_s(line, "OpenXR system: %s", systemProps.systemName);
             Log(line);
         }
+        if(vulkanEnabled)
+        {
+            if(!RageDirect3DDevice9::m_pRealDevice || !*RageDirect3DDevice9::m_pRealDevice) return false;
+            vulkanBridge=new DxvkVulkan::Bridge;
+            if(!vulkanBridge->Attach(*RageDirect3DDevice9::m_pRealDevice))
+                {Log("OpenXR Vulkan: DXVK device interop unavailable"); return false;}
+            PFN_xrGetVulkanGraphicsRequirementsKHR getRequirements=nullptr;
+            PFN_xrGetVulkanGraphicsDeviceKHR getPhysical=nullptr;
+            if(XR_FAILED(xrGetInstanceProcAddr(instance,"xrGetVulkanGraphicsRequirementsKHR",reinterpret_cast<PFN_xrVoidFunction*>(&getRequirements))) ||
+                XR_FAILED(xrGetInstanceProcAddr(instance,"xrGetVulkanGraphicsDeviceKHR",reinterpret_cast<PFN_xrVoidFunction*>(&getPhysical))) ||
+                !getRequirements || !getPhysical) return false;
+            XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
+            VkPhysicalDevice selected=nullptr;
+            if(!Check("xrGetVulkanGraphicsRequirementsKHR",getRequirements(instance,systemId,&requirements)) ||
+                !Check("xrGetVulkanGraphicsDeviceKHR",getPhysical(instance,systemId,vulkanBridge->instance,&selected)) ||
+                selected!=vulkanBridge->physical) return false;
+            XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+            binding.instance=vulkanBridge->instance; binding.physicalDevice=selected; binding.device=vulkanBridge->device;
+            binding.queueFamilyIndex=vulkanBridge->family; binding.queueIndex=vulkanBridge->index;
+            XrSessionCreateInfo sessionInfo{XR_TYPE_SESSION_CREATE_INFO}; sessionInfo.next=&binding; sessionInfo.systemId=systemId;
+            if(!Check("xrCreateSession(DXVK Vulkan)",xrCreateSession(instance,&sessionInfo,&session))) return false;
+        }
+        else
+        {
         PFN_xrGetD3D11GraphicsRequirementsKHR getRequirements = nullptr;
         if (!Check("xrGetInstanceProcAddr(D3D11 requirements)", xrGetInstanceProcAddr(instance,
             "xrGetD3D11GraphicsRequirementsKHR",
@@ -516,6 +579,7 @@ namespace
         sessionInfo.next = &binding;
         sessionInfo.systemId = systemId;
         if (!Check("xrCreateSession(D3D11)", xrCreateSession(instance, &sessionInfo, &session))) return false;
+        }
         if(api.getDisplayRefreshRate)
         {
             float hz=0;
@@ -553,8 +617,10 @@ namespace
     void OnEndScene()
     {
         if (!enabled || permanentFailure) return;
+        VRProfile::Scope frameProfile(VRProfile::Metric::XRFrameWall);
         if (pendingRecreate)
         {
+            if(vulkanEnabled && (!RageDirect3DDevice9::m_pRealDevice || !*RageDirect3DDevice9::m_pRealDevice)) return;
             pendingRecreate = false;
             if (!CreateRuntime()) { Fallback("OpenXR reset recreation failed"); return; }
         }
@@ -606,14 +672,27 @@ namespace
         if (result != XR_EVENT_UNAVAILABLE)
         { Fallback("xrPollEvent failed"); return; }
         if (!running) return;
+        auto diagnostic=producerRequest.exchange(2);
+        if(producerActive && (GetTickCount64()>=producerDeadline.load() || sessionState!=XR_SESSION_STATE_FOCUSED || !haveEyeImages))diagnostic=0;
+        if(diagnostic!=2)
+        {
+            producerActive=diagnostic==1 && vulkanEnabled && haveEyeImages && sessionState==XR_SESSION_STATE_FOCUSED;
+            producerDeadline=producerActive ? GetTickCount64()+15000:0;
+            if(producerActive)producerPairs=0;
+            Log(producerActive ? "producer-test on for15s: cached pose, no headset transfer/submission, completed-pair counter":"producer-test off: normal OpenXR restored");
+        }
         // The provider fences this frame's D3D9 writes before D3D11 reads.
         // Relying on the preceding frame's fence races a reused eye texture.
         if(eyeImageProvider) eyeImageProvider();
         if(permanentFailure || !running) return;
-
         XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState state{XR_TYPE_FRAME_STATE};
-        result = xrWaitFrame(session, &wait, &state);
+        VRProfile::BeforeXRWait();
+        if(producerActive){gameplayPacing=true;return;}
+        {
+            VRProfile::Scope profile(VRProfile::Metric::XRWait);
+            result = xrWaitFrame(session, &wait, &state);
+        }
         if (XR_FAILED(result))
         { Check("xrWaitFrame", result); Fallback("OpenXR frame wait failed"); return; }
         SampleControllerInput(state.predictedDisplayTime);
@@ -624,7 +703,10 @@ namespace
         XrViewState viewState{XR_TYPE_VIEW_STATE};
         XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
         uint32_t viewCount = 0;
-        result = api.locateViews(session, &locate, &viewState, 2, &viewCount, views);
+        {
+            VRProfile::Scope profile(VRProfile::Metric::XRLocateViews);
+            result = api.locateViews(session, &locate, &viewState, 2, &viewCount, views);
+        }
         if (XR_FAILED(result))
         { Check("xrLocateViews", result); Fallback("OpenXR eye locate failed"); return; }
         const auto required = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
@@ -645,7 +727,10 @@ namespace
         }
         ReleaseSRWLockExclusive(&eyeLock);
         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
-        result = xrBeginFrame(session, &begin);
+        {
+            VRProfile::Scope profile(VRProfile::Metric::XRBegin);
+            result = RuntimeQueueCall(VRProfile::Metric::XRQueueBegin,[&](){return xrBeginFrame(session, &begin);});
+        }
         if (XR_FAILED(result))
         { Check("xrBeginFrame", result); Fallback("OpenXR frame begin failed"); return; }
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
@@ -659,34 +744,61 @@ namespace
         gameplayPacing=haveEyeImages && state.shouldRender;
         for(unsigned eye=0;eye<2 && copied;++eye)
         {
+            VRProfile::Scope profile(eye ? VRProfile::Metric::XRCopy1 : VRProfile::Metric::XRCopy0);
             auto& chain=eyeChains[eye];
+            const auto imageWaitStart=VRProfile::Begin();
             XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             uint32_t index=0;
-            if(!CheckImageStep("xrAcquireSwapchainImage(eye)",api.acquireSwapchainImage(chain.handle,&acquire,&index)))
+            if(!CheckImageStep("xrAcquireSwapchainImage(eye)",RuntimeQueueCall(VRProfile::Metric::XRQueueAcquire,[&](){return api.acquireSwapchainImage(chain.handle,&acquire,&index);})))
                 {copied=false; break;}
             XrSwapchainImageWaitInfo imageWait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             imageWait.timeout=1000000000; // One second, including timeout as failure.
             const auto waited=api.waitSwapchainImage(chain.handle,&imageWait);
-            if(!CheckImageStep("xrWaitSwapchainImage(eye)",waited) || index>=chain.images.size())
+            VRProfile::End(eye ? VRProfile::Metric::XRImageWait1 : VRProfile::Metric::XRImageWait0,imageWaitStart);
+            if(!CheckImageStep("xrWaitSwapchainImage(eye)",waited) || index>=(vulkanEnabled ? chain.vulkanImages.size() : chain.images.size()))
                 {copied=false; break;}
+            const auto copyFenceStart=VRProfile::Begin();
+            bool gpuDone=false;
+            if(vulkanEnabled)
+            {
+                const auto start=VRProfile::Begin();
+                gpuDone=vulkanBridge && vulkanBridge->Copy(eye,chain.vulkanImages[index].image);
+                VRProfile::End(eye ? VRProfile::Metric::XRCopyIssue1 : VRProfile::Metric::XRCopyIssue0,start);
+            }
+            else
+            {
+            const auto copyIssueStart=VRProfile::Begin();
             context->CopyResource(chain.images[index].texture,chain.shared.Get());
+            VRProfile::End(eye ? VRProfile::Metric::XRCopyIssue1 : VRProfile::Metric::XRCopyIssue0,copyIssueStart);
             // Complete this diagnostic copy before releasing ownership to the
             // runtime. A bounded event query avoids relying on cross-device
             // driver scheduling for correctness.
             D3D11_QUERY_DESC queryDesc{D3D11_QUERY_EVENT,0};
             Microsoft::WRL::ComPtr<ID3D11Query> query;
-            bool gpuDone=false;
-            if(SUCCEEDED(device->CreateQuery(&queryDesc,&query)))
+            const auto queryStart=VRProfile::Begin();
+            const auto created=device->CreateQuery(&queryDesc,&query);
+            VRProfile::End(eye ? VRProfile::Metric::XRQueryCreate1 : VRProfile::Metric::XRQueryCreate0,queryStart);
+            if(SUCCEEDED(created))
             {
+                const auto flushStart=VRProfile::Begin();
                 context->End(query.Get()); context->Flush();
+                VRProfile::End(eye ? VRProfile::Metric::XRFlush1 : VRProfile::Metric::XRFlush0,flushStart);
                 const auto deadline=GetTickCount64()+1000;
+                const auto pollStart=VRProfile::Begin();
                 HRESULT status=S_FALSE;
-                do {status=context->GetData(query.Get(),nullptr,0,0); if(status==S_FALSE) Sleep(0);}
+                // End/Flush above explicitly submits this event. The bounded
+                // profiler experiment suppresses redundant implicit flushing
+                // while polling; completion is still required before release.
+                const UINT pollFlags=VRProfile::NonflushingPoll() ? D3D11_ASYNC_GETDATA_DONOTFLUSH : 0;
+                do {status=context->GetData(query.Get(),nullptr,0,pollFlags); if(status==S_FALSE) Sleep(0);}
                 while(status==S_FALSE && GetTickCount64()<deadline);
                 gpuDone=status==S_OK;
+                VRProfile::End(eye ? VRProfile::Metric::XRPoll1 : VRProfile::Metric::XRPoll0,pollStart);
             }
+            }
+            VRProfile::End(eye ? VRProfile::Metric::XRCopyFence1 : VRProfile::Metric::XRCopyFence0,copyFenceStart);
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            const bool released=CheckImageStep("xrReleaseSwapchainImage(eye)",api.releaseSwapchainImage(chain.handle,&release));
+            const bool released=gpuDone && CheckImageStep("xrReleaseSwapchainImage(eye)",RuntimeQueueCall(VRProfile::Metric::XRQueueRelease,[&](){return api.releaseSwapchainImage(chain.handle,&release);}));
             if(!gpuDone || !released) {copied=false; Log("Eye transfer synchronization failed"); break;}
             auto& view=projectionViews[eye];
             const auto& source=imageViews[eye];
@@ -709,11 +821,18 @@ namespace
             // Destroying the session releases any outstanding acquisition.
             Fallback("OpenXR eye transfer failed; returning to desktop"); return;
         }
-        result = xrEndFrame(session, &end);
+        {
+            VRProfile::Scope profile(VRProfile::Metric::XREnd);
+            result = RuntimeQueueCall(VRProfile::Metric::XRQueueEnd,[&](){return xrEndFrame(session, &end);});
+        }
         if (XR_FAILED(result))
         { Check("xrEndFrame", result); Fallback("OpenXR frame end failed"); return; }
         if(copied)
         {
+            if(imagePoseTime>0 && state.predictedDisplayTime>=imagePoseTime)
+                VRProfile::Record(VRProfile::Metric::PosePredictionLag,VRProfile::Begin().epoch,
+                    static_cast<double>(state.predictedDisplayTime-imagePoseTime)/1'000'000.0);
+            VRProfile::Submission();
             const auto now=GetTickCount64();
             if(!rateWindowStart) {rateWindowStart=now; rateWindowLayers=0;}
             ++rateWindowLayers;
@@ -742,6 +861,7 @@ namespace
 
 void OpenXRVR::Shutdown()
 {
+    producerRequest=2;producerActive=false;producerDeadline=0;
     enabled = false;
     pendingRecreate = false;
     DestroyRuntime();
@@ -751,11 +871,24 @@ void OpenXRVR::Shutdown()
 std::string OpenXRVR::Status()
 {
     char text[360];
-    sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u,\"eyeImages\":%s,\"stereoLayers\":%u,\"displayRefreshHz\":%.3f,\"submittedHz\":%.2f}",
+    sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u,\"eyeImages\":%s,\"stereoLayers\":%u,\"displayRefreshHz\":%.3f,\"submittedHz\":%.2f,\"graphicsBackend\":\"%s\"}",
         enabled ? "true" : "false", running ? "true" : "false",
         permanentFailure ? "true" : "false", StateName(sessionState), frameCount,
-        haveEyeImages ? "true" : "false",submittedFrames,displayRefreshHz.load(),submittedHz.load());
+        haveEyeImages ? "true" : "false",submittedFrames,displayRefreshHz.load(),submittedHz.load(),vulkanEnabled ? "DXVK-Vulkan" : "D3D9Ex-D3D11");
     return text;
+}
+
+bool OpenXRVR::RequestProducerTest(bool enable)
+{
+    if(enable && (!enabled || !running || permanentFailure || !vulkanEnabled || !haveEyeImages))return false;
+    producerRequest=enable ? 1:0;return true;
+}
+
+std::string OpenXRVR::ProducerTestStatus()
+{
+    const auto now=GetTickCount64(),deadline=producerDeadline.load();char text[280];
+    sprintf_s(text,"{\"ok\":true,\"active\":%s,\"remainingMs\":%llu,\"completedPairs\":%llu,\"cachedPose\":true,\"headsetSubmissions\":false,\"gpuCompletionVerified\":false}",
+        producerActive.load() ? "true":"false",deadline>now ? deadline-now:0,producerPairs.load());return text;
 }
 
 bool OpenXRVR::PacesGameplay()
@@ -765,7 +898,7 @@ bool OpenXRVR::PacesGameplay()
     AcquireSRWLockShared(&eyeLock);
     const bool fresh=eyeSampledAt && GetTickCount64()-eyeSampledAt<=250;
     ReleaseSRWLockShared(&eyeLock);
-    return gameplayPacing.load() && fresh;
+    return producerActive.load() || (gameplayPacing.load() && fresh);
 }
 
 bool OpenXRVR::GetEyeViews(EyeView (&views)[2], long long& displayTime)
@@ -774,7 +907,7 @@ bool OpenXRVR::GetEyeViews(EyeView (&views)[2], long long& displayTime)
     // Never keep overriding the game camera from an indefinitely cached pose
     // when the EndScene/OpenXR producer stops. Ordinary rendering may recover
     // while simulation is still advancing; fresh views enable stereo again.
-    const auto valid = eyeViewsValid && eyeSampledAt && GetTickCount64()-eyeSampledAt<=250;
+    const auto valid = eyeViewsValid && (producerActive.load() || (eyeSampledAt && GetTickCount64()-eyeSampledAt<=250));
     if (valid)
     {
         views[0] = eyeViews[0];
@@ -795,7 +928,7 @@ bool OpenXRVR::GetControllerInput(ControllerInput& input)
 bool OpenXRVR::HasFocusedViews()
 {
     AcquireSRWLockShared(&eyeLock);
-    const bool valid=eyeViewsValid && focusedEyeViews && eyeSampledAt && GetTickCount64()-eyeSampledAt<=250;
+    const bool valid=eyeViewsValid && focusedEyeViews && (producerActive.load() || (eyeSampledAt && GetTickCount64()-eyeSampledAt<=250));
     ReleaseSRWLockShared(&eyeLock);
     return valid;
 }
@@ -870,9 +1003,49 @@ bool OpenXRVR::SetEyeImages(const HANDLE (&shared)[2], unsigned width,unsigned h
     return true;
 }
 
+bool OpenXRVR::UsesVulkan() {return vulkanEnabled;}
+
+bool OpenXRVR::SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsigned width,unsigned height,
+    const EyeView (&views)[2],long long poseTime)
+{
+    if(!vulkanEnabled || !enabled || permanentFailure || !running || !vulkanBridge || !width || !height) return false;
+    if(haveEyeImages && (imageWidth!=width || imageHeight!=height)) return false;
+    if(!haveEyeImages)
+    {
+        if(!vulkanBridge->SetTextures(textures,width,height)) {Fallback("Vulkan eye texture interop incompatible");return false;}
+        if(!eyeChains) eyeChains=new EyeSwapchain[2];
+        uint32_t count=0;
+        if(XR_FAILED(api.enumerateSwapchainFormats(session,0,&count,nullptr))) return false;
+        std::vector<int64_t> formats(count);
+        if(XR_FAILED(api.enumerateSwapchainFormats(session,count,&count,formats.data())) ||
+            std::find(formats.begin(),formats.end(),VK_FORMAT_B8G8R8A8_SRGB)==formats.end()) return false;
+        for(unsigned eye=0;eye<2;++eye)
+        {
+            auto& chain=eyeChains[eye];
+            XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+            create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+            create.format=VK_FORMAT_B8G8R8A8_SRGB; create.sampleCount=1;
+            create.width=width; create.height=height; create.faceCount=1; create.arraySize=1; create.mipCount=1;
+            if(!Check("xrCreateSwapchain(Vulkan eye)",api.createSwapchain(session,&create,&chain.handle)))
+                {Fallback("Vulkan swapchain creation failed");return false;}
+            uint32_t images=0;
+            if(XR_FAILED(api.enumerateSwapchainImages(chain.handle,0,&images,nullptr))) return false;
+            chain.vulkanImages.resize(images);
+            for(auto& image:chain.vulkanImages) image.type=XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+            if(!images || XR_FAILED(api.enumerateSwapchainImages(chain.handle,images,&images,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.vulkanImages.data())))) return false;
+        }
+        imageWidth=width; imageHeight=height; haveEyeImages=true;
+        Log("Vulkan eye swapchains ready on game's DXVK device");
+    }
+    imageViews[0]=views[0]; imageViews[1]=views[1]; imagePoseTime=poseTime;
+    if(producerActive.load())++producerPairs;
+    return true;
+}
+
 bool OpenXRVR::CanAcceptEyeImages()
 {
-    return enabled && !permanentFailure && running && device;
+    return enabled && !permanentFailure && running && (vulkanEnabled ? vulkanBridge!=nullptr : device!=nullptr);
 }
 
 void OpenXRVR::SetEyeImageProvider(void (*provider)())
@@ -884,6 +1057,7 @@ void OpenXRVR::Install()
 {
     CIniReader ini("");
     enabled = ini.ReadInteger("VR", "EnableOpenXR", 0) != 0;
+    vulkanEnabled=enabled && ini.ReadInteger("VR","ExperimentalVulkanBridge",0)!=0;
     controllerEnabled=ini.ReadInteger("VR","ExperimentalControllerInput",0)!=0;
     if (!enabled) return;
     wchar_t path[MAX_PATH]{};
@@ -899,7 +1073,28 @@ void OpenXRVR::Install()
         }
     }
     Log("OpenXR enabled by [VR] EnableOpenXR=1; initializing x86 session");
-    if (!CreateRuntime()) Fallback("OpenXR initialization failed");
+    if(vulkanEnabled)
+    {
+        if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=1)
+            {Fallback("Experimental Vulkan bridge requires d3d9.cfg API=1"); return;}
+        const auto diagnostic=ini.ReadString("DEVELOPMENT","VulkanDebugMode","");
+        if(diagnostic=="hang" || diagnostic=="validation" || diagnostic=="markers")
+        {
+            SetEnvironmentVariableA("DXVK_DEBUG",diagnostic.c_str());
+            Log("DXVK diagnostics enabled for this process; do not use for performance comparisons");
+        }
+        const auto path=ini.ReadString("VR","VulkanOpenVRBootstrap","");
+        if(!path.empty())
+        {
+            const auto absolute=std::filesystem::path(path);
+            if(!absolute.is_absolute()) {Fallback("Vulkan bootstrap DLL path must be absolute"); return;}
+            openvrBootstrap=LoadLibraryExW(absolute.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            if(!openvrBootstrap) {Fallback("Vulkan OpenVR bootstrap preload failed"); return;}
+        }
+        pendingRecreate=true; // Bind the actual game device on first EndScene.
+        Log("Experimental Vulkan bridge selected; waiting for game DXVK device");
+    }
+    else if (!CreateRuntime()) Fallback("OpenXR initialization failed");
     FusionFix::onEndScene() += []() { OnEndScene(); };
     FusionFix::onBeforeReset() += []()
     {

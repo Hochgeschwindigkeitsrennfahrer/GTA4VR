@@ -1,0 +1,72 @@
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 9b72bb2..9cbeac7 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -52,7 +52,7 @@ namespace dxvk {
+     , m_shaderModules      ( new D3D9ShaderModuleSet )
+     , m_stagingBuffer      ( dxvkDevice, StagingBufferSize )
+     , m_stagingBufferFence ( new sync::Fence() )
+-    , m_multithread        ( BehaviorFlags & D3DCREATE_MULTITHREADED )
++    , m_multithread        ( BehaviorFlags & D3DCREATE_MULTITHREADED, m_d3d9Options.experimentalReleaseDeviceLock )
+     , m_isSWVP             ( (BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) != 0 )
+     , m_csThread           ( dxvkDevice, dxvkDevice->createContext() )
+     , m_csChunk            ( AllocCsChunk() )
+diff --git a/src/d3d9/d3d9_options.cpp b/src/d3d9/d3d9_options.cpp
+index e46864e..40f20a9 100644
+--- a/src/d3d9/d3d9_options.cpp
++++ b/src/d3d9/d3d9_options.cpp
+@@ -30,6 +30,7 @@ namespace dxvk {
+ 
+ 
+   D3D9Options::D3D9Options(const Rc<DxvkDevice>& device, const Config& config) {
++    this->experimentalReleaseDeviceLock = config.getOption<bool>("d3d9.experimentalReleaseDeviceLock", false);
+     const Rc<DxvkAdapter> adapter = device != nullptr ? device->adapter() : nullptr;
+ 
+     // Fetch these as a string representing a hexadecimal number and parse it.
+diff --git a/src/d3d9/d3d9_options.h b/src/d3d9/d3d9_options.h
+index e69a39a..9a3f5ab 100644
+--- a/src/d3d9/d3d9_options.h
++++ b/src/d3d9/d3d9_options.h
+@@ -13,6 +13,9 @@ namespace dxvk {
+ 
+   struct D3D9Options {
+ 
++    // GTA4VR #013: reversible device-lock memory-order experiment.
++    bool experimentalReleaseDeviceLock;
++
+     D3D9Options(const Rc<DxvkDevice>& device, const Config& config);
+ 
+     /// Override PCI vendor and device IDs reported to the
+diff --git a/src/util/sync/sync_scoped.h b/src/util/sync/sync_scoped.h
+index 72f3f3b..91c5e93 100644
+--- a/src/util/sync/sync_scoped.h
++++ b/src/util/sync/sync_scoped.h
+@@ -62,8 +62,8 @@ namespace dxvk::sync {
+     friend ScopedDeviceGuard;
+   public:
+ 
+-    ScopedDeviceLock(bool enableProtection)
+-    : m_enable(enableProtection) { }
++    ScopedDeviceLock(bool enableProtection, bool releaseStore = false)
++    : m_enable(enableProtection), m_releaseStore(releaseStore) { }
+ 
+     ScopedDeviceGuard acquire() {
+       if (likely(!m_enable))
+@@ -90,11 +90,16 @@ namespace dxvk::sync {
+     alignas(CACHE_LINE_SIZE)
+     std::atomic<uint32_t> m_owner = { 0u };
+     bool                  m_enable = false;
++    bool                  m_releaseStore = false;
+ 
+     ScopedDeviceGuard lockContested(uint32_t threadId);
+ 
+     void unlock() {
+-      m_owner.store(0u);
++      // GTA4VR #013: release pairs with acquire ownership; keep upstream default.
++      if (m_releaseStore)
++        m_owner.store(0u, std::memory_order_release);
++      else
++        m_owner.store(0u);
+     }
+ 
+   };

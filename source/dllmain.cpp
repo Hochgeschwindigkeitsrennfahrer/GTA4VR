@@ -12,12 +12,15 @@ import vrd3d9ex;
 import vrviewprobe;
 import vrcamera;
 import vrstereo;
+import vrprofile;
 
 std::vector<std::future<void>> initializationFutures;
 
 injector::hook_back<void(*)()> hbCGameProcess;
 void CGameProcessHook()
 {
+    // This frame callback is upstream's hook of a native RET stub (#013).
+    const auto callbacksStart=VRProfile::Begin();
     if (CTimer::ms_bUserPause && CTimer::ms_bScriptPause)
     {
         if (!*CTimer::ms_bUserPause && !*CTimer::ms_bScriptPause)
@@ -47,6 +50,8 @@ void CGameProcessHook()
             FusionFix::onMenuDrawingEvent().executeAll();
     }
 
+    VRProfile::End(VRProfile::Metric::ProcessCallbacks,callbacksStart);
+    VRProfile::Scope profile(VRProfile::Metric::ProcessStub);
     return hbCGameProcess.fun();
 }
 

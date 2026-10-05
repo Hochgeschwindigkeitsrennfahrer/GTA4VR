@@ -12,6 +12,7 @@ import natives;
 import settings;
 import shaders;
 import vrtrace;
+import vrprofile;
 
 #define IDR_FXAA                                 101
 #define IDR_SMAA                                 102
@@ -1511,9 +1512,11 @@ private:
 
     static void RenderAmbientOcclusion()
     {
+        if(VRProfile::DisableAmbientOcclusion()) return;
         static auto AO = FusionFixSettings.GetRef("PREF_SAO");
         if (PostFxResources.AOEffect && PostFxResources.AOEnabled && AO->get())
         { // AO
+            VRProfile::Scope profile(VRProfile::Metric::AmbientOcclusion);
             IDirect3DDevice9* pDevice = rage::grcDevice::GetD3DDevice();
 
             IDirect3DSurface9* rt0 = nullptr;

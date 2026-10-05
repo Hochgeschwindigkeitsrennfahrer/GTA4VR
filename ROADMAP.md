@@ -10,7 +10,7 @@ The repository builds a 32-bit FusionFix ASI through `premake5.bat` and `premake
 
 1. Start each change from a recorded baseline: Git commit, game executable version, FusionFix build, selected graphics API, OpenXR runtime/headset, GPU, and graphics settings. Keep the game install and runtime files out of Git.
 2. Make one small change in a branch. Put VR code behind an opt-in setting and keep the flat-screen path testable.
-3. Generate the solution with `premake5.bat`; build the **x86** Debug configuration. Use Release for performance checks. Upstream's `premake5.lua` optionally reads a local `.env` line `GTAIV_DIR=<folder containing GTAIV.exe>` and copies a built ASI into an existing `plugins` folder. Use this only after a known-good baseline and a backup of the installed ASI.
+3. Generate the solution with `premake5.bat` when needed; build **x86 Release** for runtime and performance iterations. Build Debug when debugging/assertions or a Debug-specific issue requires it, rather than as an extra step before every Release run. Upstream's `premake5.lua` optionally reads a local `.env` line `GTAIV_DIR=<folder containing GTAIV.exe>` and copies a built ASI into an existing `plugins` folder. Use this only after a known-good baseline and a backup of the installed ASI.
 4. Test in increasing scope: compile, flat-screen launch, runtime initialization, headset display, then repeatable free-roam scenarios. Log results and a reproducible failure case in the relevant issue or PR.
 5. Update this roadmap when an experiment resolves an architectural question or changes a milestone's exit criteria. Keep upstream FusionFix changes separate from VR-specific changes where practical.
 
@@ -71,6 +71,8 @@ Closed [#029](issues/closed/029-diagnose-free-roam-crashes.md) on2026-10-04 afte
 Closed [#014](issues/closed/014-first-person-headset-camera.md) on2026-10-04: the user accepts the implemented first-person/room-scale/crouch/action/car/headset-aiming route together and separately confirms the final flat-screen check. Extra vehicle classes/passenger routes remain #019, scopes/special weapons #016, and measured scale/pose behavior #011. Other special camera transitions are deferred; cutscenes retain their existing camera path.
 
 Sequence camera/scale and controller foundations before dependent interactions. Rendering defect reproduction can proceed independently. Each issue owns its acceptance evidence; milestone completion still requires the combined route.
+
+Performance work in #013 is shelved at the user's request on 2026-10-05 so another task can proceed. Preserve the working installed DXVK/Vulkan path, shaders, experiments and measured evidence; #013 remains open without an all-scene 90 Hz claim. The [checkpoint](docs/performance-013-checkpoint.md) records stable settings and how to resume. Distributed defaults remain opt-in with the D3D9Ex/D3D11 fallback; see [Vulkan integration and limits](docs/vulkan-openxr-feasibility.md).
 
 The #014 camera foundation now supports the accepted route using existing keyboard/gamepad controls with headset-relative forward/back/strafe. Next foundations are #015 Vive Wand input and #011 measured scale/pose validation, followed by #016 independent tracked weapons. Vehicle controls/interactions remain #019. #007 remains open for render attribution; preserve radar/menu camera ownership and UI update behavior during later changes. UI presentation choices in #020/#021/#022 remain deferred at the user's request.
 

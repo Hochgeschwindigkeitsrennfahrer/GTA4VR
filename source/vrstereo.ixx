@@ -4,6 +4,15 @@ module;
 #include <d3dx9shader.h>
 #include "includes/vrmath.hpp"
 #include "includes/vrmodelrefs.hpp"
+#include "includes/vrconstantprobe.hpp"
+#include "includes/vrtexturerouting.hpp"
+#include "includes/vrvertex.hpp"
+#include "includes/vrbillboardshader.hpp"
+#include "includes/vrrigidinstanceshader.hpp"
+#include "includes/vrrigidinstance.hpp"
+#include "includes/vrmeshpacketprobe.hpp"
+#include "includes/vrconstantbatch.hpp"
+#include <intrin.h>
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -18,6 +27,7 @@ import common;
 import comvars;
 import settings;
 import openxrvr;
+import vrprofile;
 import vrcamera;
 import d3dx9_43;
 
@@ -27,12 +37,44 @@ export namespace VRStereo
     void Shutdown(); // Render callback thread, never DllMain.
     bool RestartExperiment();
     bool RestartLodProbe();
+    bool SetVisibilityTest(bool value);
+    bool RequestSphereClassificationProbe();
+    bool RequestVertexCallerProbe();
+    bool RequestModelCommandProbe();
+    bool SetVertexEmissionTest(bool value);
+    bool SetBillboardInstancingTest(bool value);
+    bool SetRigidInstancingTest(bool value);
+    bool RequestMeshPacketProbe();
+    bool RequestMeshOrderProbe();
+    bool RequestMeshReplayProbe();
+    bool RequestMeshBenchmarkProbe();
+    bool RequestLiveMeshProbe(bool replace);
+    bool RequestCpuOmission(unsigned mode);
+    std::string CpuOmissionStatus();
+    bool SetConstantBatchTest(bool value);
+    bool SetSphereClassificationTest(bool value);
     std::string Status();
 }
 
 namespace
 {
     using Microsoft::WRL::ComPtr;
+    struct ConstantProbe
+    {
+        VRConstantProbe::Observer observer;
+        VRProfile::Total time{};
+        unsigned long long calls=0,vectors=0,repeatedCandidates=0;
+        void Reset() {observer.Reset(); time={}; calls=vectors=repeatedCandidates=0;}
+        void Record(VRProfile::Stamp stamp,UINT start,const float* data,UINT count,HRESULT result)
+        {
+            if(!stamp.epoch) return;
+            if(time.epoch!=stamp.epoch) {Reset(); time.epoch=stamp.epoch;}
+            VRProfile::Accumulate(time,stamp);
+            ++calls; vectors+=count;
+            if(SUCCEEDED(result) && observer.Observe(start,data,count)) ++repeatedCandidates;
+        }
+    };
+    thread_local ConstantProbe constantProbes[2][2];
     struct Target
     {
         std::string name;
@@ -45,6 +87,16 @@ namespace
     };
     struct Resources
     {
+        VRTextureRouting::Cache<IDirect3DBaseTexture9*> textureRoutes;
+        struct GPUTiming
+        {
+            ComPtr<IDirect3DQuery9> begin,end,frequency,disjoint;
+            unsigned epoch=0;
+            bool pending=false;
+        };
+        std::array<std::array<GPUTiming,8>,2> gpuTimings;
+        int gpuActive[2]{-1,-1};
+        bool gpuInitialized=false,gpuSupported=false;
         std::vector<Target> targets;
         ComPtr<IDirect3DSurface9> originalBack;
         ComPtr<IDirect3DTexture9> finalTexture[2];
@@ -57,6 +109,59 @@ namespace
     // Explicit render-thread ownership; process detach must not invoke driver
     // cleanup under the loader lock. The bridge/reset calls Shutdown instead.
     Resources* resources=nullptr;
+
+    // No polling loop or FLUSH: consume completed older samples and skip a
+    // full ring. Query allocation happens once, during the first capture.
+    void GPUTime(IDirect3DDevice9* device,int eye,bool begin)
+    {
+        if(!resources) return;
+        auto& state=*resources;
+        if(!begin)
+        {
+            if(state.gpuActive[eye]<0) return;
+            auto& query=state.gpuTimings[eye][state.gpuActive[eye]];
+            const bool ended=SUCCEEDED(query.end->Issue(D3DISSUE_END)) &&
+                SUCCEEDED(query.frequency->Issue(D3DISSUE_END)) &&
+                SUCCEEDED(query.disjoint->Issue(D3DISSUE_END));
+            query.pending=ended;
+            state.gpuActive[eye]=-1;
+            return;
+        }
+        const auto capture=VRProfile::Begin();
+        if(!capture.epoch || !VRProfile::GPUQueriesEnabled()) return;
+        if(!state.gpuInitialized)
+        {
+            state.gpuInitialized=true;
+            state.gpuSupported=true;
+            for(auto& ring:state.gpuTimings) for(auto& query:ring)
+                if(FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMP,&query.begin)) ||
+                    FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMP,&query.end)) ||
+                    FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ,&query.frequency)) ||
+                    FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT,&query.disjoint)))
+                    state.gpuSupported=false;
+        }
+        if(!state.gpuSupported) return;
+        auto& ring=state.gpuTimings[eye];
+        for(auto& query:ring) if(query.pending)
+        {
+            UINT64 low=0,high=0,frequency=0; BOOL disjoint=TRUE;
+            if(query.end->GetData(&high,sizeof(high),0)!=S_OK ||
+                query.begin->GetData(&low,sizeof(low),0)!=S_OK ||
+                query.frequency->GetData(&frequency,sizeof(frequency),0)!=S_OK ||
+                query.disjoint->GetData(&disjoint,sizeof(disjoint),0)!=S_OK) continue;
+            if(!disjoint && frequency && high>=low)
+                VRProfile::Record(eye ? VRProfile::Metric::Eye1GPU : VRProfile::Metric::Eye0GPU,
+                    query.epoch,1000.0*static_cast<double>(high-low)/frequency);
+            query.pending=false;
+        }
+        for(unsigned index=0;index<ring.size();++index) if(!ring[index].pending)
+        {
+            auto& query=ring[index];
+            if(SUCCEEDED(query.disjoint->Issue(D3DISSUE_BEGIN)) && SUCCEEDED(query.begin->Issue(D3DISSUE_END)))
+            {query.epoch=capture.epoch; state.gpuActive[eye]=static_cast<int>(index);}
+            break;
+        }
+    }
     std::atomic<bool> ready{false};
     std::atomic<bool> enabled{false};
     unsigned maxFrames=1;
@@ -66,6 +171,14 @@ namespace
     OpenXRVR::EyeView xrViews[2]{};
     rage::grcViewport eyeViewports[2]{};
     std::array<VRMath::Vector,6> visibilityPlanes{};
+    std::array<VRMath::Vector,6> eyeVisibilityPlanes[2]{};
+    bool tightVisibility=false;
+    std::atomic<bool> visibilityTest{true};
+    std::atomic<bool> sphereClassificationProbeRequested{false};
+    unsigned sphereClassificationProbeFrames=0;
+    unsigned sphereClassificationProbeQueries=0,sphereClassificationProbeMismatches=0;
+    std::atomic<bool> sphereClassificationTest{false};
+    bool sphereClassificationFast=false;
     void* scenePhase=nullptr;
     void* lightingPhase=nullptr;
     void* drawPhase=nullptr;
@@ -83,6 +196,15 @@ namespace
     OpenXRVR::EyeView completedViews[2]{};
     long long completedPoseTime=0;
     std::atomic<DWORD> routingThread{0};
+    std::atomic<unsigned> routingGeneration{1};
+    thread_local unsigned routingPhaseGeneration=0;
+    bool OnRoutingThread()
+    {
+        // A queued eye marker verifies its executing thread once per phase.
+        // Resource replacement invalidates tokens left on any other thread.
+        return (routingPhaseGeneration && routingPhaseGeneration==routingGeneration.load(std::memory_order_relaxed)) ||
+            GetCurrentThreadId()==routingThread;
+    }
     std::atomic<bool> restartRequested{false},captureNextPair{false};
     SafetyHookInline sceneSetup{},drawSetup{},renderFrame{},buildFrame{};
     SafetyHookInline pedRender{};
@@ -130,15 +252,108 @@ namespace
     rage::grcViewport* observedSphereViewports[16]{};
     unsigned observedSphereViewportCount=0;
     SafetyHookInline setTarget{},setDepth{},setTexture{},stretch{};
+    SafetyHookInline setRenderState{},setSamplerState{},setStreamSource{},setIndices{},setVertexDeclaration{};
+    bool stateHooksReady=false,stateHooksFailed=false;
     SafetyHookInline setVertexShader{};
     SafetyHookInline setVertexConstants{};
-    SafetyHookInline drawPrimitive{};
+    SafetyHookInline drawPrimitive{},drawIndexedPrimitive{};
+    // Enabled only between markers of the requested diagnostic pair. No
+    // device getters or per-call timers in ordinary indexed draws.
+    thread_local bool normalProbeActive=false;
+    thread_local bool drawProbeActive=false;
+    thread_local unsigned drawProbeEpoch=0,drawProbeOffset=0;
+    thread_local VRProfile::DrawCounters drawProbeCounters{};
+    thread_local bool stateProbeActive=false;
+    thread_local bool constantProbeActive=false;
+    thread_local bool routingProbeActive=false;
+    thread_local bool textureCacheBypass=false;
+    thread_local unsigned stateProbeEpoch=0,stateProbeOffset=0;
+    thread_local VRProfile::StateCounters stateProbeCounters[static_cast<unsigned>(VRProfile::StateKind::Count)]{};
+
+    template<typename Call> HRESULT ObserveStateCall(VRProfile::StateKind kind,Call&& call)
+    {
+        if(!stateProbeActive) return call();
+        auto& counters=stateProbeCounters[static_cast<unsigned>(kind)];
+        ++counters.calls;
+        const auto stamp=((counters.calls+stateProbeOffset+static_cast<unsigned>(kind)*7)&63)==0
+            ? VRProfile::Begin():VRProfile::Stamp{};
+        const auto result=call();
+        counters.failedCalls+=FAILED(result);
+        if(stamp.epoch==stateProbeEpoch && stamp.ticks)
+        {
+            VRProfile::Total sample{stamp.epoch,0}; VRProfile::Accumulate(sample,stamp);
+            ++counters.timedCalls; counters.timedMs+=sample.ms;
+            counters.maxTimedMs=(std::max)(counters.maxTimedMs,sample.ms);
+        }
+        return result;
+    }
+
+    VRProfile::Stamp BeginDrawProbe(bool indexed,UINT primitives,UINT vertices)
+    {
+        auto& counters=drawProbeCounters;
+        ++counters.calls; counters.indexedCalls+=indexed;
+        counters.primitives+=primitives; counters.vertices+=vertices;
+        // Rotate the systematic sample over64 frames to avoid always timing
+        // the same positions in a repeated draw sequence. No per-call lock.
+        return ((counters.calls+drawProbeOffset)&63)==0 ? VRProfile::Begin():VRProfile::Stamp{};
+    }
+    void EndDrawProbe(VRProfile::Stamp stamp,HRESULT result)
+    {
+        drawProbeCounters.failedCalls+=FAILED(result);
+        if(stamp.epoch!=drawProbeEpoch || !stamp.ticks) return;
+        VRProfile::Total sample{stamp.epoch,0}; VRProfile::Accumulate(sample,stamp);
+        ++drawProbeCounters.timedCalls; drawProbeCounters.timedMs+=sample.ms;
+        drawProbeCounters.maxTimedMs=(std::max)(drawProbeCounters.maxTimedMs,sample.ms);
+    }
+    struct NormalProbeKey {IDirect3DPixelShader9* shader; std::array<IDirect3DBaseTexture9*,8> textures;};
+    thread_local std::vector<NormalProbeKey> normalProbeKeys[2];
+    thread_local std::vector<ComPtr<IDirect3DPixelShader9>> normalProbeShaders;
+    thread_local DWORD gbufferMipFilters[16]{};
+    thread_local bool gbufferMipValid[16]{};
+
+    void PrepareGBufferMipFilters(IDirect3DDevice9* device,unsigned eye)
+    {
+        // The second eye follows the first eye's lighting/transparency work.
+        // Native cached commands can omit sampler writes: observed normal-map
+        // slots1/2 retained MIPFILTER=NONE instead of the first eye's LINEAR.
+        // Match the authoritative first-eye entry state; do not choose a new
+        // filter or touch the game's software cache or camera constants.
+        for(unsigned slot=0;slot<16;++slot)
+        {
+            DWORD value=0;
+            const bool valid=SUCCEEDED(device->GetSamplerState(slot,D3DSAMP_MIPFILTER,&value));
+            if(!eye) {gbufferMipValid[slot]=valid; gbufferMipFilters[slot]=value;}
+            else if(valid && gbufferMipValid[slot] && value!=gbufferMipFilters[slot])
+                device->SetSamplerState(slot,D3DSAMP_MIPFILTER,gbufferMipFilters[slot]);
+        }
+    }
     SafetyHookInline setPixelShader{},setPixelConstants{};
-    bool cascadeShaderBound=false;
+    SafetyHookInline presentHook{},presentExHook{},swapPresentHook{};
+    thread_local unsigned presentDepth=0;
+
+    HRESULT WINAPI DesktopPresent(IDirect3DDevice9* self,const RECT* source,const RECT* destination,HWND window,const RGNDATA* dirty)
+    {
+        const auto stamp=presentDepth++ ? VRProfile::Stamp{} : VRProfile::Begin();
+        const auto result=presentHook.unsafe_stdcall<HRESULT>(self,source,destination,window,dirty);
+        --presentDepth; VRProfile::End(VRProfile::Metric::DesktopPresent,stamp); return result;
+    }
+    HRESULT WINAPI DesktopPresentEx(IDirect3DDevice9Ex* self,const RECT* source,const RECT* destination,HWND window,const RGNDATA* dirty,DWORD flags)
+    {
+        const auto stamp=presentDepth++ ? VRProfile::Stamp{} : VRProfile::Begin();
+        const auto result=presentExHook.unsafe_stdcall<HRESULT>(self,source,destination,window,dirty,flags);
+        --presentDepth; VRProfile::End(VRProfile::Metric::DesktopPresent,stamp); return result;
+    }
+    HRESULT WINAPI DesktopSwapPresent(IDirect3DSwapChain9* self,const RECT* source,const RECT* destination,HWND window,const RGNDATA* dirty,DWORD flags)
+    {
+        const auto stamp=presentDepth++ ? VRProfile::Stamp{} : VRProfile::Begin();
+        const auto result=swapPresentHook.unsafe_stdcall<HRESULT>(self,source,destination,window,dirty,flags);
+        --presentDepth; VRProfile::End(VRProfile::Metric::DesktopPresent,stamp); return result;
+    }
+    thread_local bool cascadeShaderBound=false;
     float originalCascadeForward[4]{},cascadeForward[4]{},gameShadowForward[4]{};
     unsigned lightingProbeMask=0;
     float expectedCamera[16]{};
-    bool rayShaderBound=false;
+    thread_local bool rayShaderBound=false;
     float originalRayConstants[4]{},eyeRayConstants[4]{};
 
     void Log(const char* message)
@@ -151,6 +366,1121 @@ namespace
         if(wcscat_s(path,L"plugins\\GTAIV.VR.stereo.log")) return;
         FILE* file=nullptr;
         if(!_wfopen_s(&file,path,L"a") && file) {fprintf(file,"%s\n",message); fclose(file);}
+    }
+
+    // Diagnostic only: attach on a queued render marker, detach after five
+    // seconds. No detour remains in ordinary captures. Counts are not timings.
+    std::atomic<bool> vertexProbeRequested{false};
+    SafetyHookMid vertexProbeHook;
+    struct VertexCaller {uintptr_t caller=0; unsigned long long calls[7]{};};
+    std::array<VertexCaller,512> vertexCallers{};
+    unsigned long long vertexProbeDropped=0,vertexProbeStreams[6]{};
+    ULONGLONG vertexProbeDeadline=0;
+    DWORD vertexProbeThread=0;
+    unsigned vertexProbePhase=6; // Outside the marked main eye streams.
+    std::atomic<bool> vertexEmissionRequested{false};
+    SafetyHookInline vertexEmissionHook;
+    std::uint32_t *vertexEnabled=nullptr,*vertexCount=nullptr;
+    std::uint32_t** vertexOutput=nullptr;
+
+    void __cdecl EmitVertexWords(std::uint32_t,std::uint32_t,std::uint32_t,
+        std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t)
+    {
+        // All nine cdecl words are contiguous above the return address;
+        // reinterpret their bits without converting the caller's float ABI.
+        VRVertex::Emit(*vertexEnabled,*vertexOutput,*vertexCount,
+            reinterpret_cast<const std::uint32_t*>(_AddressOfReturnAddress())+1);
+    }
+
+    void UpdateVertexEmissionTest()
+    {
+        if(vertexProbeHook) return;
+        if(!vertexEmissionRequested.load())
+        {if(vertexEmissionHook) {vertexEmissionHook.reset(); Log("vertex-emission-test off");} return;}
+        if(vertexEmissionHook) return;
+        auto entry=hook::pattern("83 3D ? ? ? ? 00 74 ? A1 ? ? ? ? 85 C0 74 ? F3 0F 10 44 24 04 8B C8 83 C0 24 FF 05 ? ? ? ? A3 ? ? ? ?");
+        if(entry.size()!=1) {vertexEmissionRequested=false; Log("vertex-emission-test unavailable: signature mismatch"); return;}
+        auto* enabledAddress=*entry.get_first<std::uint32_t*>(2);
+        auto** outputAddress=*entry.get_first<std::uint32_t**>(10);
+        auto* countAddress=*entry.get_first<std::uint32_t*>(31);
+        auto** advancedOutputAddress=*entry.get_first<std::uint32_t**>(36);
+        if(reinterpret_cast<uintptr_t>(enabledAddress)!=reinterpret_cast<uintptr_t>(countAddress)+4 ||
+            reinterpret_cast<uintptr_t>(outputAddress)!=reinterpret_cast<uintptr_t>(countAddress)+12 || outputAddress!=advancedOutputAddress)
+        {vertexEmissionRequested=false; Log("vertex-emission-test unavailable: state layout mismatch"); return;}
+        vertexEnabled=enabledAddress; vertexOutput=outputAddress; vertexCount=countAddress;
+        vertexEmissionHook=safetyhook::create_inline(entry.get_first(),EmitVertexWords);
+        if(!vertexEmissionHook) vertexEmissionRequested=false;
+        Log(vertexEmissionHook ? "vertex-emission-test on: exact36-byte copies, diagnostic opt-in" : "vertex-emission-test hook unavailable");
+    }
+
+    void FinishVertexCallerProbe()
+    {
+        if(!vertexProbeHook) return;
+        vertexProbeHook.reset();
+        char line[512];
+        const auto base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        sprintf_s(line,"vertex-caller-probe complete moduleBase=%08X thread=%lu dropped=%llu streams=%llu,%llu,%llu,%llu,%llu,%llu",
+            static_cast<unsigned>(base),vertexProbeThread,vertexProbeDropped,
+            vertexProbeStreams[0],vertexProbeStreams[1],vertexProbeStreams[2],
+            vertexProbeStreams[3],vertexProbeStreams[4],vertexProbeStreams[5]);
+        Log(line);
+        for(const auto& row:vertexCallers) if(row.caller)
+        {
+            // Store the return address; the candidate direct CALL is five
+            // bytes earlier and must still be validated in live disassembly.
+            sprintf_s(line,"vertex-caller returnRuntime=%08X returnAnalysis=%08X counts=%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+                static_cast<unsigned>(row.caller),static_cast<unsigned>(row.caller-base+0x400000),
+                row.calls[0],row.calls[1],row.calls[2],row.calls[3],row.calls[4],row.calls[5],row.calls[6]);
+            Log(line);
+        }
+        vertexProbeDeadline=0;
+    }
+
+    void UpdateVertexCallerProbe()
+    {
+        if(vertexProbeHook && GetTickCount64()>=vertexProbeDeadline) FinishVertexCallerProbe();
+        if(!vertexProbeRequested.exchange(false) || vertexProbeHook) return;
+        if(vertexEmissionHook) {Log("vertex-caller-probe unavailable: disable vertex-emission-test first"); return;}
+        auto entry=hook::pattern("83 3D ? ? ? ? 00 74 ? A1 ? ? ? ? 85 C0 74 ? F3 0F 10 44 24 04 8B C8 83 C0 24");
+        if(entry.size()!=1) {Log("vertex-caller-probe unavailable: unique entry signature not found"); return;}
+        vertexCallers={}; vertexProbeDropped=0;
+        for(auto& count:vertexProbeStreams) count=0;
+        vertexProbeThread=GetCurrentThreadId(); vertexProbePhase=6;
+        vertexProbeHook=safetyhook::create_mid(entry.get_first(),[](SafetyHookContext& regs)
+        {
+            if(GetCurrentThreadId()!=vertexProbeThread) return;
+            const auto caller=*reinterpret_cast<const uintptr_t*>(regs.esp);
+            auto index=(caller>>4)&(vertexCallers.size()-1);
+            for(unsigned attempt=0;attempt<vertexCallers.size();++attempt)
+            {
+                auto& row=vertexCallers[index];
+                if(!row.caller || row.caller==caller)
+                {row.caller=caller; ++row.calls[vertexProbePhase]; return;}
+                index=(index+1)&(vertexCallers.size()-1);
+            }
+            ++vertexProbeDropped;
+        });
+        if(vertexProbeHook)
+        {vertexProbeDeadline=GetTickCount64()+5000; Log("vertex-caller-probe armed: five seconds, counts only; exclude from performance captures");}
+        else Log("vertex-caller-probe unavailable: hook creation failed");
+    }
+
+    // Complete native executions, rather than a racing command-buffer prefix.
+    // This bounded diagnostic changes no command, model or visibility decision.
+    std::atomic<bool> modelProbeRequested{false};
+    std::atomic<bool> billboardInstancingRequested{false};
+    std::atomic<bool> rigidInstancingRequested{false};
+    std::unique_ptr<VRRigidInstance::Renderer> rigidInstances;
+    std::atomic<bool> meshPacketRequested{false};
+    std::atomic<bool> meshOrderRequested{false};
+    std::atomic<bool> meshReplayRequested{false};
+    std::atomic<bool> meshBenchmarkRequested{false};
+    std::atomic<unsigned> liveMeshRequested{0};
+    std::atomic<unsigned> cpuOmitRequested{99},cpuOmitMode{0};
+    std::atomic<ULONGLONG> cpuOmitDeadline{0},cpuOmitSkipped[2]{};
+    SafetyHookInline cpuOmitHook;
+    bool InCpuOmission()
+    {return OnRoutingThread() && renderEye>=0 && renderEye<2 && (renderStage==1 || renderStage==3);}
+    void __fastcall OmitModelWork(void* self,void* edx)
+    {
+        if(InCpuOmission()){++cpuOmitSkipped[renderEye];return;}
+        cpuOmitHook.unsafe_fastcall(self,edx);
+    }
+    void __fastcall OmitMaterialWork(void* self,void* edx,uintptr_t a,uintptr_t b,uintptr_t c)
+    {
+        if(InCpuOmission()){++cpuOmitSkipped[renderEye];return;}
+        cpuOmitHook.unsafe_fastcall(self,edx,a,b,c);
+    }
+    void UpdateCpuOmission();
+    unsigned liveMeshMode=0;
+    std::unique_ptr<VRMeshPacketProbe::Probe> liveMeshPackets;
+    VRRigidInstance::Renderer liveMeshRenderer;
+    LARGE_INTEGER liveMeshBegin{};
+    SafetyHookInline liveMeshClear;
+    SafetyHookInline liveMeshVBLock,liveMeshIBLock,liveMeshTextureLock,liveMeshUpdateTexture,liveMeshUpdateSurface,liveMeshColorFill,liveMeshGenerateMips;
+    void FlushLiveMesh(IDirect3DDevice9* device);
+    bool meshCompareOrder=false;
+    std::unique_ptr<VRMeshPacketProbe::Probe> meshPacketProbe;
+    SafetyHookInline meshPacketMaterialProbe;
+    uintptr_t meshPacketMaterial=0;
+    void __fastcall ObservePacketMaterial(void* self,void* edx,uintptr_t a,uintptr_t b,uintptr_t c,uintptr_t d)
+    {
+        meshPacketMaterialProbe.unsafe_fastcall(self,edx,a,b,c,d);
+        if(meshPacketProbe && meshPacketProbe->Observing() && GetCurrentThreadId()==routingThread && renderEye==0 && renderStage==1)
+            meshPacketMaterial=reinterpret_cast<uintptr_t>(self);
+    }
+    struct MeshPacketShader
+    {
+        ComPtr<IDirect3DVertexShader9> vs;ComPtr<IDirect3DPixelShader9> ps;
+        ComPtr<IDirect3DVertexDeclaration9> declaration;
+        VRMeshPacketProbe::ShaderReads reads{};bool valid=false;
+    };
+    std::vector<MeshPacketShader> meshPacketShaders;
+    SafetyHookInline modelProbeHook;
+    std::atomic<bool> constantBatchRequested{false};
+    SafetyHookInline vertexBinderBatchHook;SafetyHookMid textureBinderBatchBoundary;
+    thread_local VRConstantBatch::Buffer binderConstants;
+    thread_local IDirect3DDevice9* binderDevice=nullptr;
+    thread_local int binderEye=-1;
+    unsigned long long binderBatchScopes[2]{},binderBatchInputs[2]{},binderBatchOutputs[2]{},binderBatchFailures=0;
+    unsigned binderBatchValidations=0,binderBatchValidationFailures=0;
+    void FlushBinderConstants()
+    {
+        if(!binderDevice)return;
+        binderConstants.Flush([](unsigned first,const float* data,unsigned count)
+        {if(FAILED(setVertexConstants.unsafe_stdcall<HRESULT>(binderDevice,first,data,count)))++binderBatchFailures;});
+    }
+    void __fastcall BatchVertexBinder(void* self,void* edx,uintptr_t a,uintptr_t b,uintptr_t c)
+    {
+        if(binderDevice || GetCurrentThreadId()!=routingThread || renderEye<0 || renderStage!=1 || !ready)
+        {FlushBinderConstants();vertexBinderBatchHook.unsafe_fastcall(self,edx,a,b,c);return;}
+        auto* device=RageDirect3DDevice9::m_pRealDevice ? *RageDirect3DDevice9::m_pRealDevice:nullptr;
+        if(!device){vertexBinderBatchHook.unsafe_fastcall(self,edx,a,b,c);return;}
+        binderConstants.Reset();binderDevice=device;binderEye=renderEye;
+        vertexBinderBatchHook.unsafe_fastcall(self,edx,a,b,c);
+        FlushBinderConstants();
+        if(binderBatchValidations<64 && binderConstants.inputCalls)
+        {
+            float registers[256][4]{};++binderBatchValidations;
+            if(FAILED(device->GetVertexShaderConstantF(0,registers[0],256)) || !binderConstants.Validate(registers[0]))
+            {++binderBatchValidationFailures;constantBatchRequested=false;}
+        }
+        ++binderBatchScopes[binderEye];binderBatchInputs[binderEye]+=binderConstants.inputCalls;
+        binderBatchOutputs[binderEye]+=binderConstants.outputCalls;
+        binderDevice=nullptr;binderEye=-1;
+    }
+    void UpdateConstantBatchTest()
+    {
+        if(vertexBinderBatchHook && !constantBatchRequested)
+        {
+            textureBinderBatchBoundary.reset();vertexBinderBatchHook.reset();
+            char line[300];sprintf_s(line,"constant-batch-test off scopes=%llu,%llu inputCalls=%llu,%llu outputCalls=%llu,%llu failures=%llu validations=%u validationFailures=%u",
+                binderBatchScopes[0],binderBatchScopes[1],binderBatchInputs[0],binderBatchInputs[1],binderBatchOutputs[0],binderBatchOutputs[1],binderBatchFailures,binderBatchValidations,binderBatchValidationFailures);Log(line);
+        }
+        if(!constantBatchRequested || vertexBinderBatchHook)return;
+        if(modelProbeHook || vertexProbeHook || vertexEmissionHook || rigidInstances || meshPacketProbe || VRProfile::ConstantObservationEnabled())
+        {constantBatchRequested=false;Log("constant-batch-test unavailable: disable other native/constant experiments first");return;}
+        auto binder=hook::pattern("83 EC 10 53 55 8B 6C 24 1C 8B D9 8B 55 08 57 89 5C 24 18 39 15");
+        auto texture=hook::pattern("83 EC 34 53 57 8B FA 8B D9 85 FF 75 ? A1 ? ? ? ? 57 8B 10 53 50 FF 92 04 01 00 00");
+        if(binder.size()!=1 || texture.size()!=1)
+        {constantBatchRequested=false;Log("constant-batch-test unavailable: unique native binder/boundary signatures not found");return;}
+        binderBatchScopes[0]=binderBatchScopes[1]=binderBatchInputs[0]=binderBatchInputs[1]=binderBatchOutputs[0]=binderBatchOutputs[1]=binderBatchFailures=0;
+        binderBatchValidations=binderBatchValidationFailures=0;
+        textureBinderBatchBoundary=safetyhook::create_mid(texture.get_first(),[](SafetyHookContext&){FlushBinderConstants();});
+        if(textureBinderBatchBoundary)vertexBinderBatchHook=safetyhook::create_inline(binder.get_first(),BatchVertexBinder);
+        if(!vertexBinderBatchHook)
+        {textureBinderBatchBoundary.reset();constantBatchRequested=false;Log("constant-batch-test native hooks unavailable");return;}
+        Log("constant-batch-test on: verified vertex parameter binder; adjacency/overlaps only; texture callback and binder-return flush boundaries");
+    }
+    SafetyHookMid billboardBatchHook;
+    SafetyHookInline materialProbeHook;
+    SafetyHookInline meshGeometryProbe;
+    uintptr_t meshGeometryCaller=0;
+    SafetyHookInline meshLoopProbe;
+    uintptr_t meshLoopCaller=0;
+    SafetyHookMid coronaDrawBeginProbe,coronaDrawEndProbe;
+    SafetyHookMid coronaRecordProbe,coronaVerticesProbe;
+    uintptr_t coronaProbePool=0,coronaProbeModuleBase=0;
+    thread_local bool coronaDrawProbeActive=false;
+    struct CoronaDrawSnapshot
+    {
+        bool captured=false,valid=false;
+        unsigned type=0,start=0,count=0,stride=0,offset=0;
+        std::vector<DWORD> vertexShader,pixelShader;
+        D3DVERTEXELEMENT9 declaration[MAXD3DDECLLENGTH+1]{};
+        UINT declarationCount=0;
+        float vertexConstants[256][4]{},pixelConstants[224][4]{};
+        DWORD states[7]{};
+        bool recordCaptured=false;
+        unsigned flags[2]{},vertexCount=0;
+        DWORD record[8]{},vertices[6][9]{};
+        float basis[9]{}; // Native right, negated up, camera position.
+    };
+    CoronaDrawSnapshot coronaSnapshots[6]{};
+    constexpr D3DRENDERSTATETYPE coronaStates[]{D3DRS_ZENABLE,D3DRS_ZWRITEENABLE,
+        D3DRS_ZFUNC,D3DRS_ALPHABLENDENABLE,D3DRS_SRCBLEND,D3DRS_DESTBLEND,D3DRS_CULLMODE};
+
+    struct MaterialProbeTotals
+    {
+        unsigned long long calls=0,ticks=0,stateEntries=0,vertexParameters=0,pixelParameters=0;
+    };
+    MaterialProbeTotals materialProbeTotals[6]{};
+    struct ModelProbeRow
+    {
+        unsigned key=0,hash=0;
+        unsigned long long calls[6]{},ticks[6]{};
+    };
+    std::array<ModelProbeRow,4096> modelProbeRows{};
+    unsigned long long modelProbeStreams[6]{},modelProbeDropped=0;
+    DWORD modelProbeThread=0;
+    unsigned modelProbePhase=6;
+    ULONGLONG modelProbeDeadline=0;
+    long long modelProbeFrequency=0;
+    void** modelProbeTable=nullptr;
+
+    // One eye0 G-buffer stream only. Matching keys are batching candidates,
+    // not proof that constants, textures, animation or ordering can be shared.
+    struct MeshProbeRow {std::array<uintptr_t,14> key{};unsigned draws=0,primitives=0,runs=0,longestRun=0;};
+    std::array<MeshProbeRow,8192> meshProbeRows{};
+    unsigned meshProbeModel=0,meshProbeDraws=0,meshProbeDropped=0,meshProbeFailures=0;
+    uintptr_t meshProbePass=0;
+    unsigned meshProbePreviousRow=8192,meshProbeRun=0;
+    struct MeshModelRuns {unsigned draws=0,runs=0,longest=0;};
+    std::array<MeshModelRuns,65536> meshModelRuns{};
+    unsigned meshPreviousModel=65536,meshModelRun=0,meshNonIndexed=0;
+    SafetyHookInline meshQueryIssueProbe;
+    SafetyHookInline meshPrimitiveUPProbe,meshIndexedUPProbe;
+    bool meshQueriesObserved=false;
+    unsigned meshQueryBegins=0,meshQueryEnds=0,meshQueryOther=0,meshUPDraws=0;
+    bool InFirstMeshStream()
+    {return modelProbeHook && GetCurrentThreadId()==modelProbeThread && modelProbePhase==0 && modelProbeStreams[0]==1;}
+    bool InPacketStream()
+    {return meshPacketProbe && meshPacketProbe->Observing() && GetCurrentThreadId()==routingThread && renderEye==0 && renderStage==1;}
+    void __fastcall ObserveMeshGeometry(void* self,void* edx)
+    {
+        if(!InFirstMeshStream())
+        {meshGeometryProbe.unsafe_fastcall(self,edx);return;}
+        const auto previous=meshGeometryCaller;
+        meshGeometryCaller=reinterpret_cast<uintptr_t>(_ReturnAddress());
+        meshGeometryProbe.unsafe_fastcall(self,edx);
+        meshGeometryCaller=previous;
+    }
+    void __fastcall ObserveMeshLoop(void* self,void* edx,uintptr_t a,uintptr_t b,uintptr_t c)
+    {
+        if(!InFirstMeshStream())
+        {meshLoopProbe.unsafe_fastcall(self,edx,a,b,c);return;}
+        const auto previous=meshLoopCaller;
+        meshLoopCaller=reinterpret_cast<uintptr_t>(_ReturnAddress());
+        meshLoopProbe.unsafe_fastcall(self,edx,a,b,c);
+        meshLoopCaller=previous;
+    }
+    void MeshSequenceBarrier()
+    {meshProbePreviousRow=8192;meshProbeRun=0;meshPreviousModel=65536;meshModelRun=0;}
+    HRESULT WINAPI ObserveMeshQueryIssue(IDirect3DQuery9* query,DWORD flags)
+    {
+        if(liveMeshPackets && OnRoutingThread() && RageDirect3DDevice9::m_pRealDevice)FlushLiveMesh(*RageDirect3DDevice9::m_pRealDevice);
+        if(InPacketStream())meshPacketProbe->QueryEvent();
+        if(InFirstMeshStream())
+        {
+            if(query->GetType()==D3DQUERYTYPE_OCCLUSION)
+            {if(flags==D3DISSUE_BEGIN)++meshQueryBegins;else if(flags==D3DISSUE_END)++meshQueryEnds;else ++meshQueryOther;}
+            else ++meshQueryOther;
+            MeshSequenceBarrier();
+        }
+        return meshQueryIssueProbe.unsafe_stdcall<HRESULT>(query,flags);
+    }
+    HRESULT WINAPI ObserveMeshPrimitiveUP(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,
+        UINT count,const void* vertices,UINT stride)
+    {
+        FlushLiveMesh(device);
+        if(InPacketStream())meshPacketProbe->OtherDraw();
+        if(InFirstMeshStream()){++meshUPDraws;MeshSequenceBarrier();}
+        return meshPrimitiveUPProbe.unsafe_stdcall<HRESULT>(device,type,count,vertices,stride);
+    }
+    HRESULT WINAPI ObserveMeshIndexedUP(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,
+        UINT minimum,UINT vertexCount,UINT count,const void* indices,D3DFORMAT format,
+        const void* vertices,UINT stride)
+    {
+        FlushLiveMesh(device);
+        if(InPacketStream())meshPacketProbe->OtherDraw();
+        if(InFirstMeshStream()){++meshUPDraws;MeshSequenceBarrier();}
+        return meshIndexedUPProbe.unsafe_stdcall<HRESULT>(device,type,minimum,vertexCount,count,indices,format,vertices,stride);
+    }
+    constexpr D3DRENDERSTATETYPE meshProbeStates[]{D3DRS_ZENABLE,D3DRS_ZWRITEENABLE,
+        D3DRS_ZFUNC,D3DRS_ALPHATESTENABLE,D3DRS_ALPHAREF,D3DRS_ALPHAFUNC,
+        D3DRS_ALPHABLENDENABLE,D3DRS_SRCBLEND,D3DRS_DESTBLEND,D3DRS_BLENDOP,
+        D3DRS_SEPARATEALPHABLENDENABLE,D3DRS_SRCBLENDALPHA,D3DRS_DESTBLENDALPHA,
+        D3DRS_BLENDOPALPHA,D3DRS_CULLMODE,D3DRS_STENCILENABLE,D3DRS_STENCILFUNC,
+        D3DRS_STENCILREF,D3DRS_STENCILMASK,D3DRS_STENCILWRITEMASK,D3DRS_STENCILFAIL,
+        D3DRS_STENCILZFAIL,D3DRS_STENCILPASS,D3DRS_TWOSIDEDSTENCILMODE,
+        D3DRS_CCW_STENCILFUNC,D3DRS_CCW_STENCILFAIL,D3DRS_CCW_STENCILZFAIL,
+        D3DRS_CCW_STENCILPASS,D3DRS_COLORWRITEENABLE,D3DRS_COLORWRITEENABLE1,
+        D3DRS_COLORWRITEENABLE2,D3DRS_COLORWRITEENABLE3,D3DRS_SCISSORTESTENABLE,
+        D3DRS_CLIPPLANEENABLE,D3DRS_DEPTHBIAS,D3DRS_SLOPESCALEDEPTHBIAS,
+        D3DRS_MULTISAMPLEANTIALIAS,D3DRS_MULTISAMPLEMASK,D3DRS_SRGBWRITEENABLE};
+    struct MeshStateProbe
+    {
+        unsigned row=0,samples=0,failures=0;bool selected=false;
+        float vertex[256][4]{},pixel[224][4]{};
+        unsigned vertexChanged[256]{},pixelChanged[224]{};
+        uintptr_t textures[16]{};unsigned textureChanged=0;
+        DWORD states[std::size(meshProbeStates)]{},sampler[13]{};
+        bool stateChanged[std::size(meshProbeStates)]{},samplerChanged[13]{};
+        uintptr_t streams[16]{},targets[5]{};UINT offsets[16]{},strides[16]{},frequencies[16]{};
+        unsigned streamChanged=0,targetChanged=0;DWORD vertexUsage=0,indexUsage=0;
+        D3DVIEWPORT9 viewport{};RECT scissor{};bool viewportChanged=false,scissorChanged=false;
+        D3DVERTEXELEMENT9 declaration[MAXD3DDECLLENGTH+1]{};UINT declarationCount=0;
+        void* callers[16]{};USHORT callerCount=0;
+        std::vector<DWORD> shader,pixelShader;
+    };
+    std::array<MeshStateProbe,8> meshStateProbes{};
+    std::array<MeshStateProbe,8> meshUnknownStateProbes{};
+    void CaptureMeshState(IDirect3DDevice9* device,unsigned row)
+    {
+        auto& probes=meshProbeRows[row].key[0] ? meshStateProbes:meshUnknownStateProbes;
+        auto selected=std::find_if(probes.begin(),probes.end(),
+            [row](const auto& sample){return sample.selected && sample.row==row;});
+        if(selected==probes.end())
+        {
+            if(meshProbeRows[row].draws!=32)return;
+            selected=std::find_if(probes.begin(),probes.end(),
+                [](const auto& sample){return !sample.selected;});
+            if(selected==probes.end())return;
+        }
+        auto& sample=*selected;
+        if(!sample.selected)
+        {
+            if(meshProbeRows[row].draws!=32)return;
+            sample.selected=true;sample.row=row;
+        }
+        if(sample.row!=row)return;
+        float vertex[256][4]{},pixel[224][4]{};
+        if(FAILED(device->GetVertexShaderConstantF(0,vertex[0],256)) ||
+            FAILED(device->GetPixelShaderConstantF(0,pixel[0],224)))
+        {++sample.failures;return;}
+        uintptr_t textures[16]{};
+        for(unsigned i=0;i<16;++i)
+        {
+            ComPtr<IDirect3DBaseTexture9> texture;
+            if(FAILED(device->GetTexture(i,&texture))){++sample.failures;return;}
+            textures[i]=reinterpret_cast<uintptr_t>(texture.Get());
+        }
+        DWORD states[std::size(meshProbeStates)]{},sampler[13]{};
+        uintptr_t streams[16]{},targets[5]{};UINT offsets[16]{},strides[16]{},frequencies[16]{};
+        D3DVIEWPORT9 viewport{};RECT scissor{};
+        for(unsigned i=0;i<std::size(meshProbeStates);++i)
+            if(FAILED(device->GetRenderState(meshProbeStates[i],&states[i]))){++sample.failures;return;}
+        for(unsigned i=1;i<=13;++i)
+            if(FAILED(device->GetSamplerState(0,static_cast<D3DSAMPLERSTATETYPE>(i),&sampler[i-1])))
+            {++sample.failures;return;}
+        for(unsigned i=0;i<16;++i)
+        {
+            ComPtr<IDirect3DVertexBuffer9> buffer;
+            if(FAILED(device->GetStreamSource(i,&buffer,&offsets[i],&strides[i])) ||
+                FAILED(device->GetStreamSourceFreq(i,&frequencies[i]))){++sample.failures;return;}
+            streams[i]=reinterpret_cast<uintptr_t>(buffer.Get());
+            if(!sample.samples && i==0 && buffer)
+            {D3DVERTEXBUFFER_DESC desc{};if(FAILED(buffer->GetDesc(&desc))){++sample.failures;return;}sample.vertexUsage=desc.Usage;}
+        }
+        for(unsigned i=0;i<4;++i)
+        {
+            ComPtr<IDirect3DSurface9> surface;const auto result=device->GetRenderTarget(i,&surface);
+            if(FAILED(result) && result!=D3DERR_NOTFOUND){++sample.failures;return;}
+            targets[i]=reinterpret_cast<uintptr_t>(surface.Get());
+        }
+        ComPtr<IDirect3DSurface9> depth;const auto depthResult=device->GetDepthStencilSurface(&depth);
+        if((FAILED(depthResult) && depthResult!=D3DERR_NOTFOUND) ||
+            FAILED(device->GetViewport(&viewport)) || FAILED(device->GetScissorRect(&scissor)))
+        {++sample.failures;return;}
+        targets[4]=reinterpret_cast<uintptr_t>(depth.Get());
+        if(!sample.samples)
+        {
+            sample.callerCount=CaptureStackBackTrace(0,std::size(sample.callers),sample.callers,nullptr);
+            if(meshGeometryCaller && sample.callerCount<std::size(sample.callers))
+                sample.callers[sample.callerCount++]=reinterpret_cast<void*>(meshGeometryCaller);
+            if(meshLoopCaller && sample.callerCount<std::size(sample.callers))
+                sample.callers[sample.callerCount++]=reinterpret_cast<void*>(meshLoopCaller);
+            std::memcpy(sample.states,states,sizeof(states));std::memcpy(sample.sampler,sampler,sizeof(sampler));
+            std::memcpy(sample.streams,streams,sizeof(streams));std::memcpy(sample.targets,targets,sizeof(targets));
+            std::memcpy(sample.offsets,offsets,sizeof(offsets));std::memcpy(sample.strides,strides,sizeof(strides));
+            std::memcpy(sample.frequencies,frequencies,sizeof(frequencies));sample.viewport=viewport;sample.scissor=scissor;
+            ComPtr<IDirect3DVertexDeclaration9> declaration;ComPtr<IDirect3DIndexBuffer9> index;
+            D3DINDEXBUFFER_DESC indexDesc{};sample.declarationCount=std::size(sample.declaration);
+            if(FAILED(device->GetVertexDeclaration(&declaration)) || !declaration ||
+                FAILED(declaration->GetDeclaration(sample.declaration,&sample.declarationCount)) ||
+                FAILED(device->GetIndices(&index)) || !index || FAILED(index->GetDesc(&indexDesc)))
+            {++sample.failures;return;}
+            sample.indexUsage=indexDesc.Usage;
+            std::memcpy(sample.vertex,vertex,sizeof(vertex));std::memcpy(sample.pixel,pixel,sizeof(pixel));
+            std::memcpy(sample.textures,textures,sizeof(textures));
+            ComPtr<IDirect3DVertexShader9> shader;UINT bytes=0;
+            if(SUCCEEDED(device->GetVertexShader(&shader)) && shader &&
+                SUCCEEDED(shader->GetFunction(nullptr,&bytes)) && bytes && bytes<=65536 && !(bytes%4))
+            {sample.shader.resize(bytes/4);if(FAILED(shader->GetFunction(sample.shader.data(),&bytes)))sample.shader.clear();}
+            ComPtr<IDirect3DPixelShader9> ps;bytes=0;
+            if(SUCCEEDED(device->GetPixelShader(&ps)) && ps &&
+                SUCCEEDED(ps->GetFunction(nullptr,&bytes)) && bytes && bytes<=65536 && !(bytes%4))
+            {sample.pixelShader.resize(bytes/4);if(FAILED(ps->GetFunction(sample.pixelShader.data(),&bytes)))sample.pixelShader.clear();}
+        }
+        else
+        {
+            for(unsigned i=0;i<std::size(meshProbeStates);++i)sample.stateChanged[i]|=sample.states[i]!=states[i];
+            for(unsigned i=0;i<13;++i)sample.samplerChanged[i]|=sample.sampler[i]!=sampler[i];
+            for(unsigned i=0;i<16;++i)if(sample.streams[i]!=streams[i] || sample.offsets[i]!=offsets[i] ||
+                sample.strides[i]!=strides[i] || sample.frequencies[i]!=frequencies[i])sample.streamChanged|=1u<<i;
+            for(unsigned i=0;i<5;++i)if(sample.targets[i]!=targets[i])sample.targetChanged|=1u<<i;
+            sample.viewportChanged|=std::memcmp(&sample.viewport,&viewport,sizeof(viewport))!=0;
+            sample.scissorChanged|=std::memcmp(&sample.scissor,&scissor,sizeof(scissor))!=0;
+            for(unsigned i=0;i<256;++i)for(unsigned lane=0;lane<4;++lane)
+                if(std::memcmp(&sample.vertex[i][lane],&vertex[i][lane],4))sample.vertexChanged[i]|=1u<<lane;
+            for(unsigned i=0;i<224;++i)for(unsigned lane=0;lane<4;++lane)
+                if(std::memcmp(&sample.pixel[i][lane],&pixel[i][lane],4))sample.pixelChanged[i]|=1u<<lane;
+            for(unsigned i=0;i<16;++i)if(sample.textures[i]!=textures[i])sample.textureChanged|=1u<<i;
+        }
+        ++sample.samples;
+    }
+    void CaptureMeshBindings(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,
+        INT base,UINT minimum,UINT vertices,UINT start,UINT primitives)
+    {
+        if(!modelProbeHook || GetCurrentThreadId()!=modelProbeThread || modelProbePhase!=0 ||
+            modelProbeStreams[0]!=1) return;
+        ++meshProbeDraws;
+        if(meshProbeModel<meshModelRuns.size())
+        {
+            auto& model=meshModelRuns[meshProbeModel];++model.draws;
+            if(meshPreviousModel==meshProbeModel)++meshModelRun;
+            else {++model.runs;meshModelRun=1;meshPreviousModel=meshProbeModel;}
+            model.longest=std::max(model.longest,meshModelRun);
+        }
+        ComPtr<IDirect3DVertexShader9> vs;ComPtr<IDirect3DPixelShader9> ps;
+        ComPtr<IDirect3DVertexDeclaration9> declaration;
+        ComPtr<IDirect3DVertexBuffer9> vb;ComPtr<IDirect3DIndexBuffer9> ib;
+        UINT offset=0,stride=0;
+        if(FAILED(device->GetVertexShader(&vs)) || FAILED(device->GetPixelShader(&ps)) ||
+            FAILED(device->GetVertexDeclaration(&declaration)) ||
+            FAILED(device->GetStreamSource(0,&vb,&offset,&stride)) || FAILED(device->GetIndices(&ib)))
+        {++meshProbeFailures;meshProbePreviousRow=8192;meshProbeRun=0;return;}
+        const std::array<uintptr_t,14> key{meshProbeModel,meshProbePass,
+            reinterpret_cast<uintptr_t>(vs.Get()),reinterpret_cast<uintptr_t>(ps.Get()),
+            reinterpret_cast<uintptr_t>(declaration.Get()),reinterpret_cast<uintptr_t>(vb.Get()),
+            reinterpret_cast<uintptr_t>(ib.Get()),offset,stride,static_cast<uintptr_t>(type),
+            static_cast<uintptr_t>(base),minimum,vertices,start};
+        unsigned hash=2166136261u;
+        for(auto value:key)hash=(hash^static_cast<unsigned>(value))*16777619u;
+        hash=(hash^primitives)*16777619u;
+        auto index=hash&(meshProbeRows.size()-1);
+        for(unsigned attempt=0;attempt<meshProbeRows.size();++attempt)
+        {
+            auto& row=meshProbeRows[index];
+            if(!row.draws || (row.key==key && row.primitives==primitives))
+            {if(!row.draws){row.key=key;row.primitives=primitives;}++row.draws;
+                if(meshProbePreviousRow==index)++meshProbeRun;
+                else {++row.runs;meshProbeRun=1;meshProbePreviousRow=static_cast<unsigned>(index);}
+                row.longestRun=std::max(row.longestRun,meshProbeRun);
+                CaptureMeshState(device,static_cast<unsigned>(index));return;}
+            index=(index+1)&(meshProbeRows.size()-1);
+        }
+        ++meshProbeDropped;
+        meshProbePreviousRow=8192;meshProbeRun=0;
+    }
+
+    // Capture once per marked phase, inside the verified native corona draw call.
+    // Only getters; defer shader disassembly/logging until the hooks are detached.
+    void CaptureCoronaDraw(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,UINT start,UINT count)
+    {
+        if(!coronaDrawProbeActive || GetCurrentThreadId()!=modelProbeThread || modelProbePhase>=6) return;
+        auto& sample=coronaSnapshots[modelProbePhase];
+        if(sample.captured) return;
+        sample.captured=true; sample.type=type; sample.start=start; sample.count=count;
+        ComPtr<IDirect3DVertexDeclaration9> declaration;
+        ComPtr<IDirect3DVertexShader9> vs;
+        ComPtr<IDirect3DPixelShader9> ps;
+        ComPtr<IDirect3DVertexBuffer9> buffer;
+        bool valid=SUCCEEDED(device->GetVertexDeclaration(&declaration)) && declaration &&
+            SUCCEEDED(device->GetVertexShader(&vs)) && vs &&
+            SUCCEEDED(device->GetPixelShader(&ps)) && ps;
+        sample.declarationCount=MAXD3DDECLLENGTH+1;
+        if(valid) valid=SUCCEEDED(declaration->GetDeclaration(sample.declaration,&sample.declarationCount));
+        auto capture=[](auto* shader,std::vector<DWORD>& code)
+        {
+            UINT bytes=0;
+            if(FAILED(shader->GetFunction(nullptr,&bytes)) || !bytes || bytes>65536 || bytes%4) return false;
+            code.resize(bytes/4);
+            return SUCCEEDED(shader->GetFunction(code.data(),&bytes));
+        };
+        if(valid) valid=capture(vs.Get(),sample.vertexShader) && capture(ps.Get(),sample.pixelShader);
+        valid=SUCCEEDED(device->GetStreamSource(0,&buffer,&sample.offset,&sample.stride)) && valid;
+        valid=SUCCEEDED(device->GetVertexShaderConstantF(0,sample.vertexConstants[0],256)) && valid;
+        valid=SUCCEEDED(device->GetPixelShaderConstantF(0,sample.pixelConstants[0],224)) && valid;
+        for(unsigned i=0;i<std::size(coronaStates);++i)
+            valid=SUCCEEDED(device->GetRenderState(coronaStates[i],&sample.states[i])) && valid;
+        sample.valid=valid;
+    }
+
+    void __fastcall ObserveMaterialBind(void* self,void* edx,uintptr_t a,uintptr_t b,uintptr_t c,uintptr_t d)
+    {
+        if(GetCurrentThreadId()!=modelProbeThread || modelProbePhase>=6)
+        {materialProbeHook.unsafe_fastcall(self,edx,a,b,c,d); return;}
+        const auto phase=modelProbePhase;
+        const auto* pass=static_cast<const char*>(self);
+        meshProbePass=reinterpret_cast<uintptr_t>(self);
+        auto& total=materialProbeTotals[phase];
+        ++total.calls;
+        total.stateEntries+=*reinterpret_cast<const uint16_t*>(pass+0x1C);
+        total.vertexParameters+=*reinterpret_cast<const uint16_t*>(pass+0x08);
+        total.pixelParameters+=*reinterpret_cast<const uint16_t*>(pass+0x14);
+        LARGE_INTEGER before{},after{};
+        QueryPerformanceCounter(&before);
+        materialProbeHook.unsafe_fastcall(self,edx,a,b,c,d);
+        QueryPerformanceCounter(&after);
+        total.ticks+=after.QuadPart-before.QuadPart;
+    }
+
+    void __fastcall ObserveModelCommand(void* self,void* edx)
+    {
+        if(GetCurrentThreadId()!=modelProbeThread || modelProbePhase>=6)
+        {modelProbeHook.unsafe_fastcall(self,edx); return;}
+        const auto phase=modelProbePhase;
+        const unsigned model=*reinterpret_cast<const uint16_t*>(static_cast<const char*>(self)+0x30);
+        const auto previousModel=meshProbeModel;
+        const auto previousPass=meshProbePass;
+        meshProbeModel=model+1;meshProbePass=0;
+        const unsigned key=model+1;
+        ModelProbeRow* selected=nullptr;
+        auto index=model&(modelProbeRows.size()-1);
+        for(unsigned attempt=0;attempt<modelProbeRows.size();++attempt)
+        {
+            auto& row=modelProbeRows[index];
+            if(!row.key || row.key==key)
+            {
+                if(!row.key)
+                {
+                    row.key=key;
+                    const auto* info=static_cast<const char*>(modelProbeTable[model]);
+                    if(info) std::memcpy(&row.hash,info+0x3C,sizeof(row.hash));
+                }
+                selected=&row; break;
+            }
+            index=(index+1)&(modelProbeRows.size()-1);
+        }
+        if(!selected) ++modelProbeDropped;
+        LARGE_INTEGER before{},after{};
+        QueryPerformanceCounter(&before);
+        modelProbeHook.unsafe_fastcall(self,edx);
+        meshProbeModel=previousModel;meshProbePass=previousPass;
+        QueryPerformanceCounter(&after);
+        if(selected)
+        {++selected->calls[phase]; selected->ticks[phase]+=after.QuadPart-before.QuadPart;}
+    }
+
+    void FinishModelCommandProbe()
+    {
+        if(!modelProbeHook) return;
+        coronaDrawBeginProbe.reset(); coronaDrawEndProbe.reset(); coronaDrawProbeActive=false;
+        coronaRecordProbe.reset(); coronaVerticesProbe.reset();
+        meshQueryIssueProbe.reset();
+        meshPrimitiveUPProbe.reset();meshIndexedUPProbe.reset();
+        materialProbeHook.reset();
+        meshGeometryProbe.reset();meshGeometryCaller=0;
+        meshLoopProbe.reset();meshLoopCaller=0;
+        modelProbeHook.reset();
+        modelProbePhase=6; modelProbeDeadline=0;
+        char line[650];
+        sprintf_s(line,"model-command-probe complete thread=%lu frequency=%lld dropped=%llu streams=%llu,%llu,%llu,%llu,%llu,%llu",
+            modelProbeThread,modelProbeFrequency,modelProbeDropped,modelProbeStreams[0],modelProbeStreams[1],
+            modelProbeStreams[2],modelProbeStreams[3],modelProbeStreams[4],modelProbeStreams[5]);
+        Log(line);
+        unsigned meshGroups=0,meshRepeatDraws=0;
+        for(const auto& row:meshProbeRows)if(row.draws)
+        {
+            ++meshGroups;meshRepeatDraws+=row.draws-1;
+            if(row.draws>1)
+            {
+                sprintf_s(line,"mesh-binding model=%u pass=%08X vs=%08X ps=%08X decl=%08X vb=%08X ib=%08X offset=%u stride=%u type=%u base=%d min=%u vertices=%u start=%u primitives=%u draws=%u indexedRuns=%u longestIndexedRun=%u",
+                    row.key[0],row.key[1],row.key[2],row.key[3],row.key[4],row.key[5],row.key[6],
+                    row.key[7],row.key[8],row.key[9],static_cast<int>(row.key[10]),row.key[11],row.key[12],row.key[13],row.primitives,row.draws,row.runs,row.longestRun);
+                Log(line);
+            }
+        }
+        sprintf_s(line,"mesh-binding complete streams=%llu draws=%u groups=%u repeatedDraws=%u failures=%u dropped=%u",
+            modelProbeStreams[0],meshProbeDraws,meshGroups,meshRepeatDraws,meshProbeFailures,meshProbeDropped);Log(line);
+        sprintf_s(line,"mesh-order queryObserved=%u occlusionBegin=%u occlusionEnd=%u otherQuery=%u nonIndexed=%u UP=%u",
+            meshQueriesObserved,meshQueryBegins,meshQueryEnds,meshQueryOther,meshNonIndexed,meshUPDraws);Log(line);
+        for(unsigned i=0;i<meshModelRuns.size();++i)if(meshModelRuns[i].draws>=32)
+        {const auto& row=meshModelRuns[i];sprintf_s(line,"mesh-order modelKey=%u draws=%u runs=%u longest=%u",i,row.draws,row.runs,row.longest);Log(line);}
+        for(const auto* probes:{&meshStateProbes,&meshUnknownStateProbes})
+        for(const auto& meshState:*probes)if(meshState.selected)
+        {
+        sprintf_s(line,"mesh-state selected=%u row=%u modelKey=%u samples=%u failures=%u textureChanged=%04X",
+            meshState.selected,meshState.row,meshProbeRows[meshState.row].key[0],meshState.samples,meshState.failures,meshState.textureChanged);Log(line);
+        for(unsigned i=0;i<meshState.callerCount;++i)
+        {sprintf_s(line,"mesh-state caller modelKey=%u index=%u live=%p",meshProbeRows[meshState.row].key[0],i,meshState.callers[i]);Log(line);}
+        sprintf_s(line,"mesh-state compatibility streamChanged=%04X targetChanged=%02X viewportChanged=%u scissorChanged=%u vertexUsage=%08X indexUsage=%08X",
+            meshState.streamChanged,meshState.targetChanged,meshState.viewportChanged,meshState.scissorChanged,meshState.vertexUsage,meshState.indexUsage);Log(line);
+        for(unsigned i=0;i<std::size(meshProbeStates);++i)
+        {sprintf_s(line,"mesh-state render state=%u value=%08X changed=%u",meshProbeStates[i],meshState.states[i],meshState.stateChanged[i]);Log(line);}
+        for(unsigned i=0;i<13;++i)
+        {sprintf_s(line,"mesh-state sampler0 state=%u value=%08X changed=%u",i+1,meshState.sampler[i],meshState.samplerChanged[i]);Log(line);}
+        for(unsigned i=0;i<16;++i)if(meshState.streams[i] || i==0)
+        {sprintf_s(line,"mesh-state stream=%u vb=%08X offset=%u stride=%u frequency=%08X",i,meshState.streams[i],meshState.offsets[i],meshState.strides[i],meshState.frequencies[i]);Log(line);}
+        for(unsigned i=0;i<meshState.declarationCount;++i)
+        {const auto& e=meshState.declaration[i];sprintf_s(line,"mesh-state declaration stream=%u offset=%u type=%u method=%u usage=%u index=%u",e.Stream,e.Offset,e.Type,e.Method,e.Usage,e.UsageIndex);Log(line);}
+        for(unsigned i=0;i<256;++i)if(meshState.vertexChanged[i])
+        {sprintf_s(line,"mesh-state VS changed c%u lanes=%X",i,meshState.vertexChanged[i]);Log(line);}
+        for(unsigned i=0;i<224;++i)if(meshState.pixelChanged[i])
+        {sprintf_s(line,"mesh-state PS changed c%u lanes=%X",i,meshState.pixelChanged[i]);Log(line);}
+        if(!meshState.shader.empty())
+        {
+            ComPtr<ID3DXBuffer> assembly;
+            if(SUCCEEDED(D3DXDisassembleShader(meshState.shader.data(),FALSE,nullptr,&assembly)))
+            {Log("mesh-state VS assembly begin");Log(static_cast<const char*>(assembly->GetBufferPointer()));Log("mesh-state VS assembly end");}
+        }
+        if(!meshState.pixelShader.empty())
+        {
+            ComPtr<ID3DXBuffer> assembly;
+            if(SUCCEEDED(D3DXDisassembleShader(meshState.pixelShader.data(),FALSE,nullptr,&assembly)))
+            {Log("mesh-state PS assembly begin");Log(static_cast<const char*>(assembly->GetBufferPointer()));Log("mesh-state PS assembly end");}
+        }
+        }
+        for(unsigned phase=0;phase<6;++phase)
+        {
+            const auto& sample=coronaSnapshots[phase];
+            sprintf_s(line,"corona shader capture phase=%u captured=%u valid=%u type=%u start=%u count=%u stride=%u offset=%u",
+                phase,sample.captured,sample.valid,sample.type,sample.start,sample.count,sample.stride,sample.offset); Log(line);
+            if(sample.recordCaptured)
+            {
+                sprintf_s(line,"corona record phase=%u flags=%u,%u words=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                    phase,sample.flags[0],sample.flags[1],sample.record[0],sample.record[1],sample.record[2],sample.record[3],
+                    sample.record[4],sample.record[5],sample.record[6],sample.record[7]); Log(line);
+                sprintf_s(line,"corona basis phase=%u (%.9g %.9g %.9g) (%.9g %.9g %.9g) (%.9g %.9g %.9g)",phase,
+                    sample.basis[0],sample.basis[1],sample.basis[2],sample.basis[3],sample.basis[4],sample.basis[5],
+                    sample.basis[6],sample.basis[7],sample.basis[8]); Log(line);
+                for(unsigned i=0;i<sample.vertexCount;++i)
+                {
+                    const auto* v=sample.vertices[i];
+                    sprintf_s(line,"corona vertex phase=%u index=%u words=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                        phase,i,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]); Log(line);
+                }
+            }
+            if(!sample.valid) continue;
+            for(UINT i=0;i<sample.declarationCount;++i)
+            {
+                const auto& e=sample.declaration[i];
+                sprintf_s(line,"corona declaration phase=%u stream=%u offset=%u type=%u method=%u usage=%u index=%u",
+                    phase,e.Stream,e.Offset,e.Type,e.Method,e.Usage,e.UsageIndex); Log(line);
+            }
+            for(unsigned i=0;i<std::size(coronaStates);++i)
+            {sprintf_s(line,"corona state phase=%u state=%u value=%u",phase,coronaStates[i],sample.states[i]); Log(line);}
+            for(unsigned stage=0;stage<2;++stage)
+            {
+                const auto& code=stage ? sample.pixelShader : sample.vertexShader;
+                ComPtr<ID3DXBuffer> assembly;
+                sprintf_s(line,"corona shader phase=%u stage=%s bytes=%zu",phase,stage ? "PS":"VS",code.size()*4); Log(line);
+                if(SUCCEEDED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)))
+                {
+                    const std::string text(static_cast<const char*>(assembly->GetBufferPointer()),
+                        std::min<size_t>(assembly->GetBufferSize(),48000)); Log(text.c_str());
+                }
+                const auto* constants=stage ? sample.pixelConstants : sample.vertexConstants;
+                for(unsigned i=0;i<(stage ? 224u:256u);++i)
+                {sprintf_s(line,"corona %s phase=%u c%u=(%.9g %.9g %.9g %.9g)",stage ? "PS":"VS",phase,i,
+                    constants[i][0],constants[i][1],constants[i][2],constants[i][3]); Log(line);}
+            }
+        }
+        for(unsigned phase=0;phase<6;++phase)
+        {
+            const auto& total=materialProbeTotals[phase];
+            sprintf_s(line,"material-bind phase=%u calls=%llu ticks=%llu stateEntries=%llu vertexParameters=%llu pixelParameters=%llu",
+                phase,total.calls,total.ticks,total.stateEntries,total.vertexParameters,total.pixelParameters);
+            Log(line);
+        }
+        for(const auto& row:modelProbeRows) if(row.key)
+        {
+            sprintf_s(line,"model-command model=%u hash=%08X calls=%llu,%llu,%llu,%llu,%llu,%llu ticks=%llu,%llu,%llu,%llu,%llu,%llu",
+                row.key-1,row.hash,row.calls[0],row.calls[1],row.calls[2],row.calls[3],row.calls[4],row.calls[5],
+                row.ticks[0],row.ticks[1],row.ticks[2],row.ticks[3],row.ticks[4],row.ticks[5]);
+            Log(line);
+        }
+    }
+
+    void UpdateModelCommandProbe(IDirect3DDevice9* device)
+    {
+        if(modelProbeHook && GetTickCount64()>=modelProbeDeadline) FinishModelCommandProbe();
+        if(!modelProbeRequested.exchange(false) || modelProbeHook) return;
+        if(vertexProbeHook || vertexEmissionHook || billboardBatchHook || rigidInstances || meshPacketProbe || vertexBinderBatchHook)
+        {Log("model-command-probe unavailable: disable other native probes first"); return;}
+        // Verified CE008DCBF0: thiscall, command model ushort+30, plain RET.
+        auto entry=hook::pattern("55 8B EC 83 E4 F0 83 EC 44 53 56 8B F1 57 0F B7 46 30 8B 04 85 ? ? ? ? 85 C0");
+        if(entry.size()!=1)
+        {Log("model-command-probe unavailable: unique entry signature not found"); return;}
+        modelProbeTable=*entry.get_first<void**>(21);
+        modelProbeRows={}; modelProbeDropped=0;
+        for(auto& row:meshProbeRows)row={};
+        for(auto& sample:meshStateProbes)sample={};
+        for(auto& sample:meshUnknownStateProbes)sample={};
+        meshProbeModel=meshProbeDraws=meshProbeDropped=meshProbeFailures=0;meshProbePass=0;
+        meshProbePreviousRow=8192;meshProbeRun=0;
+        meshModelRuns={};MeshSequenceBarrier();meshNonIndexed=0;
+        meshQueriesObserved=false;meshQueryBegins=meshQueryEnds=meshQueryOther=0;
+        meshUPDraws=0;
+        for(auto& sample:coronaSnapshots) sample={};
+        for(auto& total:materialProbeTotals) total={};
+        for(auto& count:modelProbeStreams) count=0;
+        LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+        modelProbeFrequency=frequency.QuadPart;
+        modelProbeThread=GetCurrentThreadId(); modelProbePhase=6;
+        modelProbeHook=safetyhook::create_inline(entry.get_first(),ObserveModelCommand);
+        if(modelProbeHook)
+        {
+            // A throwaway query identifies this backend's Issue implementation.
+            // Observe only: forward every native query and detach with the probe.
+            ComPtr<IDirect3DQuery9> query;
+            if(SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_OCCLUSION,&query)) && query)
+            {auto** table=*reinterpret_cast<void***>(query.Get());meshQueryIssueProbe=safetyhook::create_inline(table[6],ObserveMeshQueryIssue);}
+            meshQueriesObserved=static_cast<bool>(meshQueryIssueProbe);
+            auto** deviceTable=*reinterpret_cast<void***>(device);
+            meshPrimitiveUPProbe=safetyhook::create_inline(deviceTable[83],ObserveMeshPrimitiveUP);
+            meshIndexedUPProbe=safetyhook::create_inline(deviceTable[84],ObserveMeshIndexedUP);
+            Log(meshPrimitiveUPProbe && meshIndexedUPProbe ? "mesh UP barriers observed":"mesh UP barriers unavailable");
+            // Verified CE004373E0: thiscall and four stack arguments, RET10.
+            // Pure observation; this function binds states and both shader stages.
+            auto material=hook::pattern("53 55 8B E9 56 0F B7 5D 1C 33 F6 57 85 DB");
+            if(material.size()==1)
+                materialProbeHook=safetyhook::create_inline(material.get_first(),ObserveMaterialBind);
+            Log(materialProbeHook ? "material-bind observer attached" : "material-bind observer unavailable");
+            // Live CE00463490: geometry thiscall, no stack arguments, plain RET.
+            // Capture the virtual dispatch return before the frame-pointer chain is lost.
+            auto geometry=hook::pattern("57 8B F9 8B 57 04 85 D2 0F 84 ? ? ? ? 53 33 DB 39 5F 48 55 8B 6F 44");
+            if(geometry.size()==1)
+                meshGeometryProbe=safetyhook::create_inline(geometry.get_first(),ObserveMeshGeometry);
+            Log(meshGeometryProbe ? "mesh geometry caller observer attached":"mesh geometry caller observer unavailable");
+            // Live CE00444C50: thiscall, three stack arguments, RET0C.
+            auto loop=hook::pattern("55 8B EC 83 E4 F8 83 EC 20 A1 ? ? ? ? 56 57 8B F9 89 44 24 24 8B 47 0C");
+            if(loop.size()==1)
+                meshLoopProbe=safetyhook::create_inline(loop.get_first(),ObserveMeshLoop);
+            Log(meshLoopProbe ? "mesh loop caller observer attached":"mesh loop caller observer unavailable");
+            // CE00C1F940 CALL / 00C1F945 continuation, bracket the native batch draw.
+            auto corona=hook::pattern("E8 ? ? ? ? 8B 45 AC 2B C6 89 45 AC 0F 85 ? ? ? ? E8 ? ? ? ? 51 C7 04 24 00 00 80 3F");
+            if(corona.size()==1)
+            {
+                coronaDrawBeginProbe=safetyhook::create_mid(corona.get_first(),[](SafetyHookContext&)
+                {coronaDrawProbeActive=GetCurrentThreadId()==modelProbeThread && modelProbePhase<6;});
+                coronaDrawEndProbe=safetyhook::create_mid(corona.get_first<char>(5),[](SafetyHookContext&)
+                {coronaDrawProbeActive=false;});
+            }
+            if(!coronaDrawBeginProbe || !coronaDrawEndProbe)
+            {coronaDrawBeginProbe.reset(); coronaDrawEndProbe.reset(); Log("corona shader observer unavailable");}
+            else Log("corona shader observer attached: getters once per phase");
+            auto record=hook::pattern("0F 28 81 ? ? ? ? 81 CE 00 FF FF FF C1 E6 08 0B F0");
+            auto writer=hook::pattern("83 3D ? ? ? ? 00 74 ? A1 ? ? ? ? 85 C0 74 ? F3 0F 10 44 24 04 8B C8 83 C0 24");
+            if(record.size()==1 && writer.size()==1)
+            {
+                coronaProbePool=*record.get_first<uintptr_t>(3);
+                coronaRecordProbe=safetyhook::create_mid(record.get_first(),[](SafetyHookContext& regs)
+                {
+                    if(GetCurrentThreadId()!=modelProbeThread || modelProbePhase>=6) return;
+                    auto& sample=coronaSnapshots[modelProbePhase];
+                    if(sample.recordCaptured) return;
+                    sample.recordCaptured=true;
+                    std::memcpy(sample.record,reinterpret_cast<const void*>(coronaProbePool+regs.ecx),32);
+                    sample.flags[0]=*reinterpret_cast<const unsigned char*>(regs.ebp-0xAC);
+                    sample.flags[1]=*reinterpret_cast<const unsigned char*>(regs.ebp-0xCC);
+                    constexpr unsigned offsets[]{0xA0,0xA8,0xC8,0xC0,0xA4,0x88,0x140,0x148,0x130};
+                    for(unsigned i=0;i<9;++i) std::memcpy(&sample.basis[i],reinterpret_cast<const void*>(regs.ebp-offsets[i]),4);
+                });
+                coronaProbeModuleBase=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                coronaVerticesProbe=safetyhook::create_mid(writer.get_first(),[](SafetyHookContext& regs)
+                {
+                    if(GetCurrentThreadId()!=modelProbeThread || modelProbePhase>=6) return;
+                    auto& sample=coronaSnapshots[modelProbePhase];
+                    if(!sample.recordCaptured || sample.vertexCount>=6) return;
+                    const auto caller=*reinterpret_cast<const uintptr_t*>(regs.esp);
+                    if(caller<coronaProbeModuleBase+0x81F170 || caller>=coronaProbeModuleBase+0x81F993) return;
+                    std::memcpy(sample.vertices[sample.vertexCount++],reinterpret_cast<const void*>(regs.esp+4),36);
+                });
+            }
+            if(!coronaRecordProbe || !coronaVerticesProbe)
+            {coronaRecordProbe.reset();coronaVerticesProbe.reset();Log("corona record observer unavailable");}
+            else Log("corona record observer attached: first compact record and six vertices per phase");
+            modelProbeDeadline=GetTickCount64()+5000;
+            Log("model-command-probe armed: five seconds; exclude from performance captures");
+        }
+        else Log("model-command-probe unavailable: hook creation failed");
+    }
+
+    struct GpuBillboardRecord {float center[3],radius,brightness,push;DWORD color,flags;};
+    struct GpuBillboardCorner {float corner[4],right[3],up[3];};
+    static_assert(sizeof(GpuBillboardRecord)==32);
+    struct GpuBillboards
+    {
+        static constexpr unsigned capacity=2730;
+        IDirect3DDevice9* device=nullptr;
+        ComPtr<IDirect3DVertexBuffer9> corners,instances;
+        ComPtr<IDirect3DIndexBuffer9> indices;
+        ComPtr<IDirect3DVertexDeclaration9> declaration;
+        ComPtr<IDirect3DVertexShader9> sourceShader,shader,rejectedShader;
+        std::array<GpuBillboardRecord,capacity> records{};
+        uintptr_t pool=0,continuation=0;
+        unsigned long long batches=0,lights=0,fallbacks=0;
+    };
+    std::unique_ptr<GpuBillboards> gpuBillboards;
+
+    bool DrawGpuBillboards(IDirect3DDevice9* device,GpuBillboards& state,unsigned count,const float* basis)
+    {
+        ComPtr<IDirect3DVertexShader9> vs;
+        ComPtr<IDirect3DVertexDeclaration9> declaration;
+        ComPtr<IDirect3DVertexBuffer9> streams[2];
+        ComPtr<IDirect3DIndexBuffer9> indices;
+        UINT offsets[2]{},strides[2]{},frequencies[2]{};
+        if(FAILED(device->GetVertexShader(&vs)) || !vs || FAILED(device->GetVertexDeclaration(&declaration)) ||
+            FAILED(device->GetIndices(&indices))) return false;
+        for(unsigned i=0;i<2;++i)
+            if(FAILED(device->GetStreamSource(i,&streams[i],&offsets[i],&strides[i])) ||
+                FAILED(device->GetStreamSourceFreq(i,&frequencies[i]))) return false;
+        if(state.sourceShader.Get()!=vs.Get())
+        {
+            if(state.rejectedShader.Get()==vs.Get()) return false;
+            state.rejectedShader=vs;
+            UINT bytes=0;vs->GetFunction(nullptr,&bytes);
+            if(!bytes || bytes>65536 || bytes%4) return false;
+            std::vector<DWORD> code(bytes/4);ComPtr<ID3DXBuffer> assembly,assembled,errors;
+            if(FAILED(vs->GetFunction(code.data(),&bytes)) || FAILED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly))) return false;
+            std::string output;
+            if(!VRBillboardShader::AddInstanceExpansion(static_cast<const char*>(assembly->GetBufferPointer()),output,true) ||
+                FAILED(D3DXAssembleShader(output.data(),static_cast<UINT>(output.size()),nullptr,nullptr,0,&assembled,&errors))) return false;
+            ComPtr<IDirect3DVertexShader9> shader;
+            if(FAILED(device->CreateVertexShader(static_cast<const DWORD*>(assembled->GetBufferPointer()),&shader))) return false;
+            state.shader=std::move(shader);state.sourceShader=vs;
+            state.rejectedShader.Reset();
+            Log("billboard-instancing-test native shader adapted");
+        }
+        constexpr float unit[4][4]{{-1,1,0,1},{1,1,1,1},{1,-1,1,0},{-1,-1,0,0}};
+        GpuBillboardCorner corners[4]{};
+        for(unsigned i=0;i<4;++i)
+        {std::memcpy(corners[i].corner,unit[i],16);std::memcpy(corners[i].right,basis,12);std::memcpy(corners[i].up,basis+3,12);}
+        void* mapped=nullptr;
+        if(FAILED(state.corners->Lock(0,sizeof(corners),&mapped,D3DLOCK_DISCARD))) return false;
+        std::memcpy(mapped,corners,sizeof(corners));if(FAILED(state.corners->Unlock())) return false;
+        if(FAILED(state.instances->Lock(0,count*32,&mapped,D3DLOCK_DISCARD))) return false;
+        std::memcpy(mapped,state.records.data(),count*32);if(FAILED(state.instances->Unlock())) return false;
+        const bool configured=SUCCEEDED(device->SetVertexShader(state.shader.Get())) &&
+            SUCCEEDED(device->SetVertexDeclaration(state.declaration.Get())) &&
+            SUCCEEDED(device->SetStreamSource(0,state.corners.Get(),0,sizeof(GpuBillboardCorner))) &&
+            SUCCEEDED(device->SetStreamSource(1,state.instances.Get(),0,32)) &&
+            SUCCEEDED(device->SetStreamSourceFreq(0,D3DSTREAMSOURCE_INDEXEDDATA|count)) &&
+            SUCCEEDED(device->SetStreamSourceFreq(1,static_cast<UINT>(D3DSTREAMSOURCE_INSTANCEDATA)|1u)) &&
+            SUCCEEDED(device->SetIndices(state.indices.Get()));
+        const bool drawn=configured && SUCCEEDED(device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,0,4,0,2));
+        // Restore actual bindings so native RAGE caches remain consistent.
+        const auto restoredShader=device->SetVertexShader(vs.Get());
+        const auto restoredDeclaration=device->SetVertexDeclaration(declaration.Get());
+        bool restored=SUCCEEDED(restoredShader) && SUCCEEDED(restoredDeclaration);
+        for(unsigned i=0;i<2;++i)
+        {
+            const auto a=device->SetStreamSource(i,streams[i].Get(),offsets[i],strides[i]);
+            const auto b=device->SetStreamSourceFreq(i,frequencies[i]);
+            restored=SUCCEEDED(a) && SUCCEEDED(b) && restored;
+        }
+        restored=SUCCEEDED(device->SetIndices(indices.Get())) && restored;
+        if(!restored) {billboardInstancingRequested=false;Log("billboard-instancing-test binding restoration failed; disabling");}
+        return drawn;
+    }
+
+    void GpuBillboardBatch(SafetyHookContext& regs)
+    {
+        if(!gpuBillboards || GetCurrentThreadId()!=routingThread || renderEye<0 || renderStage!=3) return;
+        auto& state=*gpuBillboards;
+        const auto read=[&](unsigned offset){return *reinterpret_cast<const unsigned*>(regs.ebp-offset);};
+        const auto remaining=regs.eax,total=read(0xD4),phase=read(0x114);
+        if(!remaining || remaining>49152 || total>49152 || phase>=3 || regs.edi>total ||
+            *reinterpret_cast<const unsigned char*>(regs.ebp-0xAC) || *reinterpret_cast<const unsigned char*>(regs.ebp-0xCC))
+        {++state.fallbacks;return;}
+        const unsigned count=std::min<unsigned>(remaining,GpuBillboards::capacity);
+        const auto* mask=*reinterpret_cast<const unsigned char**>(regs.ebp-0x124);
+        unsigned next=regs.edi,selected=0;
+        while(selected<count && next<total)
+        {
+            if(mask[next]==1)
+                std::memcpy(&state.records[selected++],reinterpret_cast<const void*>(state.pool+(phase*49152+next)*32),32);
+            ++next;
+        }
+        if(selected!=count) {++state.fallbacks;return;}
+        float basis[6]{};constexpr unsigned offsets[]{0xA0,0xA8,0xC8,0xC0,0xA4,0x88};
+        for(unsigned i=0;i<6;++i)std::memcpy(&basis[i],reinterpret_cast<const void*>(regs.ebp-offsets[i]),4);
+        if(!DrawGpuBillboards(state.device,state,count,basis)) {++state.fallbacks;return;}
+        ++state.batches;state.lights+=count;
+        regs.edi=next;regs.esi=count;regs.eip=state.continuation;
+    }
+
+    void StopGpuBillboards()
+    {
+        billboardBatchHook.reset();
+        if(gpuBillboards)
+        {
+            char line[200];sprintf_s(line,"billboard-instancing-test off batches=%llu lights=%llu fallbacks=%llu",
+                gpuBillboards->batches,gpuBillboards->lights,gpuBillboards->fallbacks);Log(line);
+        }
+        gpuBillboards.reset();
+    }
+
+    void UpdateGpuBillboards(IDirect3DDevice9* device)
+    {
+        if(!billboardInstancingRequested.load()) {if(gpuBillboards || billboardBatchHook)StopGpuBillboards();return;}
+        if(billboardBatchHook) return;
+        if(modelProbeHook || vertexProbeHook || vertexEmissionHook || meshPacketProbe || vertexBinderBatchHook) return;
+        auto batch=hook::pattern("BE AA 0A 00 00 3B C6 0F 4E F0 89 B5 E4 FE FF FF");
+        auto record=hook::pattern("0F 28 81 ? ? ? ? 81 CE 00 FF FF FF C1 E6 08 0B F0");
+        auto draw=hook::pattern("E8 ? ? ? ? 8B 45 AC 2B C6 89 45 AC 0F 85 ? ? ? ? E8 ? ? ? ? 51 C7 04 24 00 00 80 3F");
+        if(batch.size()!=1 || record.size()!=1 || draw.size()!=1)
+        {billboardInstancingRequested=false;Log("billboard-instancing-test unavailable: native signature mismatch");return;}
+        auto owned=std::make_unique<GpuBillboards>();owned->device=device;
+        owned->pool=*record.get_first<uintptr_t>(3);owned->continuation=reinterpret_cast<uintptr_t>(draw.get_first<char>(5));
+        const D3DVERTEXELEMENT9 declaration[]{
+            {0,0,D3DDECLTYPE_FLOAT4,0,D3DDECLUSAGE_POSITION,0},{0,16,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_TEXCOORD,1},
+            {0,28,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_TEXCOORD,2},{1,0,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_NORMAL,0},
+            {1,12,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_TEXCOORD,0},{1,24,D3DDECLTYPE_D3DCOLOR,0,D3DDECLUSAGE_COLOR,0},D3DDECL_END()};
+        const WORD indices[]{0,1,2,2,3,0};void* mapped=nullptr;
+        const bool allocated=SUCCEEDED(device->CreateVertexBuffer(4*sizeof(GpuBillboardCorner),D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY,0,D3DPOOL_DEFAULT,&owned->corners,nullptr)) &&
+            SUCCEEDED(device->CreateVertexBuffer(GpuBillboards::capacity*32,D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY,0,D3DPOOL_DEFAULT,&owned->instances,nullptr)) &&
+            SUCCEEDED(device->CreateIndexBuffer(sizeof(indices),D3DUSAGE_WRITEONLY,D3DFMT_INDEX16,D3DPOOL_DEFAULT,&owned->indices,nullptr)) &&
+            SUCCEEDED(device->CreateVertexDeclaration(declaration,&owned->declaration)) &&
+            SUCCEEDED(owned->indices->Lock(0,sizeof(indices),&mapped,0));
+        if(!allocated) {billboardInstancingRequested=false;Log("billboard-instancing-test allocation failed");return;}
+        std::memcpy(mapped,indices,sizeof(indices));
+        if(FAILED(owned->indices->Unlock())) {billboardInstancingRequested=false;return;}
+        gpuBillboards=std::move(owned);billboardBatchHook=safetyhook::create_mid(batch.get_first(),GpuBillboardBatch);
+        if(!billboardBatchHook){billboardInstancingRequested=false;gpuBillboards.reset();Log("billboard-instancing-test hook unavailable");return;}
+        Log("billboard-instancing-test on: main eyes only, normal native mode, compact32-byte records; native fallback retained");
+    }
+
+    bool AdaptRigidShader(IDirect3DDevice9* device,const std::vector<DWORD>& code,bool tangent,ComPtr<IDirect3DVertexShader9>& shader)
+    {
+        ComPtr<ID3DXBuffer> assembly,assembled,errors;std::string output;
+        if(FAILED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)) ||
+            !VRRigidInstanceShader::AddInstanceMatrices(static_cast<const char*>(assembly->GetBufferPointer()),output,tangent) ||
+            FAILED(D3DXAssembleShader(output.data(),static_cast<UINT>(output.size()),nullptr,nullptr,0,&assembled,&errors)))return false;
+        return SUCCEEDED(device->CreateVertexShader(static_cast<const DWORD*>(assembled->GetBufferPointer()),&shader));
+    }
+    void FlushLiveMesh(IDirect3DDevice9* device)
+    {
+        if(!device || !liveMeshPackets || !OnRoutingThread() || renderEye<0 || renderStage!=1)return;
+        const auto result=liveMeshPackets->FlushLive(device,renderEye,liveMeshRenderer,
+            [device](const auto& code,bool tangent,auto& shader){return AdaptRigidShader(device,code,tangent,shader);},
+            [device](D3DPRIMITIVETYPE type,INT base,UINT first,UINT vertices,UINT start,UINT primitives)
+            {return drawIndexedPrimitive.unsafe_stdcall<HRESULT>(device,type,base,first,vertices,start,primitives);});
+        if(FAILED(result))Log("mesh-live-probe submission/restoration failed; remaining draws stay native");
+    }
+    HRESULT WINAPI ClearLiveMesh(IDirect3DDevice9* device,DWORD count,const D3DRECT* rects,DWORD flags,D3DCOLOR color,float z,DWORD stencil)
+    {
+        FlushLiveMesh(device);
+        return liveMeshClear.unsafe_stdcall<HRESULT>(device,count,rects,flags,color,z,stencil);
+    }
+    void LiveMeshResourceBarrier()
+    {
+        if(liveMeshPackets && OnRoutingThread() && RageDirect3DDevice9::m_pRealDevice)
+            FlushLiveMesh(*RageDirect3DDevice9::m_pRealDevice);
+    }
+    HRESULT WINAPI LockLiveMeshVB(IDirect3DVertexBuffer9* buffer,UINT offset,UINT bytes,void** data,DWORD flags)
+    {LiveMeshResourceBarrier();return liveMeshVBLock.unsafe_stdcall<HRESULT>(buffer,offset,bytes,data,flags);}
+    HRESULT WINAPI LockLiveMeshIB(IDirect3DIndexBuffer9* buffer,UINT offset,UINT bytes,void** data,DWORD flags)
+    {LiveMeshResourceBarrier();return liveMeshIBLock.unsafe_stdcall<HRESULT>(buffer,offset,bytes,data,flags);}
+    HRESULT WINAPI LockLiveMeshTexture(IDirect3DTexture9* texture,UINT level,D3DLOCKED_RECT* data,const RECT* rect,DWORD flags)
+    {LiveMeshResourceBarrier();return liveMeshTextureLock.unsafe_stdcall<HRESULT>(texture,level,data,rect,flags);}
+    HRESULT WINAPI UpdateLiveMeshTexture(IDirect3DDevice9* device,IDirect3DBaseTexture9* source,IDirect3DBaseTexture9* destination)
+    {FlushLiveMesh(device);return liveMeshUpdateTexture.unsafe_stdcall<HRESULT>(device,source,destination);}
+    HRESULT WINAPI UpdateLiveMeshSurface(IDirect3DDevice9* device,IDirect3DSurface9* source,const RECT* rect,IDirect3DSurface9* destination,const POINT* point)
+    {FlushLiveMesh(device);return liveMeshUpdateSurface.unsafe_stdcall<HRESULT>(device,source,rect,destination,point);}
+    HRESULT WINAPI FillLiveMeshColor(IDirect3DDevice9* device,IDirect3DSurface9* surface,const RECT* rect,D3DCOLOR color)
+    {FlushLiveMesh(device);return liveMeshColorFill.unsafe_stdcall<HRESULT>(device,surface,rect,color);}
+    void WINAPI GenerateLiveMeshMips(IDirect3DTexture9* texture)
+    {LiveMeshResourceBarrier();liveMeshGenerateMips.unsafe_stdcall(texture);}
+    void RemoveLiveMeshResourceHooks()
+    {liveMeshVBLock.reset();liveMeshIBLock.reset();liveMeshTextureLock.reset();liveMeshUpdateTexture.reset();liveMeshUpdateSurface.reset();liveMeshColorFill.reset();liveMeshGenerateMips.reset();}
+    const VRMeshPacketProbe::ShaderReads* InspectMeshPacketShaders(IDirect3DVertexShader9* vs,IDirect3DPixelShader9* ps,IDirect3DVertexDeclaration9* decl)
+    {
+        auto found=std::find_if(meshPacketShaders.begin(),meshPacketShaders.end(),[&](const auto& s)
+            {return s.vs.Get()==vs && s.ps.Get()==ps && s.declaration.Get()==decl;});
+        if(found!=meshPacketShaders.end())return found->valid ? &found->reads:nullptr;
+        if(meshPacketShaders.size()==(meshCompareOrder ? 128u:64u))return nullptr;
+        meshPacketShaders.emplace_back();auto& selected=meshPacketShaders.back();
+        selected.vs=vs;selected.ps=ps;selected.declaration=decl;
+        D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH+1]{};UINT count=std::size(elements);
+        if(FAILED(decl->GetDeclaration(elements,&count)) || (count!=5 && count!=6))return nullptr;
+        constexpr BYTE usages[]{D3DDECLUSAGE_POSITION,D3DDECLUSAGE_NORMAL,D3DDECLUSAGE_COLOR,D3DDECLUSAGE_TEXCOORD,D3DDECLUSAGE_TANGENT};
+        constexpr BYTE types[]{D3DDECLTYPE_FLOAT3,D3DDECLTYPE_FLOAT3,D3DDECLTYPE_D3DCOLOR,D3DDECLTYPE_FLOAT2,D3DDECLTYPE_FLOAT4};
+        constexpr WORD offsets[]{0,12,24,28,36};
+        for(unsigned i=0;i<count-1;++i)
+            if(elements[i].Stream || elements[i].Offset!=offsets[i] || elements[i].Type!=types[i] ||
+                elements[i].Method || elements[i].Usage!=usages[i] || elements[i].UsageIndex)return nullptr;
+        if(elements[count-1].Stream!=0xff || elements[count-1].Type!=D3DDECLTYPE_UNUSED)return nullptr;
+        const auto assembly=[](auto* shader,std::string& output)
+        {
+            UINT bytes=0;if(FAILED(shader->GetFunction(nullptr,&bytes)) || !bytes || bytes>65536 || bytes%4)return false;
+            std::vector<DWORD> code(bytes/4);ComPtr<ID3DXBuffer> text;
+            if(FAILED(shader->GetFunction(code.data(),&bytes)) || FAILED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&text)))return false;
+            output=static_cast<const char*>(text->GetBufferPointer());return true;
+        };
+        std::string vertex,pixel,prefix;
+        if(!assembly(vs,vertex) || !assembly(ps,pixel) || !VRRigidInstanceShader::AddInstanceMatrices(vertex,prefix,count==6))return nullptr;
+        selected.valid=VRMeshPacketProbe::ReadAssembly(vertex,selected.reads.vertex,std::span(selected.reads.samplers).subspan(16,4)) &&
+            VRMeshPacketProbe::ReadAssembly(pixel,selected.reads.pixel,std::span(selected.reads.samplers).first(16));
+        return selected.valid ? &selected.reads:nullptr;
+    }
+    void UpdateCpuOmission()
+    {
+        auto request=cpuOmitRequested.exchange(99);
+        if(request==99 && cpuOmitMode.load() && GetTickCount64()>=cpuOmitDeadline.load())request=0;
+        if(request==99)return;
+        cpuOmitHook.reset();cpuOmitMode=0;cpuOmitDeadline=0;
+        if(!request){Log("cpu-omit-test off: native callbacks restored");return;}
+        if(modelProbeHook || vertexProbeHook || vertexEmissionHook || rigidInstances || gpuBillboards || meshPacketProbe || liveMeshMode || vertexBinderBatchHook)
+        {Log("cpu-omit-test unavailable: another experiment is active");return;}
+        if(request>=3)
+        {
+            cpuOmitSkipped[0]=0;cpuOmitSkipped[1]=0;cpuOmitDeadline=GetTickCount64()+90000;cpuOmitMode=request;
+            Log("cpu-omit-test phase omission active for90s: native main-eye list construction and execution removed; images deliberately invalid");return;
+        }
+        // Upper-bound experiment, not a GPU replacement. Preserve simulation,
+        // list building, command ownership and non-main rendering callbacks.
+        // Deliberately omit selected native preparation AND its draw descendants.
+        auto model=hook::pattern("55 8B EC 83 E4 F0 83 EC 44 53 56 8B F1 57 0F B7 46 30 8B 04 85 ? ? ? ? 85 C0");
+        auto material=hook::pattern("55 8B EC 83 E4 F8 83 EC 20 A1 ? ? ? ? 56 57 8B F9 89 44 24 24 8B 47 0C");
+        auto& entry=request==2 ? model:material;
+        if(entry.size()!=1){Log("cpu-omit-test unavailable: unique native signature missing");return;}
+        cpuOmitHook=safetyhook::create_inline(entry.get_first(),request==2 ? reinterpret_cast<void*>(OmitModelWork):reinterpret_cast<void*>(OmitMaterialWork));
+        if(!cpuOmitHook){Log("cpu-omit-test unavailable: hook failed");return;}
+        cpuOmitSkipped[0]=0;cpuOmitSkipped[1]=0;cpuOmitDeadline=GetTickCount64()+90000;cpuOmitMode=request;
+        Log(request==2 ? "cpu-omit-test models: main eye GBuffer/DrawScene callback008DCBF0 omitted for90s; deliberately missing geometry; CPU+draw removal upper bound":
+            "cpu-omit-test materials: main eye GBuffer/DrawScene loop00444C50 omitted for90s; deliberately missing geometry; CPU+draw removal upper bound");
+    }
+    void UpdateMeshPacketProbe(IDirect3DDevice9* device)
+    {
+        const bool benchmark=meshBenchmarkRequested.exchange(false);
+        const bool packet=meshPacketRequested.exchange(false),replay=meshReplayRequested.exchange(false) || benchmark;
+        const bool order=meshOrderRequested.exchange(false) || replay;
+        if(!packet && !order)return;
+        if(meshPacketProbe || modelProbeHook || vertexProbeHook || vertexEmissionHook || rigidInstances || gpuBillboards || vertexBinderBatchHook)
+        {Log("mesh-packet-probe unavailable: disable other experiments first");return;}
+        meshCompareOrder=order;meshPacketMaterial=0;
+        // Verified CE004373E0, thiscall four stack arguments RET10. Observe
+        // native pass identity after its original state/resource binding runs.
+        auto material=hook::pattern("53 55 8B E9 56 0F B7 5D 1C 33 F6 57 85 DB");
+        if(material.size()==1)meshPacketMaterialProbe=safetyhook::create_inline(material.get_first(),ObservePacketMaterial);
+        Log(meshPacketMaterialProbe ? "mesh-recipe-probe native material identity observer attached":"mesh-recipe-probe material identity unavailable");
+        meshPacketShaders.clear();
+        try {meshPacketProbe=std::make_unique<VRMeshPacketProbe::Probe>(order,replay,benchmark);}
+        catch(const std::bad_alloc&){meshPacketMaterialProbe.reset();Log("mesh-packet-probe unavailable: allocation failed");return;}
+        ComPtr<IDirect3DQuery9> query;
+        if(SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_OCCLUSION,&query)) && query)
+        {auto** table=*reinterpret_cast<void***>(query.Get());meshQueryIssueProbe=safetyhook::create_inline(table[6],ObserveMeshQueryIssue);}
+        auto** table=*reinterpret_cast<void***>(device);
+        meshPrimitiveUPProbe=safetyhook::create_inline(table[83],ObserveMeshPrimitiveUP);
+        meshIndexedUPProbe=safetyhook::create_inline(table[84],ObserveMeshIndexedUP);
+        if(!meshQueryIssueProbe || !meshPrimitiveUPProbe || !meshIndexedUPProbe)
+        {meshPacketProbe.reset();meshPacketShaders.clear();meshPacketMaterialProbe.reset();meshPacketMaterial=0;meshQueryIssueProbe.reset();meshPrimitiveUPProbe.reset();meshIndexedUPProbe.reset();
+            Log("mesh-packet-probe unavailable: query/UP side-effect observers missing");return;}
+        Log(replay ? "mesh-replay-probe armed: all indexed packets, unsupported ordering barriers, actual native color comparison; scratch only":
+            order ? "mesh-order-probe armed: captured subset original-order/grouped scratch comparison; exclude from timing":
+            "mesh-packet-probe armed: one eye0 GBuffer capture; scratch comparison; exclude from timing");
+    }
+    void UpdateRigidInstances(IDirect3DDevice9* device)
+    {
+        if(rigidInstances && (!rigidInstancingRequested || rigidInstances->restorationFailed))
+        {
+            char line[240];sprintf_s(line,"rigid-instancing-test off draws=%llu,%llu fallbacks=%llu,%llu failures=%llu restorationFailed=%u",
+                rigidInstances->draws[0],rigidInstances->draws[1],rigidInstances->fallbacks[0],
+                rigidInstances->fallbacks[1],rigidInstances->failures,rigidInstances->restorationFailed);
+            Log(line);rigidInstances.reset();rigidInstancingRequested=false;
+        }
+        if(!rigidInstancingRequested || rigidInstances)return;
+        if(modelProbeHook || vertexProbeHook || vertexEmissionHook || meshPacketProbe || vertexBinderBatchHook)
+        {rigidInstancingRequested=false;Log("rigid-instancing-test unavailable: disable native observers first");return;}
+        D3DCAPS9 caps{};
+        if(FAILED(device->GetDeviceCaps(&caps)) || caps.VertexShaderVersion<D3DVS_VERSION(3,0) ||
+            caps.MaxStreams<2 || caps.MaxStreamStride<128)
+        {rigidInstancingRequested=false;Log("rigid-instancing-test unsupported device caps");return;}
+        rigidInstances=std::make_unique<VRRigidInstance::Renderer>();
+        Log("rigid-instancing-test on: main-eye GBuffer only, one instance, native order and fallback; compatibility test, not batching");
     }
 
     bool Check(const char* operation,HRESULT result)
@@ -171,7 +1501,8 @@ namespace
             name=="PreAlphaDepthCopy" || name.starts_with("AO") || name=="edgesTex" || name=="blendTex";
     }
 
-    IDirect3DSurface9* MapSurface(IDirect3DSurface9* input,int eye)
+    thread_local VRProfile::Total routingTime[2]{};
+    IDirect3DSurface9* MapSurfaceImpl(IDirect3DSurface9* input,int eye)
     {
         if(!input || !resources) return input;
         if(input==resources->originalBack.Get() || input==resources->finalSurface[0].Get() ||
@@ -189,24 +1520,96 @@ namespace
         return input;
     }
 
-    IDirect3DBaseTexture9* MapTexture(IDirect3DBaseTexture9* input,int eye)
+    IDirect3DBaseTexture9* MapTextureImpl(IDirect3DBaseTexture9* input,int eye)
     {
         if(!input || !resources) return input;
+        if(!textureCacheBypass)
+            return resources->textureRoutes.Map(input,eye,[](IDirect3DBaseTexture9* texture)
+            {
+                for(auto& target:resources->targets)
+                    if(texture==target.original.Get() || texture==target.texture[0].Get() || texture==target.texture[1].Get())
+                        return std::array<IDirect3DBaseTexture9*,3>{target.original.Get(),target.texture[0].Get(),target.texture[1].Get()};
+                return std::array<IDirect3DBaseTexture9*,3>{texture,texture,texture};
+            });
         for(auto& target:resources->targets)
             if(input==target.original.Get() || input==target.texture[0].Get() || input==target.texture[1].Get())
                 return eye<0 ? target.original.Get() : target.texture[eye].Get();
         return input;
     }
 
+    IDirect3DSurface9* MapSurface(IDirect3DSurface9* input,int eye)
+    {
+        // Keep disabled profiling out of this frequent routing path, including
+        // the temporary stamp initialization emitted by the x86 compiler.
+        if(!routingProbeActive || eye<0 || eye>1) return MapSurfaceImpl(input,eye);
+        const auto stamp=VRProfile::Begin();
+        auto* result=MapSurfaceImpl(input,eye);
+        if(stamp.epoch) VRProfile::Accumulate(routingTime[eye],stamp);
+        return result;
+    }
+    IDirect3DBaseTexture9* MapTexture(IDirect3DBaseTexture9* input,int eye)
+    {
+        if(!routingProbeActive || eye<0 || eye>1) return MapTextureImpl(input,eye);
+        const auto stamp=VRProfile::Begin();
+        auto* result=MapTextureImpl(input,eye);
+        if(stamp.epoch) VRProfile::Accumulate(routingTime[eye],stamp);
+        return result;
+    }
+
     HRESULT WINAPI SetTarget(IDirect3DDevice9* self,DWORD index,IDirect3DSurface9* surface)
-    {return setTarget.unsafe_stdcall<HRESULT>(self,index,GetCurrentThreadId()==routingThread ? MapSurface(surface,renderEye) : surface);}
+    {FlushLiveMesh(self);return setTarget.unsafe_stdcall<HRESULT>(self,index,OnRoutingThread() ? MapSurface(surface,renderEye) : surface);}
     HRESULT WINAPI SetDepth(IDirect3DDevice9* self,IDirect3DSurface9* surface)
-    {return setDepth.unsafe_stdcall<HRESULT>(self,GetCurrentThreadId()==routingThread ? MapSurface(surface,renderEye) : surface);}
+    {FlushLiveMesh(self);return setDepth.unsafe_stdcall<HRESULT>(self,OnRoutingThread() ? MapSurface(surface,renderEye) : surface);}
     HRESULT WINAPI SetTexture(IDirect3DDevice9* self,DWORD stage,IDirect3DBaseTexture9* texture)
-    {return setTexture.unsafe_stdcall<HRESULT>(self,stage,GetCurrentThreadId()==routingThread ? MapTexture(texture,renderEye) : texture);}
+    {
+        texture=OnRoutingThread() ? MapTexture(texture,renderEye):texture;
+        return ObserveStateCall(VRProfile::StateKind::Texture,[&](){return setTexture.unsafe_stdcall<HRESULT>(self,stage,texture);});
+    }
+    HRESULT WINAPI SetRenderState(IDirect3DDevice9* self,D3DRENDERSTATETYPE state,DWORD value)
+    {return ObserveStateCall(VRProfile::StateKind::RenderState,[&](){return setRenderState.unsafe_stdcall<HRESULT>(self,state,value);});}
+    HRESULT WINAPI SetSamplerState(IDirect3DDevice9* self,DWORD sampler,D3DSAMPLERSTATETYPE state,DWORD value)
+    {return ObserveStateCall(VRProfile::StateKind::SamplerState,[&](){return setSamplerState.unsafe_stdcall<HRESULT>(self,sampler,state,value);});}
+    HRESULT WINAPI SetStreamSource(IDirect3DDevice9* self,UINT stream,IDirect3DVertexBuffer9* buffer,UINT offset,UINT stride)
+    {return ObserveStateCall(VRProfile::StateKind::StreamSource,[&](){return setStreamSource.unsafe_stdcall<HRESULT>(self,stream,buffer,offset,stride);});}
+    HRESULT WINAPI SetIndices(IDirect3DDevice9* self,IDirect3DIndexBuffer9* indices)
+    {return ObserveStateCall(VRProfile::StateKind::Indices,[&](){return setIndices.unsafe_stdcall<HRESULT>(self,indices);});}
+    HRESULT WINAPI SetVertexDeclaration(IDirect3DDevice9* self,IDirect3DVertexDeclaration9* declaration)
+    {return ObserveStateCall(VRProfile::StateKind::VertexDeclaration,[&](){return setVertexDeclaration.unsafe_stdcall<HRESULT>(self,declaration);});}
+
+    void ConfigureStateHooks(IDirect3DDevice9* device,bool wanted)
+    {
+        // Called at the owning render thread's eye0 marker, outside every
+        // observed setter. Ordinary gameplay should pay no extra detours for
+        // the five methods that only exist to support this diagnostic.
+        if(!wanted)
+        {
+            if(stateHooksReady)
+            {
+                setRenderState.reset(); setSamplerState.reset(); setStreamSource.reset();
+                setIndices.reset(); setVertexDeclaration.reset();
+                stateHooksReady=false; Log("Sparse state-only hooks removed");
+            }
+            return;
+        }
+        if(stateHooksReady || stateHooksFailed) return;
+        const auto table=*reinterpret_cast<void***>(device);
+        setRenderState=safetyhook::create_inline(table[57],SetRenderState);
+        setSamplerState=safetyhook::create_inline(table[69],SetSamplerState);
+        setStreamSource=safetyhook::create_inline(table[100],SetStreamSource);
+        setIndices=safetyhook::create_inline(table[104],SetIndices);
+        setVertexDeclaration=safetyhook::create_inline(table[87],SetVertexDeclaration);
+        stateHooksReady=setRenderState && setSamplerState && setStreamSource && setIndices && setVertexDeclaration;
+        if(!stateHooksReady)
+        {
+            setRenderState.reset(); setSamplerState.reset(); setStreamSource.reset();
+            setIndices.reset(); setVertexDeclaration.reset(); stateHooksFailed=true;
+            Log("Sparse state-only hooks unavailable; observer disabled until reset");
+        }
+        else Log("Sparse state-only hooks installed");
+    }
     HRESULT WINAPI Stretch(IDirect3DDevice9* self,IDirect3DSurface9* source,const RECT* sourceRect,
         IDirect3DSurface9* destination,const RECT* destinationRect,D3DTEXTUREFILTERTYPE filter)
-    {const bool route=GetCurrentThreadId()==routingThread;
+    {FlushLiveMesh(self);const bool route=GetCurrentThreadId()==routingThread;
      return stretch.unsafe_stdcall<HRESULT>(self,route ? MapSurface(source,renderEye) : source,sourceRect,
         route ? MapSurface(destination,renderEye) : destination,destinationRect,filter);}
 
@@ -214,6 +1617,7 @@ namespace
     {
         if(GetCurrentThreadId()!=routingThread || !resources)
             return setVertexShader.unsafe_stdcall<HRESULT>(self,shader);
+        if(renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
         // Restore the engine's register before another lighting shader uses
         // c209 for a different purpose (for example local-light position).
         if(rayShaderBound)
@@ -273,23 +1677,135 @@ namespace
             shader=resources->asymmetricRayShader.Get();
             rayShaderBound=true;
         }
-        return setVertexShader.unsafe_stdcall<HRESULT>(self,shader);
+        return ObserveStateCall(VRProfile::StateKind::VertexShader,[&](){return setVertexShader.unsafe_stdcall<HRESULT>(self,shader);});
     }
 
     HRESULT WINAPI SetVertexConstants(IDirect3DDevice9* self,UINT start,const float* data,UINT count)
     {
-        const auto result=setVertexConstants.unsafe_stdcall<HRESULT>(self,start,data,count);
-        if(SUCCEEDED(result) && GetCurrentThreadId()==routingThread && rayShaderBound &&
+        if(binderDevice)
+        {
+            if(self==binderDevice && binderConstants.Write(start,data,count))return S_OK;
+            FlushBinderConstants();
+        }
+        // Marker-owned TLS avoids thread/observer queries for every ordinary
+        // constant write. Forward every call; no value cache or suppression.
+        if(!rayShaderBound && !constantProbeActive)
+            return ObserveStateCall(VRProfile::StateKind::VertexConstants,
+                [&](){return setVertexConstants.unsafe_stdcall<HRESULT>(self,start,data,count);});
+        const auto stamp=constantProbeActive ? VRProfile::Begin() : VRProfile::Stamp{};
+        const auto result=ObserveStateCall(VRProfile::StateKind::VertexConstants,
+            [&](){return setVertexConstants.unsafe_stdcall<HRESULT>(self,start,data,count);});
+        if(stamp.epoch) constantProbes[renderEye][0].Record(stamp,start,data,count,result);
+        if(SUCCEEDED(result) && rayShaderBound &&
             start<=209 && count>209-start)
         {
             std::memcpy(originalRayConstants,data+(209-start)*4,sizeof(originalRayConstants));
+            if(renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
             return setVertexConstants.unsafe_stdcall<HRESULT>(self,209,eyeRayConstants,1);
         }
         return result;
     }
 
+    void ProbeNormalDraw(IDirect3DDevice9* device)
+    {
+        if(!normalProbeActive || renderEye<0 || normalProbeKeys[renderEye].size()>=64) return;
+        ComPtr<IDirect3DPixelShader9> shader;
+        if(FAILED(device->GetPixelShader(&shader)) || !shader) return;
+        NormalProbeKey key{}; key.shader=shader.Get();
+        ComPtr<IDirect3DBaseTexture9> textures[8];
+        for(unsigned i=0;i<8;++i) {device->GetTexture(i,&textures[i]); key.textures[i]=textures[i].Get();}
+        auto& keys=normalProbeKeys[renderEye];
+        if(std::any_of(keys.begin(),keys.end(),[&](const auto& old){return old.shader==key.shader && old.textures==key.textures;})) return;
+        keys.push_back(key);
+        char line[256];
+        sprintf_s(line,"normal draw eye=%d record=%zu shader=%p",renderEye,keys.size(),shader.Get()); Log(line);
+        if(normalProbeShaders.size()<32 && std::none_of(normalProbeShaders.begin(),normalProbeShaders.end(),
+            [&](const auto& old){return old.Get()==shader.Get();}))
+        {
+            normalProbeShaders.push_back(shader);
+            UINT bytes=0; shader->GetFunction(nullptr,&bytes);
+            if(bytes && bytes<=65536)
+            {
+                std::vector<DWORD> code((bytes+3)/4); ComPtr<ID3DXBuffer> assembly;
+                if(SUCCEEDED(shader->GetFunction(code.data(),&bytes)) &&
+                    SUCCEEDED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)))
+                {
+                    sprintf_s(line,"normal pixel shader=%p (bounded capture)",shader.Get()); Log(line);
+                    const std::string text(static_cast<const char*>(assembly->GetBufferPointer()),
+                        std::min<size_t>(assembly->GetBufferSize(),24000)); Log(text.c_str());
+                }
+            }
+        }
+        for(unsigned slot=0;slot<4;++slot)
+        {
+            ComPtr<IDirect3DSurface9> target; D3DSURFACE_DESC desc{};
+            if(SUCCEEDED(device->GetRenderTarget(slot,&target)) && target && SUCCEEDED(target->GetDesc(&desc)))
+            {sprintf_s(line,"normal target slot=%u surface=%p format=%u",slot,target.Get(),desc.Format); Log(line);}
+        }
+        for(auto state:{D3DRS_SRGBWRITEENABLE,D3DRS_DITHERENABLE,D3DRS_ALPHABLENDENABLE,
+            D3DRS_SRCBLEND,D3DRS_DESTBLEND,D3DRS_BLENDOP,D3DRS_COLORWRITEENABLE1})
+        {DWORD value=0; if(SUCCEEDED(device->GetRenderState(state,&value)))
+            {sprintf_s(line,"normal render state=%u value=%u",state,value); Log(line);}}
+        for(unsigned slot=0;slot<8;++slot)
+        {
+            sprintf_s(line,"normal texture slot=%u texture=%p",slot,textures[slot].Get()); Log(line);
+            for(auto state:{D3DSAMP_MINFILTER,D3DSAMP_MAGFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE,
+                D3DSAMP_MAXANISOTROPY,D3DSAMP_MIPMAPLODBIAS,D3DSAMP_MAXMIPLEVEL,D3DSAMP_ADDRESSU,D3DSAMP_ADDRESSV})
+            {DWORD value=0; if(SUCCEEDED(device->GetSamplerState(slot,state,&value)))
+                {sprintf_s(line,"normal sampler slot=%u state=%u value=%u",slot,state,value); Log(line);}}
+        }
+        float constants[224][4]{};
+        if(SUCCEEDED(device->GetPixelShaderConstantF(0,constants[0],224)))
+            for(unsigned i=0;i<224;++i)
+            {sprintf_s(line,"normal PS c%u=(%.9g %.9g %.9g %.9g)",i,
+                constants[i][0],constants[i][1],constants[i][2],constants[i][3]); Log(line);}
+    }
+
+    HRESULT WINAPI DrawIndexedPrimitive(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,
+        INT base,UINT minimum,UINT vertices,UINT start,UINT primitives)
+    {
+        FlushBinderConstants();
+        if(liveMeshPackets && OnRoutingThread() && renderEye>=0 && renderStage==1 && liveMeshPackets->Observing())
+        {
+            bool queued=false;
+            try {queued=liveMeshPackets->Record(device,type,base,minimum,vertices,start,primitives,InspectMeshPacketShaders);}
+            catch(const std::bad_alloc&){liveMeshPackets->AllocationFailure();}
+            if(queued)return S_OK; // The actual native submission is replaced.
+            FlushLiveMesh(device); // Earlier packets precede this native fallback.
+        }
+        if(meshPacketProbe && GetCurrentThreadId()==routingThread && renderEye==0 && renderStage==1)
+        {
+            try {meshPacketProbe->Record(device,type,base,minimum,vertices,start,primitives,InspectMeshPacketShaders,meshPacketMaterial);}
+            catch(const std::bad_alloc&){meshPacketProbe->AllocationFailure();Log("mesh-packet-probe capture allocation failed; native draw still executes");}
+        }
+        CaptureMeshBindings(device,type,base,minimum,vertices,start,primitives);
+        if(normalProbeActive) ProbeNormalDraw(device);
+        const auto stamp=drawProbeActive ? BeginDrawProbe(true,primitives,vertices):VRProfile::Stamp{};
+        HRESULT result=S_OK;bool executed=false;
+        if(rigidInstances && GetCurrentThreadId()==routingThread && renderEye>=0 && renderStage==1)
+        {
+            executed=rigidInstances->TryDraw(device,renderEye,type,base,minimum,vertices,start,primitives,
+                [device](const std::vector<DWORD>& code,bool tangent,ComPtr<IDirect3DVertexShader9>& shader)
+                {
+                    if(!AdaptRigidShader(device,code,tangent,shader))return false;
+                    Log("rigid-instancing-test native shader adapted");return true;
+                },[device](D3DPRIMITIVETYPE kind,INT offset,UINT first,UINT count,UINT index,UINT triangles)
+                {return drawIndexedPrimitive.unsafe_stdcall<HRESULT>(device,kind,offset,first,count,index,triangles);},result);
+            if(!executed)++rigidInstances->fallbacks[renderEye];
+        }
+        if(!executed)result=drawIndexedPrimitive.unsafe_stdcall<HRESULT>(device,type,base,minimum,vertices,start,primitives);
+        if(drawProbeActive) EndDrawProbe(stamp,result);
+        return result;
+    }
+
     HRESULT WINAPI DrawPrimitive(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,UINT start,UINT count)
     {
+        FlushLiveMesh(device);
+        if(InPacketStream())meshPacketProbe->OtherDraw();
+        FlushBinderConstants();
+        if(InFirstMeshStream()){++meshNonIndexed;MeshSequenceBarrier();}
+        CaptureCoronaDraw(device,type,start,count);
+        if(normalProbeActive) ProbeNormalDraw(device);
         if(GetCurrentThreadId()==routingThread && renderEye>=0 && renderStage==2 && rayShaderBound &&
             !(lightingProbeMask&(1u<<renderEye)))
         {
@@ -315,13 +1831,42 @@ namespace
                     renderEye,pixelCamera[0],pixelCamera[1],pixelCamera[2],pixelCamera[3],sun[0],sun[1],sun[2],sun[3]); Log(line);
             }
         }
-        return drawPrimitive.unsafe_stdcall<HRESULT>(device,type,start,count);
+        const auto stamp=drawProbeActive ? BeginDrawProbe(false,count,0):VRProfile::Stamp{};
+        const auto result=drawPrimitive.unsafe_stdcall<HRESULT>(device,type,start,count);
+        if(drawProbeActive) EndDrawProbe(stamp,result);
+        return result;
+    }
+
+    void ConfigureDrawHooks(IDirect3DDevice9* device,bool wanted)
+    {
+        // Both draw detours only collect diagnostics. Change them at the eye0
+        // marker, never from within a draw callback, just like state hooks.
+        if(!wanted)
+        {
+            if(drawPrimitive || drawIndexedPrimitive)
+            {
+                drawPrimitive.reset(); drawIndexedPrimitive.reset();
+                Log("Diagnostic draw hooks removed");
+            }
+            return;
+        }
+        if(drawPrimitive && drawIndexedPrimitive) return;
+        const auto table=*reinterpret_cast<void***>(device);
+        drawPrimitive=safetyhook::create_inline(table[81],DrawPrimitive);
+        drawIndexedPrimitive=safetyhook::create_inline(table[82],DrawIndexedPrimitive);
+        if(!drawPrimitive || !drawIndexedPrimitive)
+        {
+            drawPrimitive.reset(); drawIndexedPrimitive.reset();
+            Log("Diagnostic draw hooks unavailable");
+        }
+        else Log("Diagnostic draw hooks installed");
     }
 
     HRESULT WINAPI SetPixelShader(IDirect3DDevice9* device,IDirect3DPixelShader9* shader)
     {
         if(GetCurrentThreadId()!=routingThread || !resources)
             return setPixelShader.unsafe_stdcall<HRESULT>(device,shader);
+        if(renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
         if(cascadeShaderBound)
         {
             setPixelConstants.unsafe_stdcall<HRESULT>(device,14,originalCascadeForward,1);
@@ -341,6 +1886,10 @@ namespace
                     SUCCEEDED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)))
                 {
                     const std::string text(static_cast<const char*>(assembly->GetBufferPointer()),assembly->GetBufferSize());
+                    char header[128];
+                    sprintf_s(header,"lighting pixel shader=%p frame=%u eye=%d (bounded discovery)",shader,completedFrame,renderEye);
+                    Log(header);
+                    Log(text.substr(0,24000).c_str());
                     const std::regex register14("\\bc14\\b");
                     const auto uses=std::distance(std::sregex_iterator(text.begin(),text.end(),register14),std::sregex_iterator());
                     // Verified directional deferred PS1/PS2: c14 is read only
@@ -365,15 +1914,22 @@ namespace
             setPixelConstants.unsafe_stdcall<HRESULT>(device,14,cascadeForward,1);
             cascadeShaderBound=true;
         }
-        return setPixelShader.unsafe_stdcall<HRESULT>(device,shader);
+        return ObserveStateCall(VRProfile::StateKind::PixelShader,[&](){return setPixelShader.unsafe_stdcall<HRESULT>(device,shader);});
     }
 
     HRESULT WINAPI SetPixelConstants(IDirect3DDevice9* device,UINT start,const float* data,UINT count)
     {
-        const auto result=setPixelConstants.unsafe_stdcall<HRESULT>(device,start,data,count);
-        if(SUCCEEDED(result) && GetCurrentThreadId()==routingThread && cascadeShaderBound && start<=14 && count>14-start)
+        if(!cascadeShaderBound && !constantProbeActive)
+            return ObserveStateCall(VRProfile::StateKind::PixelConstants,
+                [&](){return setPixelConstants.unsafe_stdcall<HRESULT>(device,start,data,count);});
+        const auto stamp=constantProbeActive ? VRProfile::Begin() : VRProfile::Stamp{};
+        const auto result=ObserveStateCall(VRProfile::StateKind::PixelConstants,
+            [&](){return setPixelConstants.unsafe_stdcall<HRESULT>(device,start,data,count);});
+        if(stamp.epoch) constantProbes[renderEye][1].Record(stamp,start,data,count,result);
+        if(SUCCEEDED(result) && cascadeShaderBound && start<=14 && count>14-start)
         {
             std::memcpy(originalCascadeForward,data+(14-start)*4,sizeof(originalCascadeForward));
+            if(renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
             return setPixelConstants.unsafe_stdcall<HRESULT>(device,14,cascadeForward,1);
         }
         return result;
@@ -424,11 +1980,169 @@ namespace
             if(!ready || !RageDirect3DDevice9::m_pRealDevice) return;
             auto* device=*RageDirect3DDevice9::m_pRealDevice;
             if(!device) return;
-            if(begin && stage==1 && eye==0 && captureNextPair.exchange(false)) {captured=false; lightingProbeMask=0;}
-            renderEye=begin ? eye : -1;
-            renderStage=begin ? stage : 0;
+            if(begin && stage==1 && eye==0)
+            {
+                UpdateCpuOmission();
+                UpdateVertexCallerProbe();
+                UpdateVertexEmissionTest();
+                UpdateRigidInstances(device);
+                UpdateMeshPacketProbe(device);
+                UpdateConstantBatchTest();
+                UpdateModelCommandProbe(device);
+                UpdateGpuBillboards(device);
+                liveMeshMode=liveMeshRequested.exchange(0);
+                if(liveMeshMode && (meshPacketProbe || modelProbeHook || rigidInstances || gpuBillboards || vertexBinderBatchHook || vertexProbeHook || vertexEmissionHook))
+                {liveMeshMode=0;Log("mesh-live-probe unavailable: another experiment is active");}
+                if(liveMeshMode==2)
+                {
+                    auto material=hook::pattern("53 55 8B E9 56 0F B7 5D 1C 33 F6 57 85 DB");
+                    if(material.size()==1)meshPacketMaterialProbe=safetyhook::create_inline(material.get_first(),ObservePacketMaterial);
+                    // Keep CE004373E0/0042C8F0 binding and state-only cleanup
+                    // running. Owned packets restore those states at emission.
+                    // Resource contents are a separate ordering dependency.
+                    ComPtr<IDirect3DVertexBuffer9> vb;ComPtr<IDirect3DIndexBuffer9> ib;ComPtr<IDirect3DTexture9> texture;
+                    if(SUCCEEDED(device->CreateVertexBuffer(128,D3DUSAGE_WRITEONLY,0,D3DPOOL_DEFAULT,&vb,nullptr)) &&
+                        SUCCEEDED(device->CreateIndexBuffer(16,D3DUSAGE_WRITEONLY,D3DFMT_INDEX16,D3DPOOL_DEFAULT,&ib,nullptr)) &&
+                        SUCCEEDED(device->CreateTexture(1,1,1,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&texture,nullptr)))
+                    {
+                        const auto vt=*reinterpret_cast<void***>(vb.Get()),it=*reinterpret_cast<void***>(ib.Get()),tt=*reinterpret_cast<void***>(texture.Get());
+                        liveMeshVBLock=safetyhook::create_inline(vt[11],LockLiveMeshVB);
+                        if(it[11]!=vt[11])liveMeshIBLock=safetyhook::create_inline(it[11],LockLiveMeshIB);
+                        liveMeshTextureLock=safetyhook::create_inline(tt[19],LockLiveMeshTexture);
+                        liveMeshGenerateMips=safetyhook::create_inline(tt[16],GenerateLiveMeshMips);
+                        // A shared VB/IB entry point is already covered by the
+                        // same ABI-compatible VB hook; no duplicate detour.
+                        if(it[11]==vt[11])Log("mesh-live-probe shared VB/IB lock entry");
+                    }
+                    ComPtr<IDirect3DQuery9> query;
+                    if(SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_OCCLUSION,&query)) && query)
+                        meshQueryIssueProbe=safetyhook::create_inline((*reinterpret_cast<void***>(query.Get()))[6],ObserveMeshQueryIssue);
+                    auto** table=*reinterpret_cast<void***>(device);
+                    meshPrimitiveUPProbe=safetyhook::create_inline(table[83],ObserveMeshPrimitiveUP);
+                    meshIndexedUPProbe=safetyhook::create_inline(table[84],ObserveMeshIndexedUP);
+                    liveMeshClear=safetyhook::create_inline(table[43],ClearLiveMesh);
+                    liveMeshUpdateSurface=safetyhook::create_inline(table[30],UpdateLiveMeshSurface);
+                    liveMeshUpdateTexture=safetyhook::create_inline(table[31],UpdateLiveMeshTexture);
+                    liveMeshColorFill=safetyhook::create_inline(table[35],FillLiveMeshColor);
+                    const bool indexLockCovered=ib && vb && (*reinterpret_cast<void***>(ib.Get()))[11]==(*reinterpret_cast<void***>(vb.Get()))[11];
+                    if(!meshPacketMaterialProbe || !liveMeshVBLock || (!liveMeshIBLock && !indexLockCovered) || !liveMeshTextureLock || !liveMeshGenerateMips ||
+                        !liveMeshUpdateSurface || !liveMeshUpdateTexture || !liveMeshColorFill || !meshQueryIssueProbe || !meshPrimitiveUPProbe || !meshIndexedUPProbe || !liveMeshClear)
+                    {liveMeshMode=0;meshPacketMaterialProbe.reset();RemoveLiveMeshResourceHooks();meshQueryIssueProbe.reset();meshPrimitiveUPProbe.reset();meshIndexedUPProbe.reset();liveMeshClear.reset();Log("mesh-live-probe unavailable: required boundary hook missing");}
+                }
+                ConfigureStateHooks(device,VRProfile::StateObservationEnabled());
+                ConfigureDrawHooks(device,!captured || captureNextPair.load() || modelProbeHook || rigidInstances || meshPacketProbe || liveMeshMode==2 || vertexBinderBatchHook || VRProfile::DrawObservationEnabled() || VRProfile::DrawForwardingEnabled());
+            }
+            if(begin && stage==1 && liveMeshMode)
+            {
+                if(liveMeshMode==2)
+                {
+                    try {liveMeshPackets=std::make_unique<VRMeshPacketProbe::Probe>(true,true,false,true);}
+                    catch(const std::bad_alloc&){Log("mesh-live-probe allocation failed; native rendering retained");}
+                }
+                QueryPerformanceCounter(&liveMeshBegin);
+            }
+            if(!begin && stage==1 && liveMeshMode)
+            {
+                FlushLiveMesh(device);
+                LARGE_INTEGER end{},frequency{};QueryPerformanceCounter(&end);QueryPerformanceFrequency(&frequency);
+                char line[320];
+                sprintf_s(line,"mesh-live-probe mode=%s eye=%d gbufferCpuMs=%.6f observed=%u queued=%u emitted=%u batches=%u flushes=%u failures=%u",
+                    liveMeshMode==2 ? "replacement":"native",eye,1000.0*(end.QuadPart-liveMeshBegin.QuadPart)/frequency.QuadPart,
+                    liveMeshPackets ? liveMeshPackets->observed:0,liveMeshPackets ? liveMeshPackets->liveQueued:0,
+                    liveMeshPackets ? liveMeshPackets->liveEmitted:0,liveMeshPackets ? liveMeshPackets->liveBatches:0,
+                    liveMeshPackets ? liveMeshPackets->liveFlushes:0,liveMeshPackets ? liveMeshPackets->failures:0);Log(line);
+                if(liveMeshPackets)
+                {
+                    const double ms=1000.0/frequency.QuadPart;
+                    sprintf_s(line,"mesh-live-probe costs eye=%d collectMs=%.6f stateCaptureMs=%.6f emitMs=%.6f stateApplyMs=%.6f instanceMs=%.6f",
+                        eye,liveMeshPackets->liveCollectTicks*ms,liveMeshPackets->liveStateCaptureTicks*ms,
+                        liveMeshPackets->liveEmitTicks*ms,liveMeshPackets->liveApplyTicks*ms,liveMeshPackets->liveInstanceTicks*ms);Log(line);
+                }
+                liveMeshPackets.reset();
+                if(eye==1)
+                {liveMeshMode=0;meshPacketMaterialProbe.reset();RemoveLiveMeshResourceHooks();meshQueryIssueProbe.reset();meshPrimitiveUPProbe.reset();meshIndexedUPProbe.reset();liveMeshClear.reset();}
+            }
+            if(!begin && stage==1 && eye==0 && meshPacketProbe)
+            {
+                meshPacketProbe->Compare(device,
+                    [device](const auto& code,bool tangent,auto& shader){return AdaptRigidShader(device,code,tangent,shader);},
+                    [device](D3DPRIMITIVETYPE type,INT base,UINT first,UINT vertices,UINT start,UINT primitives)
+                    {return drawIndexedPrimitive.unsafe_stdcall<HRESULT>(device,type,base,first,vertices,start,primitives);},Log,meshCompareOrder);
+                meshPacketProbe.reset();meshPacketShaders.clear();meshPacketMaterialProbe.reset();meshPacketMaterial=0;
+                meshQueryIssueProbe.reset();meshPrimitiveUPProbe.reset();meshIndexedUPProbe.reset();
+            }
+            // Queued markers execute on the render thread, after list building.
+            if(vertexProbeHook)
+            {
+                vertexProbePhase=begin && stage>=1 && stage<=3 ? eye*3+stage-1 : 6;
+                if(vertexProbePhase<6) ++vertexProbeStreams[vertexProbePhase];
+            }
+            static thread_local VRProfile::Stamp commandStart[2]{};
+            if(modelProbeHook)
+            {
+                modelProbePhase=begin && stage>=1 && stage<=3 ? eye*3+stage-1 : 6;
+                if(modelProbePhase<6) ++modelProbeStreams[modelProbePhase];
+            }
+            static thread_local VRProfile::Stamp outsideStart{},interEyeStart{};
+            if(begin && stage==1)
+            {
+                if(!eye) VRProfile::EyeExecutionStarted();
+                VRProfile::End(eye ? VRProfile::Metric::InterEyeGap : VRProfile::Metric::FrameOutsideEyes,
+                    eye ? interEyeStart : outsideStart);
+                routingTime[eye]={};
+            }
+            static thread_local VRProfile::Stamp phaseStart[2][3]{};
+            constexpr VRProfile::Metric phaseMetrics[2][3]{
+                {VRProfile::Metric::Eye0GBuffer,VRProfile::Metric::Eye0Lighting,VRProfile::Metric::Eye0DrawScene},
+                {VRProfile::Metric::Eye1GBuffer,VRProfile::Metric::Eye1Lighting,VRProfile::Metric::Eye1DrawScene}};
+            if(begin && stage>=1 && stage<=3) phaseStart[eye][stage-1]=VRProfile::Begin();
+            if(begin && stage==1)
+            {
+                stateProbeActive=stateHooksReady && VRProfile::StateObservationEnabled();
+                stateProbeEpoch=stateProbeActive ? phaseStart[eye][0].epoch:0;
+                stateProbeOffset=(frame+eye*17)&63;
+                for(auto& counters:stateProbeCounters) counters={};
+            }
+            if(!begin && stage==3)
+            {
+                if(stateProbeActive)
+                    for(unsigned kind=0;kind<static_cast<unsigned>(VRProfile::StateKind::Count);++kind)
+                        VRProfile::StateCalls(eye,static_cast<VRProfile::StateKind>(kind),stateProbeEpoch,stateProbeCounters[kind]);
+                stateProbeActive=false; stateProbeEpoch=0;
+            }
             if(begin)
             {
+                drawProbeActive=drawPrimitive && drawIndexedPrimitive && stage>=1 && stage<=3 && VRProfile::DrawObservationEnabled();
+                drawProbeEpoch=drawProbeActive ? phaseStart[eye][stage-1].epoch:0;
+                drawProbeOffset=(frame+eye*17+stage*7)&63;
+                drawProbeCounters={};
+            }
+            else
+            {
+                if(drawProbeActive) VRProfile::DrawCalls(eye,stage,drawProbeEpoch,drawProbeCounters);
+                drawProbeActive=false; drawProbeEpoch=0;
+            }
+            if(begin && stage==1) commandStart[eye]=VRProfile::Begin();
+            if(stage==1 && begin) GPUTime(device,eye,true);
+            if(stage==3 && !begin) GPUTime(device,eye,false);
+            if(begin && stage==1 && eye==0 && captureNextPair.exchange(false)) {captured=false; lightingProbeMask=0;}
+            if(begin && stage==1 && eye==0 && !captured)
+            {for(auto& keys:normalProbeKeys) keys.clear(); normalProbeShaders.clear();}
+            normalProbeActive=begin && stage==1 && !captured;
+            constantProbeActive=begin && stage>=1 && stage<=3 && VRProfile::ConstantObservationEnabled();
+            routingProbeActive=begin && stage>=1 && stage<=3 && phaseStart[eye][stage-1].epoch!=0;
+            textureCacheBypass=begin && VRProfile::TextureLinearEnabled();
+            if(begin && stage==1) PrepareGBufferMipFilters(device,eye);
+            renderEye=begin ? eye : -1;
+            renderStage=begin ? stage : 0;
+            routingPhaseGeneration=begin && GetCurrentThreadId()==routingThread ?
+                routingGeneration.load(std::memory_order_relaxed) : 0;
+            if(begin)
+            {
+                for(auto& probe:constantProbes[eye])
+                {
+                    if(stage==1) probe.Reset(); else probe.observer.Reset();
+                }
                 std::memcpy(expectedCamera,camera,sizeof(expectedCamera));
                 std::memcpy(cascadeForward,shadowForward,sizeof(cascadeForward));
                 const auto& fov=views[eye].fov;
@@ -438,8 +2152,22 @@ namespace
                 eyeRayConstants[2]=(right+left)*.5f; eyeRayConstants[3]=(up+down)*.5f;
             }
             Rebind(device,renderEye);
+            if(!begin && stage>=1 && stage<=3)
+                VRProfile::End(phaseMetrics[eye][stage-1],phaseStart[eye][stage-1]);
             if(!begin && stage==3)
             {
+                for(unsigned kind=0;kind<2;++kind)
+                {
+                    auto& probe=constantProbes[eye][kind];
+                    VRProfile::ConstantWrites(eye,kind==0,probe.time.epoch,probe.calls,probe.vectors,probe.repeatedCandidates);
+                    const auto metric=kind==0 ? (eye ? VRProfile::Metric::Eye1VertexConstants:VRProfile::Metric::Eye0VertexConstants)
+                        : (eye ? VRProfile::Metric::Eye1PixelConstants:VRProfile::Metric::Eye0PixelConstants);
+                    VRProfile::Flush(metric,probe.time);
+                    probe.Reset();
+                }
+                VRProfile::End(eye ? VRProfile::Metric::Eye1Commands : VRProfile::Metric::Eye0Commands,commandStart[eye]);
+                VRProfile::Flush(eye ? VRProfile::Metric::Eye1Routing : VRProfile::Metric::Eye0Routing,routingTime[eye]);
+                if(eye) outsideStart=VRProfile::Begin(); else interEyeStart=VRProfile::Begin();
                 if(completedFrame!=frame) {completedFrame=frame; completedEyes=0;}
                 completedEyes|=1u<<eye;
                 if(completedEyes==3)
@@ -661,10 +2389,76 @@ namespace
         device->SetViewport(&savedViewport);
     }
 
+    void CaptureLightingInputs(IDirect3DDevice9* device)
+    {
+        // Read already-produced clones. No draw, routing or state mutation.
+        // Keep unsupported formats explicit rather than misinterpreting bytes.
+        for(const auto& target:resources->targets)
+        {
+            if(target.name!="_DEFERRED_GBUFFER_0_" && target.name!="_DEFERRED_GBUFFER_1_" &&
+                target.name!="_DEFERRED_GBUFFER_2_") continue;
+            for(unsigned eye=0;eye<2;++eye)
+            {
+                D3DSURFACE_DESC desc{};
+                if(FAILED(target.surface[eye]->GetDesc(&desc))) continue;
+                char line[200];
+                sprintf_s(line,"lighting input frame=%u eye=%u name=%s format=%u size=%ux%u",
+                    completedFrame,eye,target.name.c_str(),desc.Format,desc.Width,desc.Height); Log(line);
+                if(desc.Format!=D3DFMT_A8R8G8B8 && desc.Format!=D3DFMT_X8R8G8B8 && desc.Format!=D3DFMT_A2R10G10B10)
+                {Log("Lighting input readback skipped: unsupported color encoding"); continue;}
+                ComPtr<IDirect3DSurface9> staging;
+                if(!Check("lighting input staging",device->CreateOffscreenPlainSurface(desc.Width,desc.Height,
+                    desc.Format,D3DPOOL_SYSTEMMEM,&staging,nullptr)) ||
+                    !Check("lighting input readback",device->GetRenderTargetData(target.surface[eye].Get(),staging.Get()))) continue;
+                D3DLOCKED_RECT locked{};
+                if(!Check("lighting input lock",staging->LockRect(&locked,nullptr,D3DLOCK_READONLY))) continue;
+                wchar_t path[MAX_PATH]{};
+                GetModuleFileNameW(nullptr,path,MAX_PATH);
+                auto* name=wcsrchr(path,L'\\'); if(name) name[1]=0;
+                wchar_t suffix[100];
+                const unsigned channel=target.name=="_DEFERRED_GBUFFER_0_" ? 0 : target.name=="_DEFERRED_GBUFFER_1_" ? 1 : 2;
+                swprintf_s(suffix,L"plugins\\GTAIV.VR.gbuffer%u.eye%u.bmp",channel,eye);
+                wcscat_s(path,suffix);
+                FILE* file=nullptr; _wfopen_s(&file,path,L"wb");
+                const unsigned bytes=desc.Width*desc.Height*4;
+                BITMAPFILEHEADER header{}; header.bfType=0x4D42;
+                header.bfOffBits=sizeof(header)+sizeof(BITMAPINFOHEADER); header.bfSize=header.bfOffBits+bytes;
+                BITMAPINFOHEADER info{}; info.biSize=sizeof(info); info.biWidth=desc.Width;
+                info.biHeight=-static_cast<LONG>(desc.Height); info.biPlanes=1; info.biBitCount=32;
+                info.biCompression=BI_RGB; info.biSizeImage=bytes;
+                if(file)
+                {
+                    fwrite(&header,sizeof(header),1,file); fwrite(&info,sizeof(info),1,file);
+                    std::vector<unsigned> row(desc.Width);
+                    for(unsigned y=0;y<desc.Height;++y)
+                    {
+                        const auto* source=static_cast<const unsigned char*>(locked.pBits)+y*locked.Pitch;
+                        if(desc.Format==D3DFMT_A2R10G10B10)
+                        {
+                            for(unsigned x=0;x<desc.Width;++x)
+                            {
+                                unsigned pixel; std::memcpy(&pixel,source+x*4,4);
+                                const unsigned blue=(pixel&1023)*255/1023,green=((pixel>>10)&1023)*255/1023,
+                                    red=((pixel>>20)&1023)*255/1023,alpha=(pixel>>30)*85;
+                                row[x]=blue|(green<<8)|(red<<16)|(alpha<<24);
+                            }
+                            fwrite(row.data(),desc.Width*4,1,file);
+                        }
+                        else fwrite(source,desc.Width*4,1,file);
+                    }
+                    fclose(file);
+                }
+                else Log("Lighting input file could not be created");
+                staging->UnlockRect();
+            }
+        }
+    }
+
     void CaptureEyes(IDirect3DDevice9* device)
     {
         if(captured || completedEyes!=3 || !resources) return;
         captured=true;
+        CaptureLightingInputs(device);
         CaptureDepth(device);
         for(unsigned eye=0;eye<2;++eye)
         {
@@ -715,16 +2509,28 @@ namespace
         // STOPPING/reset is temporary. Retain the completed pair until the
         // session can accept it instead of permanently disabling submission.
         if(!OpenXRVR::CanAcceptEyeImages()) return;
+        VRProfile::Scope profile(VRProfile::Metric::Publish);
         if(mirror && maxFrames!=1)
             mirror=Check("desktop eye mirror",stretch.unsafe_stdcall<HRESULT>(device,
                 resources->finalSurface[0].Get(),nullptr,resources->originalBack.Get(),nullptr,D3DTEXF_NONE));
+        if(OpenXRVR::UsesVulkan())
+        {
+            D3DSURFACE_DESC desc{}; resources->finalSurface[0]->GetDesc(&desc);
+            IDirect3DTexture9* textures[2]{resources->finalTexture[0].Get(),resources->finalTexture[1].Get()};
+            if(OpenXRVR::SetVulkanEyeImages(textures,desc.Width,desc.Height,completedViews,completedPoseTime))
+                publishedFrame=completedFrame;
+            else {Log("Vulkan eye pair publication unavailable; retaining desktop");submit=false;}
+            return;
+        }
         ComPtr<IDirect3DQuery9> query;
+        const auto fenceStart=VRProfile::Begin();
         if(!Check("eye D3D9 event",device->CreateQuery(D3DQUERYTYPE_EVENT,&query)) ||
             !Check("eye D3D9 event issue",query->Issue(D3DISSUE_END))) {submit=false; return;}
         const auto deadline=GetTickCount64()+1000;
         HRESULT status=S_FALSE;
         do {status=query->GetData(nullptr,0,D3DGETDATA_FLUSH); if(status==S_FALSE) Sleep(0);}
         while(status==S_FALSE && GetTickCount64()<deadline);
+        VRProfile::End(VRProfile::Metric::D3D9Fence,fenceStart);
         if(status!=S_OK) {Log("D3D9 eye completion failed; submission disabled"); submit=false; return;}
         D3DSURFACE_DESC desc{};
         resources->finalSurface[0]->GetDesc(&desc);
@@ -762,9 +2568,9 @@ namespace
         }
         auto owned=std::make_unique<Resources>();
         ComPtr<IDirect3DDevice9Ex> ex;
-        if(!Check("live Ex device",device->QueryInterface(__uuidof(IDirect3DDevice9Ex),
-            reinterpret_cast<void**>(ex.GetAddressOf()))) ||
-            !Check("back buffer",device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&owned->originalBack))) return;
+        if(!OpenXRVR::UsesVulkan() && !Check("live Ex device",device->QueryInterface(__uuidof(IDirect3DDevice9Ex),
+            reinterpret_cast<void**>(ex.GetAddressOf())))) return;
+        if(!Check("back buffer",device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&owned->originalBack))) return;
         D3DSURFACE_DESC back{};
         if(!Check("back description",owned->originalBack->GetDesc(&back)) || back.MultiSampleType!=D3DMULTISAMPLE_NONE) return;
         ComPtr<IDirect3DSwapChain9> desktopChain;
@@ -777,7 +2583,7 @@ namespace
         }
         for(unsigned eye=0;eye<2;++eye)
             if(!Check("shared eye color",device->CreateTexture(back.Width,back.Height,1,D3DUSAGE_RENDERTARGET,
-                D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&owned->finalTexture[eye],&owned->shared[eye])) ||
+                D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&owned->finalTexture[eye],OpenXRVR::UsesVulkan() ? nullptr : &owned->shared[eye])) ||
                 !Check("eye color surface",owned->finalTexture[eye]->GetSurfaceLevel(0,&owned->finalSurface[eye]))) return;
         for(const auto& [name,original]:rage::grcTextureFactoryPC::RTCache)
         {
@@ -822,6 +2628,15 @@ namespace
                 [required](const Target& target){return target.name==required;}))
             {Log("Incomplete world target inventory"); return;}
         auto** table=*reinterpret_cast<void***>(device);
+        // Hook the actual rendering device/chain rather than the startup dummy.
+        if(!presentHook) presentHook=safetyhook::create_inline(table[17],DesktopPresent);
+        if(ex)
+        {
+            auto** exTable=*reinterpret_cast<void***>(ex.Get());
+            if(!presentExHook) presentExHook=safetyhook::create_inline(exTable[121],DesktopPresentEx);
+        }
+        if(desktopChain && !swapPresentHook)
+            swapPresentHook=safetyhook::create_inline((*reinterpret_cast<void***>(desktopChain.Get()))[3],DesktopSwapPresent);
         if(!setTarget) setTarget=safetyhook::create_inline(table[37],SetTarget);
         if(!setDepth) setDepth=safetyhook::create_inline(table[39],SetDepth);
         if(!setTexture) setTexture=safetyhook::create_inline(table[65],SetTexture);
@@ -829,15 +2644,17 @@ namespace
         if(!setVertexShader) setVertexShader=safetyhook::create_inline(table[92],SetVertexShader);
         if(!setVertexConstants) setVertexConstants=safetyhook::create_inline(table[94],SetVertexConstants);
         if(!drawPrimitive) drawPrimitive=safetyhook::create_inline(table[81],DrawPrimitive);
+        if(!drawIndexedPrimitive) drawIndexedPrimitive=safetyhook::create_inline(table[82],DrawIndexedPrimitive);
         if(!setPixelShader) setPixelShader=safetyhook::create_inline(table[107],SetPixelShader);
         if(!setPixelConstants) setPixelConstants=safetyhook::create_inline(table[109],SetPixelConstants);
-        if(!setTarget || !setDepth || !setTexture || !stretch || !setVertexShader || !setVertexConstants || !drawPrimitive || !setPixelShader || !setPixelConstants) {Log("Device routing hook unavailable"); return;}
+        if(!setTarget || !setDepth || !setTexture || !stretch || !setVertexShader || !setVertexConstants || !drawPrimitive || !drawIndexedPrimitive || !setPixelShader || !setPixelConstants) {Log("Device routing hook unavailable"); return;}
         char line[160];
         sprintf_s(line,"allocated two eye sets targets=%zu finalColor=%ux%u format=21 shared=%u,%u",
             owned->targets.size(),back.Width,back.Height,owned->shared[0]!=nullptr,owned->shared[1]!=nullptr);
         Log(line);
         resources=owned.release();
         routingThread=GetCurrentThreadId();
+        routingGeneration.fetch_add(1,std::memory_order_relaxed);
         ready=true;
     }
 
@@ -1007,8 +2824,8 @@ namespace
 
     int __fastcall SphereCull(rage::grcViewport* self,void* edx,float x,float y,float z,float radius,float* distance)
     {
-        const int original=sphereCull.unsafe_fastcall<int>(self,edx,x,y,z,radius,distance);
-        if(!ready || !prepared || preparedFrame!=gameFrame) return original;
+        if(!ready || !prepared || preparedFrame!=gameFrame)
+            return sphereCull.unsafe_fastcall<int>(self,edx,x,y,z,radius,distance);
         int owner=-1;
         if(scenePhase && self==reinterpret_cast<rage::grcViewport*>(static_cast<char*>(scenePhase)+0xB0)) owner=0;
         else if(scenePhase && self==reinterpret_cast<rage::grcViewport*>(static_cast<char*>(scenePhase)+0x4A0)) owner=1;
@@ -1024,15 +2841,32 @@ namespace
                     self,self->mViewInverseMatrix[3][0],self->mViewInverseMatrix[3][1],self->mViewInverseMatrix[3][2],scenePhase,worldParent,gameFrame);
                 Log(line);
             }
-            return original;
+            return sphereCull.unsafe_fastcall<int>(self,edx,x,y,z,radius,distance);
         }
         ++sphereQueries[owner];
-        alignas(16) rage::grcViewport visibility=*self;
-        std::memcpy(visibility.mFrustumClipPlanes,visibilityPlanes.data(),sizeof(visibility.mFrustumClipPlanes));
+        const float center[]{x,y,z};
+        const bool fast=sphereClassificationFast && std::isfinite(x) && std::isfinite(y) &&
+            std::isfinite(z) && std::isfinite(radius) && radius>=0;
+        // The original query only writes its optional distance output. The
+        // legacy call/copy is retained as a reversible control and reference.
+        const int original=fast ? 0 : sphereCull.unsafe_fastcall<int>(self,edx,x,y,z,radius,distance);
+        auto classifyNative=[&]()
+        {
+            alignas(16) rage::grcViewport visibility=*self;
+            std::memcpy(visibility.mFrustumClipPlanes,visibilityPlanes.data(),sizeof(visibility.mFrustumClipPlanes));
+            return sphereCull.unsafe_fastcall<int>(&visibility,edx,x,y,z,radius,nullptr);
+        };
         // The CE optional output is plane[0].dot(center)+radius. Plane zero
         // in our world AABB is an X boundary, not the engine's near plane.
         // Keep union visibility separate from the headset near-plane distance.
-        int result=sphereCull.unsafe_fastcall<int>(&visibility,edx,x,y,z,radius,nullptr);
+        int result=fast ? VRMath::ClassifySphere(visibilityPlanes,center,radius) : classifyNative();
+        if(sphereClassificationProbeFrames)
+        {
+            ++sphereClassificationProbeQueries;
+            const int reference=fast ? classifyNative() : result;
+            if(reference!=VRMath::ClassifySphere(visibilityPlanes,center,radius))
+                ++sphereClassificationProbeMismatches;
+        }
         if(distance)
         {
             float nearestVisible=-INFINITY;
@@ -1045,7 +2879,11 @@ namespace
             // CE's output-distance branch returns 1 for any accepted sphere.
             if(result) result=1;
         }
-        if(!original && result) ++sphereCorrections[owner];
+        // Preserve native accepted classifications and near-plane output.
+        // Only narrow entity tests; streaming/portal traversal keeps its broad
+        // bounds, and auxiliary viewports are excluded by the owner checks.
+        if(tightVisibility && result && VRMath::OutsideBothEyes(eyeVisibilityPlanes,center,radius)) result=0;
+        if(!fast && !original && result) ++sphereCorrections[owner];
         return result;
     }
 
@@ -1124,6 +2962,7 @@ namespace
 
     void __fastcall SceneVisibility(void* self,void* edx)
     {
+        VRProfile::Scope profile(VRProfile::Metric::Visibility);
         // CE 0x00D689E0 constructs occlusion from +0xB0 before 0x00AE4880
         // caches position/direction from +0x4A0 for LOD and traversal. This
         // happens before BuildFrame's per-eye viewport replacements.
@@ -1175,6 +3014,13 @@ namespace
         scenePhase=self;
         worldParent=parent;
         prepared=false;
+        sphereClassificationFast=sphereClassificationTest.load(std::memory_order_relaxed);
+        if(sphereClassificationProbeRequested.exchange(false))
+        {
+            sphereClassificationProbeFrames=120;
+            sphereClassificationProbeQueries=sphereClassificationProbeMismatches=0;
+            Log("VR sphere classification probe started; decisions unchanged");
+        }
         if(!ready || (maxFrames && stereoFrames>=maxFrames) || *CTimer::ms_bUserPause || *CTimer::ms_bScriptPause) return;
         if(!OpenXRVR::GetEyeViews(xrViews,viewTime))
         {
@@ -1200,6 +3046,9 @@ namespace
         try {planes=VRMath::UnionBounds(cameras,fov,base->mNearClip,base->mFarClip);}
         catch(const std::exception&) {Log("Invalid union bounds; ordinary frame retained"); return;}
         visibilityPlanes=planes;
+        tightVisibility=visibilityTest.load(std::memory_order_relaxed) && !VRProfile::BroadVisibilityEnabled();
+        for(unsigned eye=0;eye<2;++eye)
+            std::memcpy(eyeVisibilityPlanes[eye].data(),eyeViewports[eye].mFrustumClipPlanes,sizeof(eyeViewports[eye].mFrustumClipPlanes));
         std::memcpy(base->mFrustumClipPlanes,planes.data(),sizeof(base->mFrustumClipPlanes));
         auto* secondary=reinterpret_cast<rage::grcViewport*>(static_cast<char*>(self)+0x4A0);
         std::memcpy(secondary->mFrustumClipPlanes,planes.data(),sizeof(secondary->mFrustumClipPlanes));
@@ -1224,6 +3073,7 @@ namespace
 
     void __fastcall RenderFrame(void* self,void* edx)
     {
+        VRProfile::Scope profile(VRProfile::Metric::FramePrepare);
         setupThisFrame=false;
         lightingPhase=nullptr;
         drawPhase=nullptr;
@@ -1293,11 +3143,19 @@ namespace
                 phaseCount=static_cast<uint16_t>(eyeWorldPhases.size());
             }
             if(stereoFrames==0) Log(eye ? "build eye 1 begin" : "build eye 0 begin");
+            VRProfile::Scope profile(eye ? VRProfile::Metric::Eye1Build : VRProfile::Metric::Eye0Build);
             buildFrame.unsafe_fastcall(self,edx);
             if(stereoFrames==0) Log(eye ? "build eye 1 end" : "build eye 0 end");
         }
         buildingEye=-1;
         buildingStage=0;
+        if(sphereClassificationProbeFrames && --sphereClassificationProbeFrames==0)
+        {
+            char line[240];
+            sprintf_s(line,"VR sphere classification probe complete frames=120 queries=%u mismatches=%u; decisions unchanged",
+                sphereClassificationProbeQueries,sphereClassificationProbeMismatches);
+            Log(line);
+        }
         if(commandPool)
         {
             const auto bytes=commandPool[7];
@@ -1330,7 +3188,7 @@ namespace
             Log(line);
             sprintf_s(line,"VR main-world visibility grid rasterizations=%u",visibilityRasterQueries);
             Log(line);
-            sprintf_s(line,"VR sphere queries scene=%u secondary=%u parent=%u corrected=%u,%u,%u",
+            sprintf_s(line,"VR sphere queries scene=%u secondary=%u parent=%u legacyCorrected=%u,%u,%u",
                 sphereQueries[0],sphereQueries[1],sphereQueries[2],sphereCorrections[0],sphereCorrections[1],sphereCorrections[2]);
             Log(line);
         }
@@ -1339,12 +3197,46 @@ namespace
 
 void VRStereo::Shutdown()
 {
+    cpuOmitRequested=99;cpuOmitMode=0;cpuOmitDeadline=0;cpuOmitHook.reset();
+    liveMeshRequested=0;liveMeshMode=0;liveMeshPackets.reset();liveMeshRenderer=VRRigidInstance::Renderer{};liveMeshClear.reset();RemoveLiveMeshResourceHooks();
+    billboardInstancingRequested=false;
+    StopGpuBillboards();
+    rigidInstancingRequested=false;
+    rigidInstances.reset();
+    meshBenchmarkRequested=false;meshPacketRequested=false;meshOrderRequested=false;meshReplayRequested=false;meshCompareOrder=false;meshPacketProbe.reset();meshPacketShaders.clear();meshPacketMaterialProbe.reset();meshPacketMaterial=0;
+    constantBatchRequested=false;textureBinderBatchBoundary.reset();vertexBinderBatchHook.reset();binderDevice=nullptr;binderEye=-1;binderConstants.Reset();
+    modelProbeRequested=false;
+    FinishModelCommandProbe();
+    vertexProbeRequested=false;
+    FinishVertexCallerProbe();
+    vertexEmissionRequested=false;
+    vertexEmissionHook.reset();
+    routingGeneration.fetch_add(1,std::memory_order_relaxed);
+    routingPhaseGeneration=0;
+    visibilityTest=true;
+    sphereClassificationProbeRequested=false;
+    sphereClassificationProbeFrames=0;
+    sphereClassificationTest=false;
+    sphereClassificationFast=false;
+    normalProbeActive=false;
+    routingProbeActive=false;
+    textureCacheBypass=false;
+    drawPrimitive.reset(); drawIndexedPrimitive.reset();
+    drawProbeActive=false; drawProbeEpoch=0; drawProbeCounters={};
+    stateProbeActive=false; stateProbeEpoch=0;
+    for(auto& counters:stateProbeCounters) counters={};
+    setRenderState.reset(); setSamplerState.reset(); setStreamSource.reset();
+    setIndices.reset(); setVertexDeclaration.reset();
+    stateHooksReady=false; stateHooksFailed=false;
+    for(auto& keys:normalProbeKeys) keys.clear();
+    normalProbeShaders.clear();
     enabled=false;
     ready=false;
     renderEye=-1;
     renderStage=0;
     rayShaderBound=false;
     cascadeShaderBound=false;
+    constantProbeActive=false;
     lightingProbeMask=0;
     completedEyes=0;
     captured=false;
@@ -1370,6 +3262,111 @@ bool VRStereo::RestartLodProbe()
     return true;
 }
 
+bool VRStereo::SetVisibilityTest(bool value)
+{
+    if(value && (!enabled || !ready)) return false;
+    visibilityTest=value;
+    return true;
+}
+
+bool VRStereo::RequestSphereClassificationProbe()
+{
+    if(!enabled || !ready) return false;
+    sphereClassificationProbeRequested=true;
+    return true;
+}
+
+bool VRStereo::SetSphereClassificationTest(bool value)
+{
+    if(value && (!enabled || !ready)) return false;
+    sphereClassificationTest=value;
+    return true;
+}
+
+bool VRStereo::RequestVertexCallerProbe()
+{
+    if(!enabled || !ready) return false;
+    vertexProbeRequested=true;
+    return true;
+}
+
+bool VRStereo::SetVertexEmissionTest(bool value)
+{
+    if(value && (!enabled || !ready)) return false;
+    vertexEmissionRequested=value;
+    return true;
+}
+
+bool VRStereo::SetBillboardInstancingTest(bool value)
+{
+    if(value && (!enabled || !ready)) return false;
+    billboardInstancingRequested=value;
+    return true;
+}
+
+bool VRStereo::SetRigidInstancingTest(bool value)
+{
+    if(value && (!enabled || !ready))return false;
+    rigidInstancingRequested=value;return true;
+}
+
+bool VRStereo::RequestMeshPacketProbe()
+{
+    if(!enabled || !ready)return false;
+    meshPacketRequested=true;return true;
+}
+
+bool VRStereo::RequestMeshOrderProbe()
+{
+    if(!enabled || !ready)return false;
+    meshOrderRequested=true;return true;
+}
+
+bool VRStereo::RequestMeshReplayProbe()
+{
+    if(!enabled || !ready)return false;
+    meshReplayRequested=true;return true;
+}
+
+bool VRStereo::RequestMeshBenchmarkProbe()
+{
+    if(!enabled || !ready)return false;
+    meshBenchmarkRequested=true;return true;
+}
+
+bool VRStereo::RequestLiveMeshProbe(bool replace)
+{
+    if(!enabled || !ready)return false;
+    liveMeshRequested=replace ? 2:1;return true;
+}
+
+bool VRStereo::RequestCpuOmission(unsigned mode)
+{
+    if(mode>6 || (mode && (!enabled || !ready)))return false;
+    cpuOmitRequested=mode;return true;
+}
+
+std::string VRStereo::CpuOmissionStatus()
+{
+    const auto now=GetTickCount64(),deadline=cpuOmitDeadline.load();char line[260];
+    sprintf_s(line,"{\"ok\":true,\"mode\":%u,\"remainingMs\":%llu,\"skipped\":[%llu,%llu],\"upperBoundOnly\":true,\"gpuReplacement\":false}",
+        cpuOmitMode.load(),deadline>now ? deadline-now:0,cpuOmitSkipped[0].load(),cpuOmitSkipped[1].load());
+    return line;
+}
+
+bool VRStereo::SetConstantBatchTest(bool value)
+{
+    if(value && (!enabled || !ready))return false;
+    constantBatchRequested=value;return true;
+}
+
+bool VRStereo::RequestModelCommandProbe()
+{
+    if(!enabled || !ready) return false;
+    modelProbeRequested=true;
+    return true;
+}
+
 std::string VRStereo::Status()
 {
     char line[400];
@@ -1385,7 +3382,7 @@ void VRStereo::Install()
 {
     CIniReader ini("");
     if(!ini.ReadInteger("VR","ExperimentalStereo",0)) return;
-    if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=0)
+    if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=0 && !OpenXRVR::UsesVulkan())
     {Log("Stereo sharing requires system D3D9Ex; DXVK selected, retaining desktop"); return;}
     if(ini.ReadInteger("DEVELOPMENT","ProbeEyeViewport",0) || ini.ReadInteger("DEVELOPMENT","ProbeRenderBindings",0))
     {Log("Disable viewport/binding probes before stereo routing"); return;}
@@ -1529,6 +3526,22 @@ void VRStereo::Install()
             Log("Stereo experiment restarted on game-process callback");
         }
     };
+    // Development-only phase omission: keep markers, command ownership and
+    // auxiliary phase lists. Remove main-eye construction plus its commands.
+    auto omitPhase=[](CBaseDC* phase,unsigned role)
+    {
+        const auto mode=cpuOmitMode.load();
+        if(buildingEye<0 || buildingEye>1 || !ready || !prepared || preparedFrame!=gameFrame)return false;
+        if(phase!=(role==1 ? scenePhase:role==2 ? lightingPhase:drawPhase))return false;
+        const bool omit=mode==6 || (mode==3 && role==1) || (mode==4 && role==3) || (mode==5 && role==2);
+        if(omit)++cpuOmitSkipped[buildingEye];
+        return omit;
+    };
+    // Noncapturing wrappers access the same predicate through a static value.
+    static const auto phasePredicate=omitPhase;
+    CRenderPhaseDeferredLighting_SceneToGBuffer::OmitRenderList=[](CBaseDC* phase){return phasePredicate(phase,1);};
+    CRenderPhaseDeferredLighting_LightsToScreen::OmitRenderList=[](CBaseDC* phase){return phasePredicate(phase,2);};
+    CRenderPhaseDrawScene::OmitRenderList=[](CBaseDC* phase){return phasePredicate(phase,3);};
     CRenderPhaseDeferredLighting_SceneToGBuffer::OnBuildRenderList() += [](){Marker(1,true);};
     CRenderPhaseDeferredLighting_SceneToGBuffer::OnAfterBuildRenderList() += [](){Marker(1,false);};
     CRenderPhaseDeferredLighting_LightsToScreen::OnBuildRenderList() += [](){Marker(2,true);};

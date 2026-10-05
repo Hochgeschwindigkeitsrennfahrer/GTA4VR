@@ -17,3 +17,6 @@
 [submodule "external/openxr-sdk"]
 	path = external/openxr-sdk
 	url = https://github.com/KhronosGroup/OpenXR-SDK-Source.git
+[submodule "external/vulkan-headers"]
+	path = external/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git

@@ -160,6 +160,7 @@ workspace "GTAIV.EFLC.FusionFix"
 project "GTAIV.EFLC.FusionFix"
    targetdir "bin"
    includedirs { "external/openxr-sdk/include" }
+   includedirs { "external/vulkan-headers/include" }
    links { "d3d11.lib", "dxgi.lib", "advapi32.lib" }
 
    local gamedir = envdir("GTAIV_DIR")

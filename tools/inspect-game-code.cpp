@@ -13,30 +13,50 @@
 #include <algorithm>
 
 // Read-only inspection of a bounded live GTAIV code region. Arguments are
-// process ID, Ghidra VA (image base 0x400000), and byte count <= 64 KiB.
+// process ID, analysis VA (image base 0x400000), and byte count <= 64 KiB.
+// An optional module filename allows read-only inspection of a loaded bridge.
 int main(int argc, char** argv)
 {
     const bool scan=argc==4 && !std::strcmp(argv[2],"--pattern");
-    if (argc!=4) { std::fprintf(stderr,"Usage: inspect-game-code PID GhidraVA byteCount | PID --pattern \"AA ? BB\"\n"); return 1; }
+    const bool calls=argc==4 && !std::strcmp(argv[2],"--calls");
+    const bool liveAddress=argc==5 && !std::strcmp(argv[2],"--live");
+    if (argc!=4 && argc!=5) { std::fprintf(stderr,"Usage: inspect-game-code PID AnalysisVA byteCount [module.dll] | PID --pattern \"AA ? BB\" | PID --calls AnalysisVA | PID --live address byteCount\n"); return 1; }
+    const std::string module=argc==5 && !liveAddress ? argv[4] : "GTAIV.exe";
     const auto pid=static_cast<DWORD>(std::strtoul(argv[1],nullptr,0));
-    const auto va=std::strtoull(argv[2],nullptr,0);
-    const auto length=std::strtoul(argv[3],nullptr,0);
-    if (!scan && (va<0x400000 || !length || length>65536)) return 1;
+    const auto va=std::strtoull(argv[liveAddress || calls ? 3 : 2],nullptr,0);
+    const auto length=std::strtoul(argv[liveAddress ? 4 : 3],nullptr,0);
+    if (!scan && !calls && ((!liveAddress && va<0x400000) || !length || length>65536 ||
+        (liveAddress && (va<0x10000 || va+length>0x100000000ull)))) return 1;
     const auto snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
     if (snapshot==INVALID_HANDLE_VALUE) return 2;
     MODULEENTRY32W entry{sizeof(entry)};
     bool found=false;
     if (Module32FirstW(snapshot,&entry)) do {
-        if (!_wcsicmp(entry.szModule,L"GTAIV.exe")) { found=true; break; }
+        const std::wstring moduleWide(module.begin(),module.end());
+        if (!_wcsicmp(entry.szModule,moduleWide.c_str())) { found=true; break; }
     } while(Module32NextW(snapshot,&entry));
     CloseHandle(snapshot);
-    if (!found || (!scan && va-0x400000+length>entry.modBaseSize)) return 3;
+    if (!found || (!scan && !calls && !liveAddress && va-0x400000+length>entry.modBaseSize)) return 3;
+    if(calls && (va<0x400000 || va-0x400000>=entry.modBaseSize)) return 1;
     const auto process=OpenProcess(PROCESS_VM_READ|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
     if (!process) return 4;
-    if(scan)
+    if(liveAddress)
+    {
+        // Inspect only one committed executable region in a process that has
+        // the GTAIV module. No writes, injection or arbitrary execution.
+        MEMORY_BASIC_INFORMATION region{};
+        if(!VirtualQueryEx(process,reinterpret_cast<void*>(va),&region,sizeof(region)) ||
+            region.State!=MEM_COMMIT || (region.Protect&PAGE_GUARD) ||
+            !(region.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) ||
+            va+length>reinterpret_cast<uintptr_t>(region.BaseAddress)+region.RegionSize)
+        {CloseHandle(process);return 7;}
+        std::printf("Live executable region base=%p size=%zu type=%lu protect=%lu (not a Ghidra address)\n",
+            region.BaseAddress,region.RegionSize,region.Type,region.Protect);
+    }
+    if(scan || calls)
     {
         std::vector<int> pattern;
-        std::istringstream input(argv[3]); std::string token;
+        std::istringstream input(calls ? "E8 ? ? ? ?" : argv[3]); std::string token;
         while(input>>token) pattern.push_back(token=="?" || token=="??" ? -1 : std::strtoul(token.c_str(),nullptr,16));
         if(pattern.empty() || pattern.size()>256 || entry.modBaseSize>0x4000000) {CloseHandle(process); return 1;}
         std::vector<unsigned char> memory(entry.modBaseSize);
@@ -51,6 +71,12 @@ int main(int argc, char** argv)
                 bool match=true;
                 for(size_t i=0;i<pattern.size();++i)
                     if(pattern[i]>=0 && memory[start+at+i]!=pattern[i]) {match=false; break;}
+                if(match && calls)
+                {
+                    int32_t displacement{};
+                    std::memcpy(&displacement,memory.data()+start+at+1,sizeof(displacement));
+                    match=static_cast<uint32_t>(0x400000ull+start+at+5+displacement)==va;
+                }
                 if(match)
                 {
                     ++matches;
@@ -60,16 +86,17 @@ int main(int argc, char** argv)
                 }
             }
         }
-        std::printf("moduleBase=%p matches=%u\n",entry.modBaseAddr,matches);
+        std::printf("moduleBase=%p matches=%u%s\n",entry.modBaseAddr,matches,
+            calls ? " (candidate direct calls; validate instruction boundaries and executable code)" : "");
         CloseHandle(process); return 0;
     }
     std::vector<unsigned char> bytes(length);
     SIZE_T read=0;
-    const auto live=entry.modBaseAddr+(va-0x400000);
+    const auto live=liveAddress ? reinterpret_cast<unsigned char*>(va) : entry.modBaseAddr+(va-0x400000);
     const bool ok=ReadProcessMemory(process,live,bytes.data(),length,&read)!=FALSE;
     CloseHandle(process);
     if (!ok || read!=length) return 5;
-    std::printf("PID=%lu moduleBase=%p live=%p GhidraVA=%08llX bytes=%lu\n",pid,entry.modBaseAddr,live,va,length);
+    std::printf("PID=%lu module=%s moduleBase=%p live=%p %s=%08llX bytes=%lu\n",pid,module.c_str(),entry.modBaseAddr,live,liveAddress ? "LiveAddress" : "AnalysisVA",va,length);
     size_t offset=0;
     while(offset<bytes.size())
     {

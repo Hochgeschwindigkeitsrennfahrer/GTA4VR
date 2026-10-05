@@ -356,3 +356,6 @@ GTAIV.EFLC.FusionFix.zip
 GTAIV.EFLC.FusionFixOfflineInstaller.exe
 GTAIV.EFLC.FusionFixWebInstaller.exe
 .env
+
+# Local third-party mod download; preserve locally, never commit the archive.
+/Grass And Procedural Prop Fixes*.zip

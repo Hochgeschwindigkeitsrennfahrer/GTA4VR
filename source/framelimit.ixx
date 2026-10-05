@@ -12,6 +12,7 @@ import comvars;
 import settings;
 import natives;
 import openxrvr;
+import vrprofile;
 
 int32_t nFrameLimitType;
 float fFpsLimit;
@@ -97,8 +98,9 @@ public:
 
         return 0;
     }
-    void Sync()
+    void Sync(VRProfile::Metric metric=VRProfile::Metric::LoadingLimiter)
     {
+        VRProfile::Scope profile(metric);
         if (fFPSLimit <= 0.0f)
             return;
 
@@ -149,13 +151,15 @@ void __cdecl sub_855640()
     // xrWaitFrame on the render thread supplies backpressure while stereo is
     // active. A second wall-clock limiter can fight the runtime's schedule.
     const bool runtimePacing=matchHeadset && OpenXRVR::PacesGameplay();
+    if(runtimePacing)
+        VRProfile::Record(VRProfile::Metric::RuntimePacingBypass,VRProfile::Begin().epoch,0);
 
     if ((CMenuManager::bLoadscreenShown && !*CMenuManager::bLoadscreenShown && !bLoadingShown) || !bUnlockFramerateDuringLoadscreens)
     {
         if (!runtimePacing && preset && *preset >= FusionFixSettings.FpsCaps.eCustom)
         {
             if (fFpsLimit != 0.0f || (*preset > FusionFixSettings.FpsCaps.eCustom && *preset < int32_t(FusionFixSettings.FpsCaps.data.size())))
-                FpsLimiter.Sync();
+                FpsLimiter.Sync(VRProfile::Metric::GameplayLimiter);
         }
     }
 
@@ -164,21 +168,21 @@ void __cdecl sub_855640()
         if (CCutsceneManager::IsRunning())
         {
             if (fCutsceneFpsLimit)
-                CutsceneFpsLimiter.Sync();
+                CutsceneFpsLimiter.Sync(VRProfile::Metric::CutsceneLimiter);
             else if (fScriptCutsceneFpsLimit)
-                ScriptCutsceneFpsLimiter.Sync();
+                ScriptCutsceneFpsLimiter.Sync(VRProfile::Metric::CutsceneLimiter);
 
             // To avoid more softlocks with high fps
             if (!fCutsceneFpsLimit && CCutsceneManager::ms_State)
             {
                 if (*CCutsceneManager::ms_State == 9 || *CCutsceneManager::ms_State == 10)
-                    LoadingFpsLimiter2.Sync();
+                    LoadingFpsLimiter2.Sync(VRProfile::Metric::LoadingSafety60);
             }
         }
     }
 
     if (fMinigamesFpsLimit && Natives::IsMinigameInProgress() && bNeedsToLimitFpsForThisMinigame)
-        MinigamesFpsLimiter.Sync();
+        MinigamesFpsLimiter.Sync(VRProfile::Metric::MinigameLimiter);
 }
 
 injector::hook_back<void(__cdecl*)(void*)> hbsub_C64CB0;

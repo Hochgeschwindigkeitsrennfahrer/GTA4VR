@@ -7,6 +7,8 @@ module;
 #include <cwchar>
 #include <string>
 #include <vector>
+#include <atomic>
+#include "includes/vrdevlocation.hpp"
 
 export module devcontrol;
 
@@ -15,6 +17,8 @@ import comvars;
 import openxrvr;
 import vrstereo;
 import vrcamera;
+import vrprofile;
+import natives;
 
 export namespace DevControl { void Install(); }
 
@@ -32,6 +36,82 @@ namespace
     char input[128]{};
     std::string response;
     HWND quitWindow = nullptr;
+    // RPC runs on EndScene; player natives run only on the simulation callback.
+    SRWLOCK locationLock=SRWLOCK_INIT;
+    enum class LocationOperation { None, Capture, Restore };
+    LocationOperation locationOperation=LocationOperation::None;
+    VRDevLocation::Position locationRequest{},locationResult{};
+    unsigned locationId=0;
+    bool locationBusy=false,locationValid=false;
+    std::atomic<bool> locationQueued{false};
+    const char* locationError="not captured";
+
+    std::string LocationStatus()
+    {
+        char buffer[384];
+        AcquireSRWLockShared(&locationLock);
+        sprintf_s(buffer,"{\"ok\":true,\"id\":%u,\"pending\":%s,\"valid\":%s,\"error\":\"%s\",\"position\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f,\"heading\":%.6f}}",
+            locationId,locationBusy ? "true":"false",locationValid ? "true":"false",locationError,
+            locationResult.x,locationResult.y,locationResult.z,locationResult.heading);
+        ReleaseSRWLockShared(&locationLock);
+        return buffer;
+    }
+    std::string QueueLocation(LocationOperation operation,const VRDevLocation::Position& value={})
+    {
+        AcquireSRWLockExclusive(&locationLock);
+        if(locationBusy)
+        {
+            ReleaseSRWLockExclusive(&locationLock);
+            return "{\"ok\":false,\"error\":\"location operation pending\"}";
+        }
+        ++locationId; locationBusy=true; locationValid=false; locationError="";
+        locationRequest=value; locationOperation=operation;
+        const auto id=locationId;
+        ReleaseSRWLockExclusive(&locationLock);
+        locationQueued.store(true,std::memory_order_release);
+        return "{\"ok\":true,\"accepted\":true,\"id\":"+std::to_string(id)+"}";
+    }
+    void ProcessLocation()
+    {
+        if(!locationQueued.exchange(false,std::memory_order_acquire)) return;
+        AcquireSRWLockExclusive(&locationLock);
+        const auto operation=locationOperation;
+        auto position=locationRequest;
+        locationOperation=LocationOperation::None;
+        ReleaseSRWLockExclusive(&locationLock);
+        if(operation==LocationOperation::None) return;
+        Ped ped=0;
+        const char* error="";
+        if(!CTimer::ms_bUserPause || !CTimer::ms_bScriptPause ||
+            *CTimer::ms_bUserPause || *CTimer::ms_bScriptPause ||
+            !Natives::IsPlayerPlaying(Natives::GetPlayerId()) || Natives::GetMissionFlag() ||
+            (Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished()))
+            error="requires unpaused free roam";
+        else
+        {
+            Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+            if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharDead(ped) ||
+                Natives::IsCharInAnyCar(ped) || Natives::IsCharInAir(ped))
+                error="requires a living grounded player on foot";
+            else
+            {
+                if(operation==LocationOperation::Restore)
+                {
+                    Natives::RequestCollisionAtPosn(position.x,position.y,position.z);
+                    Natives::SetCharCoordinatesNoOffset(ped,position.x,position.y,position.z);
+                    Natives::SetCharHeading(ped,position.heading);
+                    VRCamera::Recenter();
+                }
+                Natives::GetCharCoordinates(ped,&position.x,&position.y,&position.z);
+                Natives::GetCharHeading(ped,&position.heading);
+                if(!VRDevLocation::Valid(position)) error="invalid native position";
+            }
+        }
+        AcquireSRWLockExclusive(&locationLock);
+        if(!*error) locationResult=position;
+        locationError=error; locationValid=!*error; locationBusy=false;
+        ReleaseSRWLockExclusive(&locationLock);
+    }
 
     void Prepare(Stage next)
     {
@@ -92,9 +172,28 @@ namespace
                 std::to_string(GetCurrentProcessId()) + ",\"openxr\":" +
                 OpenXRVR::Status() + ",\"stereo\":" + VRStereo::Status() + "}";
         }
+        else if(command=="profile-start" || command=="profile-start-cpu" || command=="profile-start-cpu-noflush" || command=="profile-start-cpu-noao" || command=="profile-start-cpu-constants" || command=="profile-start-cpu-draws" || command=="profile-start-cpu-states" || command=="profile-start-cpu-drawforwarding" || command=="profile-start-cpu-texturelinear" || command=="profile-start-cpu-broadvisibility" || command.rfind("profile-states ",0)==0 || command.rfind("profile-draws ",0)==0 || command=="profile-stop" || command=="profile-status" || command=="profile-constants" || command.rfind("profile-metric ",0)==0)
+        {
+            response=VRProfile::Command(command);
+        }
+        else if(command=="producer-test-status")response=OpenXRVR::ProducerTestStatus();
+        else if(command=="producer-test on" || command=="producer-test off")
+        {
+            response=OpenXRVR::RequestProducerTest(command=="producer-test on") ?
+                "{\"ok\":true,\"accepted\":true,\"automaticTimeoutSeconds\":15,\"cachedPose\":true}" : "{\"ok\":false,\"error\":\"Vulkan stereo session unavailable\"}";
+        }
         else if(command=="input-status")
         {
             response="{\"ok\":true,\"input\":"+OpenXRVR::InputStatus()+"}";
+        }
+        else if(command=="location-status") response=LocationStatus();
+        else if(command=="location-capture") response=QueueLocation(LocationOperation::Capture);
+        else if(command.rfind("location-restore ",0)==0)
+        {
+            VRDevLocation::Position value;
+            response=VRDevLocation::Parse(std::string_view(command).substr(17),value)
+                ? QueueLocation(LocationOperation::Restore,value)
+                : "{\"ok\":false,\"error\":\"expected bounded finite x y z heading\"}";
         }
         else if(command=="movement-status")
         {
@@ -103,6 +202,90 @@ namespace
         else if(command=="aim-status")
         {
             response="{\"ok\":true,\"aim\":"+VRCamera::AimStatus()+"}";
+        }
+        else if(command=="visibility-test on" || command=="visibility-test off")
+        {
+            const bool value=command=="visibility-test on";
+            response=VRStereo::SetVisibilityTest(value) ?
+                std::string("{\"ok\":true,\"accepted\":true,\"tightVisibility\":")+(value ? "true}" : "false}") :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="sphere-classification-test on" || command=="sphere-classification-test off")
+        {
+            const bool value=command=="sphere-classification-test on";
+            response=VRStereo::SetSphereClassificationTest(value) ?
+                std::string("{\"ok\":true,\"accepted\":true,\"fastClassification\":")+(value ? "true}" : "false}") :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="sphere-classification-probe")
+        {
+            response=VRStereo::RequestSphereClassificationProbe() ?
+                "{\"ok\":true,\"accepted\":true,\"decisionsChanged\":false}" :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="vertex-emission-test on" || command=="vertex-emission-test off")
+        {
+            const bool value=command=="vertex-emission-test on";
+            response=VRStereo::SetVertexEmissionTest(value) ?
+                std::string("{\"ok\":true,\"accepted\":true,\"replacementRequested\":")+(value ? "true}" : "false}") :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="billboard-instancing-test on" || command=="billboard-instancing-test off")
+        {
+            const bool value=command=="billboard-instancing-test on";
+            response=VRStereo::SetBillboardInstancingTest(value) ?
+                std::string("{\"ok\":true,\"accepted\":true,\"replacementRequested\":")+(value ? "true}" : "false}") :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="rigid-instancing-test on" || command=="rigid-instancing-test off")
+        {
+            const bool value=command=="rigid-instancing-test on";
+            response=VRStereo::SetRigidInstancingTest(value) ?
+                std::string("{\"ok\":true,\"accepted\":true,\"replacementRequested\":")+(value ? "true}" : "false}") :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="constant-batch-test on" || command=="constant-batch-test off")
+        {
+            const bool value=command=="constant-batch-test on";
+            response=VRStereo::SetConstantBatchTest(value) ?
+                std::string("{\"ok\":true,\"accepted\":true,\"batchRequested\":")+(value ? "true}" : "false}") :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="cpu-omit-status")response=VRStereo::CpuOmissionStatus();
+        else if(command=="cpu-omit-test off" || command=="cpu-omit-test materials" || command=="cpu-omit-test models" ||
+            command=="cpu-omit-test gbuffer" || command=="cpu-omit-test scene" || command=="cpu-omit-test lighting" || command=="cpu-omit-test eyes")
+        {
+            const unsigned mode=command=="cpu-omit-test models" ? 2:command=="cpu-omit-test materials" ? 1:
+                command=="cpu-omit-test gbuffer" ? 3:command=="cpu-omit-test scene" ? 4:
+                command=="cpu-omit-test lighting" ? 5:command=="cpu-omit-test eyes" ? 6:0;
+            response=VRStereo::RequestCpuOmission(mode) ?
+                "{\"ok\":true,\"accepted\":true,\"upperBoundOnly\":true,\"gpuReplacement\":false,\"automaticTimeoutSeconds\":90}" :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="mesh-live-probe" || command=="mesh-native-probe")
+        {
+            response=VRStereo::RequestLiveMeshProbe(command=="mesh-live-probe") ?
+                "{\"ok\":true,\"accepted\":true,\"scratchOnly\":false,\"eyePairs\":1}" :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="mesh-packet-probe" || command=="mesh-order-probe" || command=="mesh-replay-probe" || command=="mesh-benchmark-probe")
+        {
+            const bool accepted=command=="mesh-benchmark-probe" ? VRStereo::RequestMeshBenchmarkProbe():
+                command=="mesh-replay-probe" ? VRStereo::RequestMeshReplayProbe():
+                command=="mesh-order-probe" ? VRStereo::RequestMeshOrderProbe():VRStereo::RequestMeshPacketProbe();
+            response=accepted ? "{\"ok\":true,\"accepted\":true,\"scratchOnly\":true}" :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="model-command-probe")
+        {
+            response=VRStereo::RequestModelCommandProbe() ? "{\"ok\":true,\"command\":\"model-command-probe\",\"accepted\":true}" :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
+        }
+        else if(command=="vertex-caller-probe")
+        {
+            response=VRStereo::RequestVertexCallerProbe() ?
+                "{\"ok\":true,\"accepted\":true,\"countsOnly\":true,\"durationSeconds\":5}" :
+                "{\"ok\":false,\"error\":\"stereo not ready\"}";
         }
         else if(command=="stereo-test")
         {
@@ -211,6 +394,7 @@ void DevControl::Install()
     ioEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!ioEvent) { CloseHandle(pipe); pipe = INVALID_HANDLE_VALUE; return; }
     Connect();
+    FusionFix::onGameProcessEvent() += ProcessLocation;
     FusionFix::onEndScene() += []() { Pump(); };
     FusionFix::onShutdownEvent() += []()
     {

@@ -1,0 +1,49 @@
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 9b72bb2..a5e1a1c 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -3859,8 +3859,15 @@ namespace dxvk {
+     // Don't unbind the buffer if the game sets a nullptr here.
+     // Operation Flashpoint Red River breaks if we do that.
+     // EndScene will clean it up if necessary.
+-    if (buffer != nullptr)
+-      BindIndices();
++    if (buffer != nullptr) {
++      // GTA4VR #013: PrepareDraw already binds a dirty index buffer before
++      // UploadIBO draws. Retain the API-state reference here, but omit queued
++      // bindings overwritten before that draw. UP draws own their binding.
++      if (m_d3d9Options.experimentalDeferIndexBindings)
++        m_dirty.set(D3D9DeviceDirtyFlag::IndexBuffer);
++      else
++        BindIndices();
++    }
+ 
+     return D3D_OK;
+   }
+diff --git a/src/d3d9/d3d9_options.cpp b/src/d3d9/d3d9_options.cpp
+index e46864e..f31df91 100644
+--- a/src/d3d9/d3d9_options.cpp
++++ b/src/d3d9/d3d9_options.cpp
+@@ -49,6 +49,7 @@ namespace dxvk {
+     this->dpiAware                      = config.getOption<bool>        ("d3d9.dpiAware",                      true);
+     this->lenientClear                  = config.getOption<bool>        ("d3d9.lenientClear",                  false);
+     this->deferSurfaceCreation          = config.getOption<bool>        ("d3d9.deferSurfaceCreation",          false);
++    this->experimentalDeferIndexBindings = config.getOption<bool>       ("d3d9.experimentalDeferIndexBindings", false);
+     this->samplerAnisotropy             = config.getOption<int32_t>     ("d3d9.samplerAnisotropy",             -1);
+     this->maxAvailableMemory            = config.getOption<int32_t>     ("d3d9.maxAvailableMemory",            4096);
+     this->supportCubeDepthFormats       = config.getOption<bool>        ("d3d9.supportCubeDepthFormats",       false);
+diff --git a/src/d3d9/d3d9_options.h b/src/d3d9/d3d9_options.h
+index e69a39a..f323277 100644
+--- a/src/d3d9/d3d9_options.h
++++ b/src/d3d9/d3d9_options.h
+@@ -58,6 +58,10 @@ namespace dxvk {
+     /// Defer surface creation
+     bool deferSurfaceCreation;
+ 
++    /// GTA4VR #013 experiment: coalesce index bindings until an indexed draw.
++    /// Off by default; does not alter API-state references or device locking.
++    bool experimentalDeferIndexBindings;
++
+     /// Anisotropic filter override
+     ///
+     /// Enforces anisotropic filtering with the

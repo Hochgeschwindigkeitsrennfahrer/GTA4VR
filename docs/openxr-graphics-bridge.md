@@ -23,10 +23,22 @@ Choose D3D9Ex/D3D11 for the first headset image because its required x86 OpenXR 
 
 ## Integration gates
 
+### Revisit for performance (#013, 2026-10-04)
+
+The user proposes testing the graphics-menu Vulkan option after native CPU sampling found substantial D3D9/driver cost. Source `source/settings.ixx` writes `[MAIN] API` in `d3d9.cfg`; `source/d3d9/d3d9.cpp` loads the supplied `vulkan.dll` when API is nonzero. This is FusionFix's selectable D3D9 translation backend, not a native GTA IV Vulkan renderer. The game still builds D3D9 commands. The measured D3D9 CPU share includes scene rendering/state updates, so it must not all be labeled VR transfer overhead.
+
+Current upstream DXVK exposes [D3D9 Vulkan interop interfaces](https://github.com/doitsujin/dxvk/blob/master/src/d3d9/d3d9_interfaces.h) for instance/device/queue handles, backing texture images, layout transitions, rendering flush and queue ownership. This offers a concrete route to investigate without initially depending on private DXVK object layouts. Availability and ABI must be verified against the installed x86 DXVK build. An OpenXR Vulkan session must use a compatible instance/device/queue and required extensions; support on this machine remains untested. The current D3D9Ex/D3D11 bridge is guarded off when DXVK is selected, after #006 observed a Vulkan startup crash and unsuccessful shared-texture interop. That earlier failure does not rule out a purpose-built Vulkan path.
+
+Recommended spike: establish a warmed flat-screen backend comparison first, then query interop and runtime support, then test same-device Vulkan copies into acquired OpenXR eye images with explicit layout/queue synchronization. Direct rendering into imported OpenXR images can be investigated later; do not assume zero-copy or a performance gain. Preserve D3D9Ex as the working backend until reset, lifecycle, stereo/shadow correctness and Release frame-time comparisons pass.
+
 1. In #005, load the x86 OpenXR loader only when VR is enabled. If no loader, runtime, HMD, D3D11 extension, compatible LUID, or required format exists, log the specific failure, release partial objects, and continue flat-screen. Do not create a second D3D11 device on the wrong adapter. Request API 1.0 initially and negotiate newer versions separately.
 2. Before #006 transfers a game image, identify whether GTA IV's actual D3D9 device is Ex and whether the scene color target can be rendered or copied into a shareable D3D9Ex target. If it cannot, investigate an Ex-compatible game-device path or a measured fallback; do not silently assume the standalone probe's device is equivalent. Verify color-space conversion when copying UNORM source into the runtime's sRGB/typeless target.
 3. For #006, tie D3D9 completion and D3D11 copy/submission to explicit per-image ownership. Test both eyes' color and depth isolation, device reset, swapchain recreation, runtime loss, alt-tab, and flat-screen operation. Measure copy and synchronization time under an actual game frame before making performance claims. A copied flat frame alone is not stereo VR.
 
 ## Reproduction
+
+### Vulkan feasibility update (2026-10-04)
+
+The standalone x86 DXVK v3.1.1 discovery probe retrieves device/texture Vulkan handles and creates a SteamVR OpenXR session and swapchain on the same device. Preloading SteamVR's x86 OpenVR library before DXVK factory creation supplies required Vulkan instance extensions; plain initialization failed runtime GPU discovery. Repeated production-copier pixel checks now pass in Debug/Release. The opt-in game prototype renders continuous stereo, confirmed by the user after correcting missing queue synchronization around OpenXR calls; explicit shutdown released the runtime and GTAIV exited. This supersedes the earlier untested-session statement above. Performance, reset and failure/fallback comparisons remain pending; retain the supported D3D9Ex/D3D11 default. See [full findings and decision gates](vulkan-openxr-feasibility.md).
 
 The tracked, standalone sources and build instructions are in [`tools/bridge-probe/`](../tools/bridge-probe/README.md). They do not load or modify the game. The SDK checkout, compiled loader, executables, and logs stay under ignored `build/`.

@@ -141,6 +141,30 @@ namespace VRMath
         }
     };
 
+    // CE 00431F09..00431F7C, null-distance branch. Preserve the ordered
+    // float additions and compare the expanded distance (not an algebraic
+    // side<0 shortcut, which can differ at a rounded boundary).
+#ifdef _MSC_VER
+#pragma float_control(precise,on,push)
+#endif
+    inline int ClassifySphere(const std::array<Vector,6>& planes,const float* center,float radius)
+    {
+        int result=2;
+        for(const auto& plane:planes)
+        {
+            const float xy=plane[0]*center[0]+plane[1]*center[1];
+            const float xyz=xy+plane[2]*center[2];
+            const float side=xyz+plane[3];
+            const float expanded=side+radius;
+            if(0.f>expanded) return 0;
+            if(radius>expanded) result=1;
+        }
+        return result;
+    }
+#ifdef _MSC_VER
+#pragma float_control(pop)
+#endif
+
     // A sphere is excluded only when wholly outside a normalized plane.
     inline bool SphereOutside(const std::array<Vector,6>& planes, const float* center, float radius)
     {
@@ -152,6 +176,15 @@ namespace VRMath
             if(distance < -radius) return true;
         }
         return false;
+    }
+
+    // Keep boundary-crossing bounds for either eye. Invalid input is retained
+    // by SphereOutside; the extra skin avoids precision-driven edge popping.
+    inline bool OutsideBothEyes(const std::array<Vector,6> (&eyes)[2],const float* center,float radius)
+    {
+        if(!std::isfinite(radius) || radius<0) return false;
+        return SphereOutside(eyes[0],center,radius+.01f) &&
+            SphereOutside(eyes[1],center,radius+.01f);
     }
 
     inline Matrix Identity()

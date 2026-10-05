@@ -2478,6 +2478,7 @@ export namespace RageDirect3DDevice9
 export class CRenderPhaseDeferredLighting_SceneToGBuffer
 {
 public:
+    static inline bool (*OmitRenderList)(CBaseDC*) = nullptr;
     static FusionFix::Event<>& OnBuildRenderList()
     {
         static FusionFix::Event<> BuildRenderListEvent;
@@ -2493,7 +2494,7 @@ public:
     static void __fastcall BuildRenderList(CBaseDC* _this, void* edx)
     {
         OnBuildRenderList().executeAll();
-        shBuildRenderList.fastcall<void*>(_this, edx);
+        if (!OmitRenderList || !OmitRenderList(_this)) shBuildRenderList.fastcall<void*>(_this, edx);
         OnAfterBuildRenderList().executeAll();
     }
 };
@@ -2501,6 +2502,7 @@ public:
 export class CRenderPhaseDeferredLighting_LightsToScreen
 {
 public:
+    static inline bool (*OmitRenderList)(CBaseDC*) = nullptr;
     static FusionFix::Event<>& OnBuildRenderList()
     {
         static FusionFix::Event<> BuildRenderListEvent;
@@ -2523,7 +2525,7 @@ public:
     static void __fastcall BuildRenderList(CBaseDC* _this, void* edx)
     {
         OnBuildRenderList().executeAll();
-        shBuildRenderList.unsafe_fastcall(_this, edx);
+        if (!OmitRenderList || !OmitRenderList(_this)) shBuildRenderList.unsafe_fastcall(_this, edx);
         OnAfterBuildRenderList().executeAll();
     }
 
@@ -2538,6 +2540,7 @@ public:
 export class CRenderPhaseDrawScene
 {
 public:
+    static inline bool (*OmitRenderList)(CBaseDC*) = nullptr;
     static FusionFix::Event<>& OnBuildRenderList()
     {
         static FusionFix::Event<> BuildRenderListEvent;
@@ -2553,7 +2556,7 @@ public:
     static void __fastcall BuildRenderList(CBaseDC* _this, void* edx)
     {
         OnBuildRenderList().executeAll();
-        shBuildRenderList.fastcall<void*>(_this, edx);
+        if (!OmitRenderList || !OmitRenderList(_this)) shBuildRenderList.fastcall<void*>(_this, edx);
         OnAfterBuildRenderList().executeAll();
     }
 };

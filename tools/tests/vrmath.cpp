@@ -266,5 +266,26 @@ int main()
     if(VRMath::SphereOutside(rearBounds,behind,.2f) ||
         !VRMath::SphereOutside(rearBounds,inFront,.2f) ||
         VRMath::SphereOutside(rearBounds,boundary,.1f)) return 1;
-    std::puts("VR math: clip corners, pose inverse, game matrix/plane regression, conservative union and rear-view spheres passed");
+    std::array<VRMath::Vector,6> exactEyes[2];
+    for(unsigned eye=0;eye<2;++eye)
+        exactEyes[eye]=VRMath::Planes(VRMath::Multiply(VRMath::InverseRigid(rearCameras[eye]),VRMath::Projection(fov,.05f,10)));
+    if(VRMath::OutsideBothEyes(exactEyes,behind,.2f) ||
+        !VRMath::OutsideBothEyes(exactEyes,inFront,.2f) ||
+        VRMath::OutsideBothEyes(exactEyes,boundary,.1f) ||
+        VRMath::OutsideBothEyes(exactEyes,nullptr,.2f) ||
+        VRMath::OutsideBothEyes(exactEyes,inFront,-.005f)) return 1;
+    // Visibility in just one eye must survive union rejection.
+    exactEyes[0]=rearBounds;
+    exactEyes[1]=VRMath::UnionBounds(cameras,eyeFov,.05f,1500);
+    if(VRMath::OutsideBothEyes(exactEyes,behind,.2f)) return 1;
+    // Independently expected native classifications in a unit box: wholly
+    // outside=0, center outside but sphere intersects=1, center inside=2.
+    const std::array<VRMath::Vector,6> box{{{1,0,0,1},{-1,0,0,1},
+        {0,1,0,1},{0,-1,0,1},{0,0,1,1},{0,0,-1,1}}};
+    const float inside[]{0,0,0}, crossing[]{1.1f,0,0}, touching[]{1.25f,0,0}, outside[]{1.251f,0,0};
+    if(VRMath::ClassifySphere(box,inside,.25f)!=2 ||
+        VRMath::ClassifySphere(box,crossing,.25f)!=1 ||
+        VRMath::ClassifySphere(box,touching,.25f)!=1 ||
+        VRMath::ClassifySphere(box,outside,.25f)!=0) return 1;
+    std::puts("VR math: camera/plane regressions, conservative union, exact eye spheres and native sphere classifications passed");
 }
