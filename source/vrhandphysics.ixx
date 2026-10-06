@@ -22,7 +22,7 @@ export namespace VRHandPhysics
 
 namespace
 {
-    SafetyHookInline pairHook{};
+    SafetyHookInline pairHook{},queryHook{};
     bool enabled=false;
     std::atomic<bool> failed=false;
     uint32_t model=0;
@@ -35,6 +35,7 @@ namespace
     std::atomic<void*> instances[2][VRHandPhysics::NodeCount]{};
     std::atomic<void*> player=nullptr,weapon=nullptr;
     std::atomic<unsigned> created=0,removed=0,active=0,updates=0,excludedPairs=0,recoveries=0,limitedDrives=0;
+    std::atomic<unsigned> excludedQueries=0;
     float armForce=250.f,recoveryDistance=.75f;
     constexpr float NodeMass=.15f,Stiffness=400.f,Damping=12.f;
     std::atomic<float> maxError=0;
@@ -73,6 +74,17 @@ namespace
             {++excludedPairs; return false;}
         }
         return pairHook.thiscall<bool>(self,other);
+    }
+
+    bool __fastcall QueryBound(void* query,void*,void* bound,void* instance)
+    {
+        // CE 73B7D0 is the scene-query narrowphase, not the contact solver.
+        // Invisible owned limb objects must not become obstacles for room-scale
+        // sweeps or native pedestrian/vehicle-entry placement queries. Reject
+        // the candidate BEFORE writing any hit, so the query still finds walls
+        // and props behind it. Physical prop contacts retain CanCollide above.
+        if(IsProxy(instance)) {++excludedQueries; return false;}
+        return queryHook.thiscall<bool>(query,bound,instance);
     }
 
     void ClearHand(unsigned hand)
@@ -132,6 +144,7 @@ namespace
         Ped ped=0; Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
         if(failed || !pose.owner || pose.owner!=FindPlayerPed(0) || !OpenXRVR::HasFocusedViews() ||
             !ped || Natives::IsCharDead(ped) || Natives::IsCharInAnyCar(ped) ||
+            Natives::IsCharGettingInToACar(ped) ||
             !pose.at[0] || !pose.at[1] || now-pose.at[0]>100 || now-pose.at[1]>100)
         {if(currentOwner || active.load()) Clear(); return;}
         if(currentOwner && currentOwner!=pose.owner) Clear();
@@ -226,9 +239,9 @@ bool VRHandPhysics::Resolve(void* owner,unsigned hand,VRMath::Matrix& wrist)
 
 std::string VRHandPhysics::Status()
 {
-    char value[420];
-    sprintf_s(value,"{\"enabled\":%s,\"ready\":%s,\"failed\":%s,\"activeShapes\":%u,\"created\":%u,\"removed\":%u,\"updates\":%u,\"excludedPairs\":%u,\"maxTargetError\":%.4f,\"armForceLimit\":%.1f,\"recoveryDistance\":%.2f,\"recoveries\":%u,\"limitedDrives\":%u}",
-        enabled ? "true":"false",pairHook ? "true":"false",failed ? "true":"false",active.load(),created.load(),removed.load(),updates.load(),excludedPairs.load(),maxError.load(),armForce,recoveryDistance,recoveries.load(),limitedDrives.load());
+    char value[460];
+    sprintf_s(value,"{\"enabled\":%s,\"ready\":%s,\"failed\":%s,\"activeShapes\":%u,\"created\":%u,\"removed\":%u,\"updates\":%u,\"excludedPairs\":%u,\"excludedQueries\":%u,\"maxTargetError\":%.4f,\"armForceLimit\":%.1f,\"recoveryDistance\":%.2f,\"recoveries\":%u,\"limitedDrives\":%u}",
+        enabled ? "true":"false",(pairHook && queryHook) ? "true":"false",failed ? "true":"false",active.load(),created.load(),removed.load(),updates.load(),excludedPairs.load(),excludedQueries.load(),maxError.load(),armForce,recoveryDistance,recoveries.load(),limitedDrives.load());
     return value;
 }
 
@@ -243,9 +256,15 @@ void VRHandPhysics::Install()
     armForce=std::clamp(armForce,25.f,1000.f);
     recoveryDistance=std::clamp(recoveryDistance,.4f,1.5f);
     auto filter=hook::pattern("53 8B D9 B8 00 01 00 00 66 85 43 0A 74 06 32 C0 5B C2 04 00");
-    if(filter.size()!=1) {failed=true; return;}
+    // Resolve from the dispatcher call: several narrowphase variants share
+    // the same prologue, so that prologue alone is not a unique signature.
+    auto query=hook::pattern("F3 0F 11 47 70 F3 0F 11 57 74 F3 0F 11 5F 78 8B 46 04 FF 70 0C E8 ? ? ? ? 84 C0 74 11 6A 00 8D 46 10 50 8B CF");
+    if(filter.size()!=1 || query.size()!=1) {failed=true; return;}
     pairHook=safetyhook::create_inline(filter.get_first(),CanCollide);
     if(!pairHook) {failed=true; return;}
+    auto queryTarget=injector::GetBranchDestination(query.get_first(21)).as_int();
+    queryHook=safetyhook::create_inline(reinterpret_cast<void*>(queryTarget),QueryBound);
+    if(!queryHook) {pairHook.reset(); failed=true; return;}
     enabled=true;
     FusionFix::onGameProcessEvent() += Process;
 }
