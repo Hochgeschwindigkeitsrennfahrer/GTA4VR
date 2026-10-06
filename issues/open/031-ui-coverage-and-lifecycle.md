@@ -6,7 +6,8 @@ Extend and validate the accepted UI foundation from [#020](../closed/020-vr-over
 
 ## Tasks
 
-- [ ] Inventory uncaptured or poorly placed notifications, mission timers/counters, ammo/weapon feedback and phone/call UI. Attribute unmatched pixels/draw paths and transition ordering, recording camera/target ownership and reproducible evidence. Reuse closed #007 findings; physical phone draw/interaction mapping belongs to #022.
+- [ ] Inventory uncaptured or poorly placed notifications, mission timers/counters, ammo/weapon feedback and phone/call UI. Attribute unmatched pixels/draw paths and transition ordering, recording camera/target ownership and reproducible evidence. Reuse closed #007 and #022 phone mapping findings.
+- [ ] Validate the accepted native phone controls through receiving/placing calls, messages, contacts, required mission progression and native stow behavior; check phone/HUD separation alongside subtitles, flat-screen and runtime fallback. Record GTA IV/TLAD/TBoGT coverage separately. Include mouse/gamepad device switching in regression checks. Transferred from closed #022; these broader routes are not claimed complete.
 - [ ] Verify subtitles/help/mission feedback during dialogue and representative missions, including driving, death/cutscenes, loading and pause transitions. Record actual coverage rather than assuming all font/sprite calls are sufficient.
 - [ ] Verify unread-SMS envelope appearance, flashing and disappearance after reading; distinguish SMS from missed-call/phone notifications. The native texture signature resolves, but an active SMS capture was not observed in the final saved-game runs.
 - [ ] Test UI resource recreation on a real resolution/device reset, runtime loss/recovery and headset/controller tracking recovery; verify normal desktop UI after fallback.

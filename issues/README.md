@@ -35,7 +35,7 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [019 — VR vehicle interaction and driving](open/019-vr-vehicles.md)
 - [020 — VR minimap, subtitles and gameplay overlays (closed)](closed/020-vr-overlays-and-subtitles.md)
 - [021 — VR weapon wheel](open/021-vr-weapon-wheel.md)
-- [022 — Physical interactive in-world phone](open/022-physical-interactive-phone.md)
+- [022 — Physical interactive in-world phone (closed)](closed/022-physical-interactive-phone.md)
 - [023 — Fix world objective markers visible only in the left eye](open/023-objective-markers-both-eyes.md)
 - [024 — Firearm coverage and physical weapon reloading](open/024-physical-weapon-reloading.md)
 - [025 — Physics-based money and weapon drops](open/025-physical-money-and-weapon-drops.md)

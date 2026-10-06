@@ -1,6 +1,7 @@
 module;
 #include <common.hxx>
 #include "includes/vrmath.hpp"
+#include "includes/vrphoneinput.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -46,6 +47,10 @@ namespace
     bool previousJump=false,previousEnter=false,previousHandbrake=false,previousRun=false;
     bool buttonsArmed=false;
     std::atomic<unsigned> padButtonUpdates{0},padJumpPresses{0},padEnterPresses{0},padDrivingUpdates{0};
+    std::atomic<unsigned> phoneDelivered[6]{};
+    SafetyHookInline phoneRawPressed{},phoneRawJustPressed{};
+    std::atomic<unsigned> phoneRawDown{0},phoneRawRising{0},phoneRawQueries{0},phoneRawMatches{0};
+    std::atomic<uint64_t> phoneRawSampledAt{0};
     std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
     float firstPersonForwardOffset=.08f;
     std::atomic<bool> firstPersonActive{false};
@@ -532,6 +537,35 @@ namespace
         ordinaryWalk.unsafe_fastcall<void>(task,edx,owner);
     }
 
+    unsigned PhoneRawButton(unsigned pad,unsigned button,bool rising)
+    {
+        // Script IS_BUTTON_* uses the raw gamepad table, independently of the
+        // semantic CPad controls used in keyboard mode. Keep native input and
+        // device ownership intact; supplement only local phone button queries.
+        constexpr unsigned ids[]{8,9,10,11,16,17}; // D-pad, A, B
+        if(pad>1 || !CPhoneMgr::bDisplayMobile || !*CPhoneMgr::bDisplayMobile ||
+            (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) ||
+            !OpenXRVR::HasFocusedViews() || GetTickCount64()-phoneRawSampledAt.load()>250) return 0;
+        for(unsigned i=0;i<6;++i) if(button==ids[i])
+        {
+            ++phoneRawQueries;
+            const bool pressed=((rising ? phoneRawRising.load():phoneRawDown.load()) & (1u<<i))!=0;
+            if(pressed) ++phoneRawMatches;
+            return pressed ? 1:0;
+        }
+        return 0;
+    }
+    int __cdecl PhoneRawPressed(unsigned pad,unsigned button)
+    {
+        const int native=phoneRawPressed.unsafe_ccall<int>(pad,button);
+        return native ? native:static_cast<int>(PhoneRawButton(pad,button,false));
+    }
+    bool __cdecl PhoneRawJustPressed(unsigned pad,unsigned button)
+    {
+        const bool native=phoneRawJustPressed.unsafe_ccall<bool>(pad,button);
+        return PhoneRawButton(pad,button,true)!=0 || native;
+    }
+
     void __fastcall UpdateControllerPad(void* pad,void* edx)
     {
         // The classifier changes movement value XOR keys according to native
@@ -539,15 +573,63 @@ namespace
         controllerPadUpdate.unsafe_fastcall<void>(pad,edx);
         if(!localPad || pad!=localPad()) return;
         OpenXRVR::ControllerInput input{};
-        // Pause is a global action, including when gameplay injection is gated.
-        // CE control 76 is INPUT_FRONTEND_PAUSE (IV-SDK ePadControls).
-        static bool previousPause=false;
-        const bool pause=OpenXRVR::HasFocusedViews() && OpenXRVR::GetControllerInput(input) && input.pause;
-        auto* pauseValue=static_cast<unsigned char*>(pad)+0x2698+16*76;
-        const auto pauseKey=pauseValue[4];
-        pauseValue[6]=static_cast<unsigned char>(std::max<unsigned>(pauseValue[6]^pauseKey,pause ? 255:0)^pauseKey);
-        pauseValue[7]=static_cast<unsigned char>(std::max<unsigned>(pauseValue[7]^pauseKey,previousPause ? 255:0)^pauseKey);
-        previousPause=pause;
+        // Shared default: a short left Menu press pauses on release; a hold
+        // opens the native phone once. Separate semantic bindings still work.
+        static bool previousPause=false,leftHeld=false,holdConsumed=false,pauseHeld=false;
+        static uint64_t heldAt=0,phonePulseUntil=0;
+        static bool previousPhone[12]{};
+        const auto now=GetTickCount64();
+        const bool inputFresh=OpenXRVR::HasFocusedViews() && OpenXRVR::GetControllerInput(input);
+        const bool inMenu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+        const bool down=inputFresh && (input.pause || (!inMenu && input.phoneOpen));
+        if(down && !leftHeld) {heldAt=now;holdConsumed=false;pauseHeld=false;}
+        if(down && input.pause) pauseHeld=true;
+        const bool directPause=down && !leftHeld && input.pause && (inMenu || !input.phoneOpen);
+        // A runtime long-press binding delivers PhoneOpen separately. Execute
+        // immediately; only the shared suggested click needs our fallback timer.
+        if(down && !inMenu && input.phoneOpen && !holdConsumed &&
+            (!input.pause || now-heldAt>=500))
+        {holdConsumed=true;phonePulseUntil=now+100;}
+        const bool pause=inputFresh && (directPause || (!down && leftHeld && pauseHeld && !holdConsumed));
+        if(directPause) holdConsumed=true;
+        leftHeld=down;
+        if(!inputFresh) {holdConsumed=false;pauseHeld=false;phonePulseUntil=0;}
+        auto mergeButton=[&](unsigned id,bool pressed,bool wasPressed)
+        {
+            auto* value=static_cast<unsigned char*>(pad)+0x2698+16*id;
+            const auto key=value[4];
+            value[6]=static_cast<unsigned char>(std::max<unsigned>(value[6]^key,pressed ? 255:0)^key);
+            value[7]=static_cast<unsigned char>(std::max<unsigned>(value[7]^key,wasPressed ? 255:0)^key);
+            auto* history=*reinterpret_cast<unsigned char**>(value+12);
+            if(history && value[8]<64) history[8*value[8]]=value[6];
+        };
+        mergeButton(76,pause,previousPause);previousPause=pause;
+        const bool phone=inputFresh && !inMenu && input.phoneActive;
+        const auto held=VRPhoneInput::Buttons(input);
+        static VRPhoneInput::Pulse phonePulses[6]{};
+        bool directions[6]{};
+        unsigned rawDown=0,rawRising=0;
+        // OpenXR updates on the render thread, native input on simulation.
+        // Preserve rising edges even when press/release both fall between pad
+        // updates; give scripts a held pulse and a distinct release interval.
+        for(unsigned i=0;i<6;++i)
+        {
+            const bool wasDown=phonePulses[i].down;
+            directions[i]=phonePulses[i].Update(input.phonePresses[i],held[i],phone,now);
+            if(directions[i] && !wasDown) ++phoneDelivered[i];
+            if(directions[i]) rawDown|=1u<<i;
+            if(directions[i] && !wasDown) rawRising|=1u<<i;
+        }
+        phoneRawDown=rawDown;phoneRawRising=rawRising;phoneRawSampledAt=now;
+        // Native gamepad phone Up shares TAKE_OUT with opening the phone;
+        // scripts also use it to advance the raised phone to the keypad.
+        static bool previousOpen=false;
+        const bool open=(inputFresh && !inMenu && !input.phoneActive && now<phonePulseUntil) || directions[0];
+        mergeButton(21,open,previousOpen);previousOpen=open;
+        // Keyboard/frontend controls complement the raw gamepad query hooks.
+        constexpr unsigned phoneIds[]{65,64,66,67,77,78,130,131,132,133,181,182};
+        for(unsigned i=0;i<12;++i)
+        {mergeButton(phoneIds[i],directions[i%6],previousPhone[i]);previousPhone[i]=directions[i%6];}
         const bool fresh=firstPersonActive && !ragdollView && OpenXRVR::HasFocusedViews() &&
             !(CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) &&
             !(CTimer::ms_bScriptPause && *CTimer::ms_bScriptPause) &&
@@ -1043,7 +1125,11 @@ std::string VRCamera::ControllerMovementStatus()
     sprintf_s(buttons,",\"buttonsConfigured\":%s,\"buttonsInstalled\":%s,\"buttonUpdates\":%u,\"jumpPresses\":%u,\"enterPresses\":%u,\"drivingUpdates\":%u,\"steering\":%.3f,\"throttle\":%.3f,\"brake\":%.3f}",
         controllerButtons ? "true":"false",controllerPadUpdate ? "true":"false",padButtonUpdates.load(),
         padJumpPresses.load(),padEnterPresses.load(),padDrivingUpdates.load(),padSteering.load(),padThrottle.load(),padBrake.load());
-    result+=buttons; return result;
+    result+=buttons;result.pop_back();result+=",\"phoneDelivered\":[";
+    for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(phoneDelivered[i].load());}
+    return result+"],\"phoneRawInstalled\":"+(phoneRawPressed && phoneRawJustPressed ? "true":"false")+
+        ",\"phoneRawQueries\":"+std::to_string(phoneRawQueries.load())+
+        ",\"phoneRawMatches\":"+std::to_string(phoneRawMatches.load())+"}";
 }
 bool VRCamera::RestartAnchorProbe()
 {
@@ -1086,6 +1172,15 @@ void VRCamera::Install()
             {
                 localPad=reinterpret_cast<PadGetter>(getter);
                 controllerPadUpdate=safetyhook::create_inline(code,UpdateControllerPad);
+                auto pressed=hook::pattern("FF 74 24 04 E8 ? ? ? ? 83 C4 04 85 C0 74 60 8B 4C 24 08 83 F9 13");
+                auto justPressed=hook::pattern("56 FF 74 24 08 E8 ? ? ? ? 8B F0 83 C4 04 85 F6 0F 84 ? ? ? ? 83 7C 24 08 04");
+                if(controllerPadUpdate && pressed.size()==1 && justPressed.size()==1)
+                {
+                    phoneRawPressed=safetyhook::create_inline(pressed.get_first(),PhoneRawPressed);
+                    phoneRawJustPressed=safetyhook::create_inline(justPressed.get_first(),PhoneRawJustPressed);
+                    if(!phoneRawPressed || !phoneRawJustPressed)
+                    {phoneRawPressed.reset();phoneRawJustPressed.reset();}
+                }
             }
         }
     }

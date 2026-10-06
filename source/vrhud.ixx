@@ -64,6 +64,20 @@ namespace
     ComPtr<IDirect3DSurface9> overlaySurface;
     ComPtr<IDirect3DPixelShader9> overlayShader;
     std::atomic<unsigned> textCaptures{},textDraws{};
+    std::atomic<unsigned> phoneCaptureTargets[3][6]{};
+    void ObservePhoneTarget(unsigned kind)
+    {
+        if(!CPhoneMgr::bDisplayMobile || !*CPhoneMgr::bDisplayMobile || replayingOverlay || !RageDirect3DDevice9::m_pRealDevice) return;
+        auto* device=*RageDirect3DDevice9::m_pRealDevice;
+        ComPtr<IDirect3DSurface9> target;
+        D3DSURFACE_DESC desc{};D3DVIEWPORT9 viewport{};
+        if(!device || FAILED(device->GetRenderTarget(0,&target)) || FAILED(target->GetDesc(&desc))) return;
+        device->GetViewport(&viewport);
+        auto* phone=rage::grcTextureFactoryPC::GetRTByName("PHONE_SCREEN");
+        const unsigned values[]{static_cast<unsigned>(reinterpret_cast<uintptr_t>(target.Get())),desc.Width,desc.Height,
+            phone && target.Get()==phone->mD3DSurface ? 1u:0u,viewport.Width,viewport.Height};
+        for(unsigned i=0;i<6;++i) phoneCaptureTargets[kind][i]=values[i];
+    }
     void** smsTexture=nullptr;
     ComPtr<IDirect3DTexture9> smsImage;
     ComPtr<IDirect3DSurface9> smsSurface;
@@ -89,6 +103,25 @@ namespace
         auto& surface=sms ? smsSurface:overlaySurface;
         auto& fresh=sms ? smsFresh:overlayFresh;
         auto* device=*RageDirect3DDevice9::m_pRealDevice;
+        // PHONE_SCREEN already supplies the native held phone. Capturing its
+        // offscreen text/sprites here duplicates them on the view HUD plane.
+        ComPtr<IDirect3DSurface9> sourceTarget;
+        auto* phone=rage::grcTextureFactoryPC::GetRTByName("PHONE_SCREEN");
+        if(phone && device && SUCCEEDED(device->GetRenderTarget(0,&sourceTarget)) &&
+            sourceTarget.Get()==phone->mD3DSurface)
+        {overlayRouting(false);return;}
+        // Offscreen script targets (including phone targets created before the
+        // factory cache hook) are not desktop HUD content. Do not stretch their
+        // square UI into the view plane merely because the same font/sprite
+        // commands are used. Native rendering above remains untouched.
+        ComPtr<IDirect3DSurface9> backBuffer;
+        D3DSURFACE_DESC sourceDesc{},backDesc{};
+        if(device && SUCCEEDED(device->GetRenderTarget(0,&sourceTarget)) &&
+            SUCCEEDED(sourceTarget->GetDesc(&sourceDesc)) &&
+            SUCCEEDED(device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&backBuffer)) &&
+            SUCCEEDED(backBuffer->GetDesc(&backDesc)) &&
+            (sourceDesc.Width!=backDesc.Width || sourceDesc.Height!=backDesc.Height))
+        {overlayRouting(false);return;}
         ComPtr<IDirect3DStateBlock9> state;
         ComPtr<IDirect3DSurface9> targets[4],depth;
         D3DVIEWPORT9 viewport{};
@@ -133,13 +166,17 @@ namespace
 
     void __cdecl FontDraw(const void* begin,const void* end)
     {
+        ObservePhoneTarget(0);
         fontDraw.unsafe_ccall(begin,end);
         if(begin!=end) CaptureOverlay([&](){fontDraw.unsafe_ccall(begin,end);});
     }
     void __fastcall PopupSprite(void* self,void* edx)
     {
+        ObservePhoneTarget(1);
         popupSprite.unsafe_fastcall(self,edx);
         const auto* data=static_cast<const unsigned char*>(self);
+        auto* phone=rage::grcTextureFactoryPC::GetRTByName("PHONE_SCREEN");
+        if(phone && *reinterpret_cast<void* const*>(data+0x18)==phone) return;
         if(enabled && smsTexture && *smsTexture && *reinterpret_cast<void* const*>(data+0x18)==*smsTexture &&
             *reinterpret_cast<const int*>(data+0x24)==2)
         {
@@ -155,6 +192,7 @@ namespace
     }
     void __fastcall PopupWindow(void* self,void* edx)
     {
+        ObservePhoneTarget(2);
         popupWindow.unsafe_fastcall(self,edx);
         CaptureOverlay([&](){popupWindow.unsafe_fastcall(self,edx);});
     }
@@ -440,7 +478,10 @@ std::string VRHud::Status()
 {
     char text[1400];sprintf_s(text,"{\"enabled\":%s,\"hookReady\":%s,\"calls\":%u,\"queued\":%u,\"executed\":%u,\"captures\":%u,\"eyeDraws\":%u,\"failures\":%u,\"bounds\":[%.2f,%.2f,%.2f,%.2f],\"panel\":[%.1f,%.1f,%.1f,%.1f],\"wanted\":%u,\"dashboardEnabled\":%s,\"dashboardEyeDraws\":%u,\"headingHookReady\":%s,\"headingOverrides\":%u,\"originalHeading\":%.3f,\"carHeading\":%.3f,\"textHookReady\":%s,\"spriteHookReady\":%s,\"windowHookReady\":%s,\"textCaptures\":%u,\"textEyeDraws\":%u,\"hudWidth\":%.2f,\"smsSlotReady\":%s,\"smsCaptures\":%u,\"smsBounds\":[%.4f,%.4f,%.4f,%.4f]}",
         enabled ? "true":"false",radarDraw ? "true":"false",calls.load(),queued.load(),executed.load(),captures.load(),draws.load(),failures.load(),
-        lastBounds[0].load(),lastBounds[1].load(),lastBounds[2].load(),lastBounds[3].load(),lastPanel[0].load(),lastPanel[1].load(),lastPanel[2].load(),lastPanel[3].load(),wanted.load(),dashboard ? "true":"false",dashboardDraws.load(),radarHeadingHook ? "true":"false",radarHeadingOverrides.load(),originalRadarHeading.load(),appliedRadarHeading.load(),fontDraw ? "true":"false",popupSprite ? "true":"false",popupWindow ? "true":"false",textCaptures.load(),textDraws.load(),hudWidth,smsTexture ? "true":"false",smsCaptures.load(),smsBounds[0],smsBounds[1],smsBounds[2],smsBounds[3]);return text;
+        lastBounds[0].load(),lastBounds[1].load(),lastBounds[2].load(),lastBounds[3].load(),lastPanel[0].load(),lastPanel[1].load(),lastPanel[2].load(),lastPanel[3].load(),wanted.load(),dashboard ? "true":"false",dashboardDraws.load(),radarHeadingHook ? "true":"false",radarHeadingOverrides.load(),originalRadarHeading.load(),appliedRadarHeading.load(),fontDraw ? "true":"false",popupSprite ? "true":"false",popupWindow ? "true":"false",textCaptures.load(),textDraws.load(),hudWidth,smsTexture ? "true":"false",smsCaptures.load(),smsBounds[0],smsBounds[1],smsBounds[2],smsBounds[3]);
+    std::string result=text;result.pop_back();result+=",\"phoneTargets\":[";
+    for(unsigned kind=0;kind<3;++kind) { if(kind) result+=",";result+="[";for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(phoneCaptureTargets[kind][i].load());}result+="]";}
+    return result+"]}";
 }
 
 void VRHud::Install()

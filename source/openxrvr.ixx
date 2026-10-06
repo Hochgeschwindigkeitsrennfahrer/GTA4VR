@@ -19,6 +19,7 @@ module;
 #include <cmath>
 #include <filesystem>
 #include "includes/vrmath.hpp"
+#include "includes/vrphoneinput.hpp"
 
 export module openxrvr;
 
@@ -52,6 +53,10 @@ export namespace OpenXRVR
         bool cycle=false,nextWeapon=false,previousWeapon=false;
         float cycleDirection=0;
         bool pause=false,select[2]{},back=false;
+        bool phoneOpen=false,phoneClick=false,phoneBack=false,phoneActive=false;
+        float phoneDirection[2]{};
+        bool phoneUp=false,phoneDown=false,phoneLeft=false,phoneRight=false,phoneAccept=false;
+        uint64_t phonePresses[6]{};
         unsigned long long sampledAt=0;
     };
     struct PanelPointer
@@ -158,9 +163,10 @@ namespace
     uint64_t eyeSampledAt=0;
     bool controllerEnabled=false,inputReady=false;
     XrActionSet inputActions=XR_NULL_HANDLE;
-    XrActionSet gameplayActions=XR_NULL_HANDLE,drivingActions=XR_NULL_HANDLE,menuActions=XR_NULL_HANDLE,systemActions=XR_NULL_HANDLE;
+    XrActionSet gameplayActions=XR_NULL_HANDLE,drivingActions=XR_NULL_HANDLE,menuActions=XR_NULL_HANDLE,systemActions=XR_NULL_HANDLE,phoneActions=XR_NULL_HANDLE;
     enum class Action {Move,MoveEnable,Sprint,Jump,Interact,Fire,Support,Cycle,CycleDirection,Next,Previous,
-        Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,Count};
+        Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
+        PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
     OpenXRVR::PanelPointer panelPointer{};
@@ -172,6 +178,7 @@ namespace
     XrSpace aimSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
     XrSpace gripSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
     OpenXRVR::ControllerInput controllerInput{}; // Published with eyeLock.
+    VRPhoneInput::Edges phoneEdges{}; // Render-thread input edges survive between simulation ticks.
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -406,9 +413,9 @@ namespace
             Check("xrDestroySession", xrDestroySession(session));
             session = XR_NULL_HANDLE;
         }
-        for(auto set:{inputActions,gameplayActions,drivingActions,menuActions,systemActions})
+        for(auto set:{inputActions,gameplayActions,drivingActions,menuActions,systemActions,phoneActions})
             if(set!=XR_NULL_HANDLE) api.destroyActionSet(set);
-        gameplayActions=drivingActions=menuActions=systemActions=XR_NULL_HANDLE;
+        gameplayActions=drivingActions=menuActions=systemActions=phoneActions=XR_NULL_HANDLE;
         for(auto& action:actions) action=XR_NULL_HANDLE;
         AcquireSRWLockExclusive(&eyeLock);panelPointer={};ReleaseSRWLockExclusive(&eyeLock);
         inputActions=XR_NULL_HANDLE;
@@ -441,7 +448,8 @@ namespace
             !makeSet("on_foot","On foot",0,gameplayActions) ||
             !makeSet("driving","Driving",0,drivingActions) ||
             !makeSet("menus","Menus",1,menuActions) ||
-            !makeSet("system","Pause menu",0,systemActions)) return false;
+            !makeSet("system","Pause menu / phone",0,systemActions) ||
+            !makeSet("phone","Phone",2,phoneActions)) return false;
         if(!Check("left hand path",api.stringToPath(instance,"/user/hand/left",&handPaths[0])) ||
             !Check("right hand path",api.stringToPath(instance,"/user/hand/right",&handPaths[1]))) return false;
         std::vector<XrActionSuggestedBinding> bindings;
@@ -487,7 +495,16 @@ namespace
             !game(Action::Brake,drivingActions,"brake","Brake / reverse",scalar,0,"/input/trigger/value") ||
             !game(Action::Handbrake,drivingActions,"handbrake","Handbrake",boolean,1,"/input/trackpad/click") ||
             !game(Action::Exit,drivingActions,"exit_vehicle","Exit vehicle",boolean,1,"/input/menu/click") ||
-            !game(Action::Pause,systemActions,"pause","Open / close pause menu",boolean,0,"/input/menu/click") ||
+            !game(Action::Pause,systemActions,"pause","Pause menu (tap)",boolean,0,"/input/menu/click") ||
+            !game(Action::PhoneOpen,systemActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
+            !game(Action::PhoneDirection,phoneActions,"phone_direction","Phone navigation direction",vector,1,"/input/trackpad") ||
+            !game(Action::PhoneClick,phoneActions,"phone_click","Phone navigate / accept",boolean,1,"/input/trackpad/click") ||
+            !game(Action::PhoneBack,phoneActions,"phone_back","Phone back",boolean,1,"/input/menu/click") ||
+            !game(Action::PhoneUp,phoneActions,"phone_up","Phone up / keypad",boolean,1,nullptr) ||
+            !game(Action::PhoneDown,phoneActions,"phone_down","Phone down",boolean,1,nullptr) ||
+            !game(Action::PhoneLeft,phoneActions,"phone_left","Phone left",boolean,1,nullptr) ||
+            !game(Action::PhoneRight,phoneActions,"phone_right","Phone right",boolean,1,nullptr) ||
+            !game(Action::PhoneAccept,phoneActions,"phone_accept","Phone accept",boolean,1,nullptr) ||
             !game(Action::Select,menuActions,"select","Select / drag",boolean,-1,"/input/trigger/click") ||
             !game(Action::Back,menuActions,"back","Back",boolean,1,"/input/menu/click")) return false;
         XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -495,8 +512,8 @@ namespace
         suggest.countSuggestedBindings=static_cast<uint32_t>(bindings.size()); suggest.suggestedBindings=bindings.data();
         if(!Check("Vive suggested bindings",api.suggestBindings(instance,&suggest))) return false;
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-        XrActionSet sets[]{inputActions,gameplayActions,drivingActions,menuActions,systemActions};
-        attach.countActionSets=5; attach.actionSets=sets;
+        XrActionSet sets[]{inputActions,gameplayActions,drivingActions,menuActions,systemActions,phoneActions};
+        attach.countActionSets=6; attach.actionSets=sets;
         if(!Check("xrAttachSessionActionSets",api.attachActionSets(session,&attach))) return false;
         for(unsigned hand=0;hand<2;++hand)
         {
@@ -518,8 +535,10 @@ namespace
         {
             const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
             XrActiveActionSet active[]{{inputActions,XR_NULL_PATH},{systemActions,XR_NULL_PATH},
-                {menu ? menuActions : drivingInput.load() ? drivingActions : gameplayActions,XR_NULL_PATH}};
-            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=3; sync.activeActionSets=active;
+                {menu ? menuActions : drivingInput.load() ? drivingActions : gameplayActions,XR_NULL_PATH},
+                {phoneActions,XR_NULL_PATH}};
+            const bool phone=!menu && CPhoneMgr::bDisplayMobile && *CPhoneMgr::bDisplayMobile;
+            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=phone ? 4:3; sync.activeActionSets=active;
             if(api.syncActions(session,&sync)==XR_SUCCESS)
             {
                 auto getBool=[&](Action id,bool* available=nullptr,XrPath path=XR_NULL_PATH){
@@ -556,6 +575,18 @@ namespace
                 sample.accelerate=getFloat(Action::Accelerate);sample.brake=getFloat(Action::Brake);
                 sample.handbrake=getBool(Action::Handbrake);sample.exitVehicle=getBool(Action::Exit);
                 sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
+                sample.phoneOpen=getBool(Action::PhoneOpen);sample.phoneActive=phone;
+                if(phone)
+                {
+                    const auto direction=getVector(Action::PhoneDirection);
+                    sample.phoneDirection[0]=direction[0];sample.phoneDirection[1]=direction[1];
+                    sample.phoneClick=getBool(Action::PhoneClick);sample.phoneBack=getBool(Action::PhoneBack);
+                    sample.phoneUp=getBool(Action::PhoneUp);sample.phoneDown=getBool(Action::PhoneDown);
+                    sample.phoneLeft=getBool(Action::PhoneLeft);sample.phoneRight=getBool(Action::PhoneRight);
+                    sample.phoneAccept=getBool(Action::PhoneAccept);
+                    sample.jump=sample.cycle=sample.nextWeapon=sample.previousWeapon=sample.interact=false;
+                    sample.exitVehicle=sample.handbrake=sample.fireActive=false;sample.fire=sample.accelerate=0;
+                }
                 for(unsigned hand=0;hand<2;++hand)sample.select[hand]=getBool(Action::Select,nullptr,handPaths[hand]);
                 for(unsigned hand=0;hand<2;++hand)
                 {
@@ -620,6 +651,8 @@ namespace
         }
         }
         sample.sampledAt=GetTickCount64();
+        phoneEdges.Sample(VRPhoneInput::Buttons(sample));
+        std::copy(phoneEdges.presses.begin(),phoneEdges.presses.end(),sample.phonePresses);
         AcquireSRWLockExclusive(&eyeLock); controllerInput=sample; ReleaseSRWLockExclusive(&eyeLock);
     }
 
@@ -1234,6 +1267,16 @@ std::string OpenXRVR::InputStatus()
         input.pause ? "true":"false",input.select[0] ? "true":"false",input.select[1] ? "true":"false",input.back ? "true":"false",
         pointer.active ? "true":"false",pointer.hit ? "true":"false",pointer.u,pointer.v,pointer.down ? "true":"false");
     result+=semantic;
+    result.pop_back();
+    char phone[300];
+    sprintf_s(phone,",\"phone\":{\"active\":%s,\"open\":%s,\"click\":%s,\"direction\":[%.3f,%.3f],\"buttons\":[%s,%s,%s,%s,%s],\"back\":%s}}",
+        input.phoneActive ? "true":"false",input.phoneOpen ? "true":"false",input.phoneClick ? "true":"false",
+        input.phoneDirection[0],input.phoneDirection[1],input.phoneUp ? "true":"false",input.phoneDown ? "true":"false",
+        input.phoneLeft ? "true":"false",input.phoneRight ? "true":"false",input.phoneAccept ? "true":"false",input.phoneBack ? "true":"false");
+    result+=phone;
+    result.pop_back();result+=",\"phonePresses\":[";
+    for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(input.phonePresses[i]);}
+    result+="]}";
     return result;
 }
 
