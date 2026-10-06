@@ -39,6 +39,11 @@ export namespace OpenXRVR
     {
         bool active[2]{},clicked[2]{},poseValid[2]{};
         float trackpad[2][2]{},position[2][3]{},orientation[2][4]{};
+        bool gripPoseValid[2]{},gripActive[2]{},gripped[2]{};
+        float gripPosition[2][3]{},gripOrientation[2][4]{};
+        bool triggerActive[2]{},padTouched[2]{};
+        bool menuActive[2]{},menuPressed[2]{};
+        float trigger[2]{};
         unsigned long long sampledAt=0;
     };
     bool GetControllerInput(ControllerInput& input);
@@ -100,6 +105,7 @@ namespace
         PFN_xrSyncActions syncActions=nullptr;
         PFN_xrGetActionStateVector2f getVector2=nullptr;
         PFN_xrGetActionStateBoolean getBoolean=nullptr;
+        PFN_xrGetActionStateFloat getFloat=nullptr;
         PFN_xrGetActionStatePose getPose=nullptr;
         PFN_xrLocateSpace locateSpace=nullptr;
     } api;
@@ -135,8 +141,12 @@ namespace
     bool controllerEnabled=false,inputReady=false;
     XrActionSet inputActions=XR_NULL_HANDLE;
     XrAction padAction=XR_NULL_HANDLE,clickAction=XR_NULL_HANDLE,aimAction=XR_NULL_HANDLE;
+    XrAction gripPoseAction=XR_NULL_HANDLE,gripAction=XR_NULL_HANDLE;
+    XrAction triggerAction=XR_NULL_HANDLE,touchAction=XR_NULL_HANDLE;
+    XrAction menuAction=XR_NULL_HANDLE;
     XrPath handPaths[2]{};
     XrSpace aimSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
+    XrSpace gripSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
     OpenXRVR::ControllerInput controllerInput{}; // Published with eyeLock.
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
@@ -290,6 +300,7 @@ namespace
             LOAD_XR(syncActions,xrSyncActions)
             LOAD_XR(getVector2,xrGetActionStateVector2f)
             LOAD_XR(getBoolean,xrGetActionStateBoolean)
+            LOAD_XR(getFloat,xrGetActionStateFloat)
             LOAD_XR(getPose,xrGetActionStatePose)
             LOAD_XR(locateSpace,xrLocateSpace)
         }
@@ -342,6 +353,11 @@ namespace
             if(space!=XR_NULL_HANDLE) api.destroySpace(space);
             space=XR_NULL_HANDLE;
         }
+        for(auto& space:gripSpaces)
+        {
+            if(space!=XR_NULL_HANDLE) api.destroySpace(space);
+            space=XR_NULL_HANDLE;
+        }
         if (localSpace != XR_NULL_HANDLE)
         {
             Check("xrDestroySpace(tracking)", api.destroySpace(localSpace));
@@ -356,6 +372,9 @@ namespace
         if(inputActions!=XR_NULL_HANDLE) api.destroyActionSet(inputActions);
         inputActions=XR_NULL_HANDLE;
         padAction=clickAction=aimAction=XR_NULL_HANDLE;
+        gripPoseAction=gripAction=XR_NULL_HANDLE;
+        triggerAction=touchAction=XR_NULL_HANDLE;
+        menuAction=XR_NULL_HANDLE;
         handPaths[0]=handPaths[1]=XR_NULL_PATH;
         if (context) { context->Release(); context = nullptr; }
         if (device) { device->Release(); device = nullptr; }
@@ -386,11 +405,19 @@ namespace
         };
         if(!create("trackpad","Trackpad",XR_ACTION_TYPE_VECTOR2F_INPUT,padAction) ||
             !create("trackpad_click","Trackpad click",XR_ACTION_TYPE_BOOLEAN_INPUT,clickAction) ||
-            !create("aim_pose","Controller aim",XR_ACTION_TYPE_POSE_INPUT,aimAction)) return false;
+            !create("aim_pose","Controller aim",XR_ACTION_TYPE_POSE_INPUT,aimAction) ||
+            !create("grip_pose","Controller grip pose",XR_ACTION_TYPE_POSE_INPUT,gripPoseAction) ||
+            !create("grip","Close hand",XR_ACTION_TYPE_BOOLEAN_INPUT,gripAction) ||
+            !create("trigger","Index finger curl",XR_ACTION_TYPE_FLOAT_INPUT,triggerAction) ||
+            !create("trackpad_touch","Thumb contact",XR_ACTION_TYPE_BOOLEAN_INPUT,touchAction) ||
+            !create("menu_button","Vehicle entry/exit",XR_ACTION_TYPE_BOOLEAN_INPUT,menuAction)) return false;
         std::vector<XrActionSuggestedBinding> bindings;
         for(unsigned hand=0;hand<2;++hand)
             for(auto binding: {std::pair{padAction,"/input/trackpad"},
-                std::pair{clickAction,"/input/trackpad/click"},std::pair{aimAction,"/input/aim/pose"}})
+                std::pair{clickAction,"/input/trackpad/click"},std::pair{aimAction,"/input/aim/pose"},
+                std::pair{gripPoseAction,"/input/grip/pose"},std::pair{gripAction,"/input/squeeze/click"},
+                std::pair{triggerAction,"/input/trigger/value"},std::pair{touchAction,"/input/trackpad/touch"},
+                std::pair{menuAction,"/input/menu/click"}})
             {
                 const std::string path=std::string(hand ? "/user/hand/right" : "/user/hand/left")+binding.second;
                 XrPath xrPath=XR_NULL_PATH;
@@ -409,6 +436,8 @@ namespace
             XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
             space.action=aimAction; space.subactionPath=handPaths[hand]; space.poseInActionSpace.orientation.w=1;
             if(!Check("xrCreateActionSpace(aim)",api.createActionSpace(session,&space,&aimSpaces[hand]))) return false;
+            space.action=gripPoseAction;
+            if(!Check("xrCreateActionSpace(grip)",api.createActionSpace(session,&space,&gripSpaces[hand]))) return false;
         }
         inputReady=true;
         Log("Vive Wand actions attached; input observation enabled, no game input injection");
@@ -436,6 +465,23 @@ namespace
                     }
                     XrActionStateBoolean click{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=clickAction;
                     if(api.getBoolean(session,&get,&click)==XR_SUCCESS && click.isActive) sample.clicked[hand]=click.currentState;
+                    XrActionStateBoolean touch{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=touchAction;
+                    if(api.getBoolean(session,&get,&touch)==XR_SUCCESS && touch.isActive) sample.padTouched[hand]=touch.currentState;
+                    XrActionStateBoolean menu{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=menuAction;
+                    if(api.getBoolean(session,&get,&menu)==XR_SUCCESS && menu.isActive)
+                    {sample.menuActive[hand]=true; sample.menuPressed[hand]=menu.currentState;}
+                    XrActionStateFloat trigger{XR_TYPE_ACTION_STATE_FLOAT}; get.action=triggerAction;
+                    if(api.getFloat(session,&get,&trigger)==XR_SUCCESS && trigger.isActive && std::isfinite(trigger.currentState))
+                    {
+                        sample.triggerActive[hand]=true;
+                        sample.trigger[hand]=std::clamp(trigger.currentState,0.f,1.f);
+                    }
+                    XrActionStateBoolean grip{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=gripAction;
+                    if(api.getBoolean(session,&get,&grip)==XR_SUCCESS && grip.isActive)
+                    {
+                        sample.gripActive[hand]=true;
+                        sample.gripped[hand]=grip.currentState;
+                    }
                     XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE}; get.action=aimAction;
                     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
                     constexpr auto required=XR_SPACE_LOCATION_ORIENTATION_VALID_BIT|XR_SPACE_LOCATION_POSITION_VALID_BIT;
@@ -451,6 +497,23 @@ namespace
                             sample.position[hand][0]=p.position.x; sample.position[hand][1]=p.position.y; sample.position[hand][2]=p.position.z;
                             sample.orientation[hand][0]=p.orientation.x; sample.orientation[hand][1]=p.orientation.y;
                             sample.orientation[hand][2]=p.orientation.z; sample.orientation[hand][3]=p.orientation.w;
+                        }
+                    }
+                    get.action=gripPoseAction;
+                    pose={XR_TYPE_ACTION_STATE_POSE}; location={XR_TYPE_SPACE_LOCATION};
+                    if(api.getPose(session,&get,&pose)==XR_SUCCESS && pose.isActive &&
+                        api.locateSpace(gripSpaces[hand],localSpace,time,&location)==XR_SUCCESS &&
+                        (location.locationFlags & required)==required)
+                    {
+                        const auto& p=location.pose;
+                        if(std::isfinite(p.position.x) && std::isfinite(p.position.y) && std::isfinite(p.position.z) &&
+                            std::isfinite(p.orientation.x) && std::isfinite(p.orientation.y) &&
+                            std::isfinite(p.orientation.z) && std::isfinite(p.orientation.w))
+                        {
+                            sample.gripPoseValid[hand]=true;
+                            sample.gripPosition[hand][0]=p.position.x; sample.gripPosition[hand][1]=p.position.y; sample.gripPosition[hand][2]=p.position.z;
+                            sample.gripOrientation[hand][0]=p.orientation.x; sample.gripOrientation[hand][1]=p.orientation.y;
+                            sample.gripOrientation[hand][2]=p.orientation.z; sample.gripOrientation[hand][3]=p.orientation.w;
                         }
                     }
                 }
@@ -937,12 +1000,28 @@ std::string OpenXRVR::InputStatus()
 {
     ControllerInput input{};
     const bool fresh=GetControllerInput(input);
-    char text[400];
-    sprintf_s(text,"{\"enabled\":%s,\"ready\":%s,\"fresh\":%s,\"left\":{\"active\":%s,\"poseValid\":%s,\"click\":%s,\"pad\":[%.3f,%.3f]},\"right\":{\"active\":%s,\"poseValid\":%s,\"click\":%s,\"pad\":[%.3f,%.3f]}}",
+    char text[900];
+    sprintf_s(text,"{\"enabled\":%s,\"ready\":%s,\"fresh\":%s,\"left\":{\"active\":%s,\"poseValid\":%s,\"click\":%s,\"pad\":[%.3f,%.3f],\"gripPoseValid\":%s,\"gripActive\":%s,\"gripped\":%s,\"gripPosition\":[%.4f,%.4f,%.4f]},\"right\":{\"active\":%s,\"poseValid\":%s,\"click\":%s,\"pad\":[%.3f,%.3f],\"gripPoseValid\":%s,\"gripActive\":%s,\"gripped\":%s,\"gripPosition\":[%.4f,%.4f,%.4f]}}",
         controllerEnabled ? "true" : "false",inputReady ? "true" : "false",fresh ? "true" : "false",
         input.active[0] ? "true" : "false",input.poseValid[0] ? "true" : "false",input.clicked[0] ? "true" : "false",input.trackpad[0][0],input.trackpad[0][1],
-        input.active[1] ? "true" : "false",input.poseValid[1] ? "true" : "false",input.clicked[1] ? "true" : "false",input.trackpad[1][0],input.trackpad[1][1]);
-    return text;
+        input.gripPoseValid[0] ? "true" : "false",input.gripActive[0] ? "true" : "false",input.gripped[0] ? "true" : "false",
+        input.gripPosition[0][0],input.gripPosition[0][1],input.gripPosition[0][2],
+        input.active[1] ? "true" : "false",input.poseValid[1] ? "true" : "false",input.clicked[1] ? "true" : "false",input.trackpad[1][0],input.trackpad[1][1],
+        input.gripPoseValid[1] ? "true" : "false",input.gripActive[1] ? "true" : "false",input.gripped[1] ? "true" : "false",
+        input.gripPosition[1][0],input.gripPosition[1][1],input.gripPosition[1][2]);
+    std::string result=text;
+    result.pop_back();
+    char fingers[160];
+    sprintf_s(fingers,",\"trigger\":[%.3f,%.3f],\"triggerActive\":[%s,%s],\"padTouched\":[%s,%s]}",
+        input.trigger[0],input.trigger[1],input.triggerActive[0] ? "true":"false",input.triggerActive[1] ? "true":"false",
+        input.padTouched[0] ? "true":"false",input.padTouched[1] ? "true":"false");
+    result+=fingers;
+    char menu[120];
+    sprintf_s(menu,",\"menuActive\":[%s,%s],\"menuPressed\":[%s,%s]}",
+        input.menuActive[0] ? "true":"false",input.menuActive[1] ? "true":"false",
+        input.menuPressed[0] ? "true":"false",input.menuPressed[1] ? "true":"false");
+    result.pop_back(); result+=menu;
+    return result;
 }
 
 bool OpenXRVR::SetEyeImages(const HANDLE (&shared)[2], unsigned width,unsigned height,

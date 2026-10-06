@@ -8,7 +8,7 @@ Show the regular third-person game camera and existing HUD on the desktop while 
 
 - [ ] Preserve the ordinary game camera and its desktop targets separately from headset cameras, eye targets and temporal state. Confirm visibility covers the desktop camera and both eyes before any shared traversal.
 - [ ] Schedule the desktop world render and original minimap/subtitle/HUD/menu composition in their correct order after one simulation update. Avoid duplicated script, audio, shadow, weather or UI updates; do not assume appending one draw call restores the HUD.
-- [ ] Add per-view local-character visibility: hide the selected head/body meshes in headset rendering while retaining the regular model in the desktop image. Keep collision, AI/script state and appropriate shadow behavior intact. Future tracked hands/weapons (#016) need separate visibility ownership.
+- [ ] Add per-view local-character visibility: hide the selected head/body meshes in headset rendering while retaining the regular model in the desktop image. Keep collision, AI/script state and appropriate shadow behavior intact. The accepted tracked hands/pistol from closed #016 need separate visibility ownership.
 - [ ] Measure the extra desktop-view cost in Release with #013. Record any lower-resolution or update-rate option as an explicit tradeoff; preserve correct headset synchronization and pacing.
 - [ ] Verify third-person desktop camera/HUD, VR camera/head motion, view-specific character visibility, pause/phone/menu transitions, device reset and ordinary VR-disabled behavior.
 

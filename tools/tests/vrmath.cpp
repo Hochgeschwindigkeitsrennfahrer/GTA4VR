@@ -13,6 +13,44 @@ static void Near(float actual, float expected, float tolerance=1e-4f)
 
 int main()
 {
+    auto fitBone=VRMath::Identity();
+    fitBone[3]={12,22,34,NAN}; fitBone[0][3]=NAN;
+    const VRMath::Vector fitPivot{10,20,30,1};
+    const auto fitted=VRMath::ScaleBoneAbout(fitBone,fitPivot,.8f);
+    Near(fitted[3][0],11.6f); Near(fitted[3][2],33.2f); Near(fitted[0][0],.8f);
+    if(!std::isnan(fitted[0][3]) || !std::isnan(fitted[3][3])) return 1;
+    // Inverse-scaled tracked target returns to the real controller position.
+    auto fitHand=VRMath::Identity();
+    for(unsigned a=0;a<3;++a) fitHand[3][a]=fitPivot[a]+(fitBone[3][a]-fitPivot[a])/.8f;
+    const auto fittedHand=VRMath::ScaleBoneAbout(fitHand,fitPivot,.8f);
+    for(unsigned a=0;a<3;++a) Near(fittedHand[3][a],fitBone[3][a]);
+    const auto padCenter=VRMath::TouchpadMovement(.1f,.1f);
+    Near(padCenter[0],0); Near(padCenter[1],0);
+    const auto padForward=VRMath::TouchpadMovement(0,1);
+    Near(padForward[0],0); Near(padForward[1],1);
+    const auto padBack=VRMath::TouchpadMovement(0,-1);
+    Near(padBack[1],-1);
+    const auto padDiagonal=VRMath::TouchpadMovement(1,1);
+    Near(std::hypot(padDiagonal[0],padDiagonal[1]),1);
+    const auto padInvalid=VRMath::TouchpadMovement(NAN,1);
+    Near(padInvalid[0],0); Near(padInvalid[1],0);
+    // Native GTA bone matrices store metadata (including NaNs) in W lanes.
+    // Carry an equipped finger with a moved wrist using only affine XYZ.
+    auto oldWrist=VRMath::Identity(),newWrist=VRMath::Identity(),finger=VRMath::Identity();
+    oldWrist[3]={10,20,30,NAN};
+    newWrist[3]={11,22,33,-4.31602e8f};
+    finger[3]={10.2f,20.3f,30.4f,NAN};
+    for(unsigned row=0;row<3;++row)
+    {
+        oldWrist[row][3]=newWrist[row][3]=NAN;
+        finger[row][3]=-4.31602e8f;
+    }
+    const auto carried=VRMath::Multiply(VRMath::AffineXYZ(finger),
+        VRMath::Multiply(VRMath::InverseRigid(VRMath::AffineXYZ(oldWrist)),VRMath::AffineXYZ(newWrist)));
+    Near(carried[3][0],11.2f); Near(carried[3][1],22.3f); Near(carried[3][2],33.4f);
+    for(unsigned row=0;row<4;++row) for(float value:carried[row])
+        if(!std::isfinite(value)) return 1;
+    if(!std::isnan(oldWrist[3][3]) || finger[0][3]!=-4.31602e8f) return 1;
     // Reconstruct native weapon forward from the extracted headset angles.
     // Sweep pitch and yaw, including wrap and the vertical singularity.
     for(float pitch:{-1.5707963f,-1.1f,0.f,.8f,1.5707963f})
@@ -287,5 +325,22 @@ int main()
         VRMath::ClassifySphere(box,crossing,.25f)!=1 ||
         VRMath::ClassifySphere(box,touching,.25f)!=1 ||
         VRMath::ClassifySphere(box,outside,.25f)!=0) return 1;
-    std::puts("VR math: camera/plane regressions, conservative union, exact eye spheres and native sphere classifications passed");
+    // Knee location preserves both segment lengths with the foot planted.
+    VRMath::Vector knee{};
+    const VRMath::Vector hip{0,0,.6f,1},foot{0,0,0,1},pole{0,1,0,0};
+    if(!VRMath::TwoBoneKnee(hip,foot,pole,.4f,.4f,knee) || knee[1]<=0 ||
+        std::abs(VRMath::Length3(VRMath::Difference3(knee,hip))-.4f)>1.e-5f ||
+        std::abs(VRMath::Length3(VRMath::Difference3(foot,knee))-.4f)>1.e-5f ||
+        VRMath::TwoBoneKnee({0,0,1,1},foot,pole,.4f,.4f,knee)) return 1;
+    const auto turned=VRMath::Transform({0,0,-1,0},VRMath::SegmentRotation({0,0,-1,0},{0,1,0,0}));
+    if(std::abs(turned[1]-1)>1.e-5f || std::abs(turned[2])>1.e-5f) return 1;
+    auto stance=VRMath::Identity(); stance[0][3]=123;
+    auto settled=VRMath::UprightGameCamera(30,{0,0,0,1});
+    // Use a conventional XYZ bone rotation, not camera right/up/back.
+    settled=VRMath::SegmentRotation({1,0,0,0},{.8660254f,.5f,0,0}); settled[3][0]=2;
+    const auto halfway=VRMath::BlendRigidPose(stance,settled,.5f);
+    if(std::abs(VRMath::Dot3(halfway[0],halfway[1]))>1.e-5f ||
+        std::abs(VRMath::Length3(halfway[2])-1)>1.e-5f || halfway[0][3]!=123 ||
+        halfway[3][0]!=1 || VRMath::BlendRigidPose(stance,settled,0)!=stance) return 1;
+    std::puts("VR math: camera/visibility, knee/segment rotation and rigid stance blending passed");
 }

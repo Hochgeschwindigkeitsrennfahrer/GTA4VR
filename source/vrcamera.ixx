@@ -11,6 +11,7 @@ import common;
 import comvars;
 import openxrvr;
 import natives;
+import vrhands;
 
 export namespace VRCamera
 {
@@ -18,6 +19,7 @@ export namespace VRCamera
     void Recenter(); // Atomic request, consumed by the world list builder.
     bool RestartAnchorProbe();
     std::string MovementStatus();
+    std::string ControllerMovementStatus();
     std::string AimStatus();
     void SetVisibilityAvailable(bool available);
     bool HideLocalCharacter(const void* entity);
@@ -36,6 +38,15 @@ namespace
     VRMath::Matrix referenceInverse{};
     bool probeAnchor=false;
     bool firstPerson=false;
+    bool controllerButtons=false;
+    SafetyHookInline controllerPadUpdate{};
+    using PadGetter=void* (__cdecl*)();
+    PadGetter localPad=nullptr;
+    bool previousJump=false,previousEnter=false,previousHandbrake=false,previousRun=false;
+    bool buttonsArmed=false;
+    std::atomic<unsigned> padButtonUpdates{0},padJumpPresses{0},padEnterPresses{0},padDrivingUpdates{0};
+    std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
+    float firstPersonForwardOffset=.08f;
     std::atomic<bool> firstPersonActive{false};
     bool visibilityAvailable=false;
     bool debugBody=false;
@@ -80,6 +91,20 @@ namespace
     float lastMoveBlend[3]{}, lastMoveTarget[3]{}, lastMoveDt=0;
     bool headRelativeMovement=false;
     SafetyHookInline movementHeading{};
+    SafetyHookInline controllerMoveAxis{};
+    SafetyHookInline controllerMoveFloatAxis{};
+    SafetyHookInline ordinaryWalk{};
+    SafetyHookInline movementSpeed{},runControl{};
+    thread_local int padGait=-1;
+    thread_local unsigned char padRunControl[16]{};
+    std::atomic<unsigned> padJogReads{0},padSprintReads{0};
+    using DirectionalWalk=void (__thiscall*)(void*,void*);
+    DirectionalWalk directionalWalk=nullptr;
+    std::atomic<unsigned> directionalWalkCalls{0};
+    bool controllerLocomotion=false;
+    std::atomic<unsigned> controllerMoveReads{0};
+    std::atomic<unsigned> controllerAxisCalls{0},controllerMotorReads{0};
+    std::atomic<uintptr_t> controllerAxisCallers[8]{};
     SRWLOCK headingLock=SRWLOCK_INIT;
     bool headingValid=false;
     void* headingOwner=nullptr;
@@ -259,6 +284,30 @@ namespace
                 animated=AnimationControlsBody(ped,owner,ragdoll,&exiting);
             }
         }
+        // Preserve native idle/head-IK flags while tracked arms own the rig.
+        // Never follow a cached pointer after the player entity is replaced.
+        static void* idleOwner=nullptr;
+        static uint32_t idleFlags=0,headFlags=0;
+        constexpr uint32_t idleMask=0x28000,headMask=0x300000;
+        const bool tracked=owner && firstPersonActive && !animated && !ragdoll && !vehicleView &&
+            OpenXRVR::HasFocusedViews() && VRHands::Active(owner);
+        if(idleOwner && idleOwner==owner && !tracked)
+        {
+            auto& flags=*reinterpret_cast<uint32_t*>(static_cast<char*>(owner)+0x2A0);
+            auto& head=*reinterpret_cast<uint32_t*>(static_cast<char*>(owner)+0x29C);
+            flags=(flags&~idleMask)|idleFlags;
+            head=(head&~headMask)|headFlags;
+            idleOwner=nullptr;
+        }
+        if(idleOwner!=owner) idleOwner=nullptr;
+        if(tracked)
+        {
+            auto& flags=*reinterpret_cast<uint32_t*>(static_cast<char*>(owner)+0x2A0);
+            auto& head=*reinterpret_cast<uint32_t*>(static_cast<char*>(owner)+0x29C);
+            if(!idleOwner) {idleOwner=owner; idleFlags=flags&idleMask; headFlags=head&headMask;}
+            flags|=idleMask;
+            head=(head&~headMask)|0x100000;
+        }
         AcquireSRWLockExclusive(&animationLock);
         animationOwner=owner; animationPed=ped;
         animationDriven=animated; animationRagdoll=ragdoll;
@@ -420,6 +469,258 @@ namespace
         lastAppliedHeading=result;
         ReleaseSRWLockExclusive(&headingLock);
         return result;
+    }
+
+    void __fastcall WalkFacingHead(void* task,void* edx,void* owner)
+    {
+        bool apply=firstPersonActive && !vehicleView && !animatedView && !ragdollView &&
+            !airborneView && OpenXRVR::HasFocusedViews() &&
+            !(CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive);
+        AcquireSRWLockShared(&headingLock);
+        apply=apply && headingValid && owner==headingOwner && GetTickCount64()-headingSampledAt<=250;
+        const float heading=headHeading;
+        ReleaseSRWLockShared(&headingLock);
+        AcquireSRWLockShared(&animationLock);
+        const Ped ped=animationPed;
+        apply=apply && ped && owner==animationOwner && !animationDriven && !animationRagdoll &&
+            GetTickCount64()-animationSampledAt<=250;
+        ReleaseSRWLockShared(&animationLock);
+        using Hash=Natives::NativeHashes;
+        if(apply && directionalWalk &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Hash::SET_CHAR_HEADING)) &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Hash::SET_CHAR_DESIRED_HEADING)))
+        {
+            // This native locomotion callback is on the simulation thread.
+            // Use native entity rotation, not a render-time matrix overwrite.
+            float bodyHeading=heading;
+            if(VRHands::Active(owner))
+            {
+                static void* facingOwner=nullptr;
+                static float facing=0;
+                if(facingOwner!=owner)
+                {
+                    float degrees=0; Natives::GetCharHeading(ped,&degrees);
+                    facing=degrees*3.14159265358979323846f/180.f; facingOwner=owner;
+                }
+                bool moving=false;
+                if(auto* pad=localPad ? localPad():nullptr)
+                    // The directional walking motor selects these signed
+                    // axes (8F00C0/8F00F0). Auxiliary 90/91 may retain stale
+                    // values when untouched and must not assert traversal.
+                    for(unsigned id:{12u,13u,14u,15u})
+                    {
+                        auto* value=static_cast<unsigned char*>(pad)+0x2698+16*id;
+                        moving |= std::abs(static_cast<int>(value[6]^value[4])-128)>34;
+                    }
+                if(moving) facing=heading; // Traversal owns logical forward.
+                else VRHands::StationaryBodyHeading(owner,facing,facing);
+                VRHands::SetTraversalState(owner,moving,!crouchedView);
+                bodyHeading=facing;
+            }
+            const float degrees=bodyHeading*180.f/3.14159265358979323846f;
+            Natives::SetCharHeading(ped,degrees);
+            Natives::SetCharDesiredHeading(ped,degrees);
+            ++directionalWalkCalls;
+            // Same task layout/thiscall ABI as ordinary walk; preserves native
+            // collision and selects signed forward/lateral animation blends.
+            directionalWalk(task,owner);
+            return;
+        }
+        ordinaryWalk.unsafe_fastcall<void>(task,edx,owner);
+    }
+
+    void __fastcall UpdateControllerPad(void* pad,void* edx)
+    {
+        // The classifier changes movement value XOR keys according to native
+        // device ownership. Merge after it, using the final keys for this tick.
+        controllerPadUpdate.unsafe_fastcall<void>(pad,edx);
+        if(!localPad || pad!=localPad()) return;
+        OpenXRVR::ControllerInput input{};
+        const bool fresh=firstPersonActive && !ragdollView && OpenXRVR::HasFocusedViews() &&
+            !(CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) &&
+            !(CTimer::ms_bScriptPause && *CTimer::ms_bScriptPause) &&
+            OpenXRVR::GetControllerInput(input) && input.gripPoseValid[1];
+        const bool center=fresh && input.clicked[1] &&
+            std::abs(input.trackpad[1][0])<.25f &&
+            std::hypot(input.trackpad[1][0],input.trackpad[1][1])<.35f;
+        const bool menu=fresh && input.menuActive[1] && input.menuPressed[1];
+        if(!fresh)
+        {
+            buttonsArmed=false; previousJump=previousEnter=previousHandbrake=previousRun=false;
+            padSteering=padThrottle=padBrake=0;
+            return; // The freshly updated native values already cleared VR input.
+        }
+        if(!buttonsArmed && !input.clicked[1] && !menu) buttonsArmed=true;
+        auto writeValue=[](unsigned char* value,unsigned char decoded)
+        {
+            value[6]=decoded^value[4];
+            // Vehicle exit B7BDE0 tests held input through 8F0230's native
+            // 64-sample history, not just current/prior bytes. Replace this
+            // tick's existing sample; retain native index, time and allocation.
+            auto* history=*reinterpret_cast<unsigned char**>(value+12);
+            if(history && value[8]<64) history[8*value[8]]=value[6];
+        };
+        auto button=[&](unsigned id,bool down,bool wasDown)
+        {
+            auto* value=static_cast<unsigned char*>(pad)+0x2698+16*id;
+            const unsigned char key=value[4];
+            const unsigned char current=value[6]^key,previous=value[7]^key;
+            writeValue(value,static_cast<unsigned char>(std::max<unsigned>(current,down ? 255:0)));
+            value[7]=static_cast<unsigned char>(std::max<unsigned>(previous,wasDown ? 255:0)^key);
+        };
+        const bool driving=vehicleView;
+        const bool jump=buttonsArmed && center && !driving && !animatedView;
+        const bool enter=buttonsArmed && menu;
+        const bool handbrake=buttonsArmed && center && driving;
+        button(2,jump,previousJump); // INPUT_JUMP
+        button(3,enter && !driving,previousEnter && !driving); // INPUT_ENTER
+        button(43,enter && driving,previousEnter && driving); // INPUT_VEH_EXIT
+        button(44,handbrake,previousHandbrake); // INPUT_VEH_HANDBRAKE
+        button(45,handbrake,previousHandbrake); // alternate handbrake
+        if(jump && !previousJump) ++padJumpPresses;
+        if(enter && !previousEnter) ++padEnterPresses;
+        previousJump=jump; previousEnter=enter; previousHandbrake=handbrake;
+        ++padButtonUpdates;
+        auto analog=[&](unsigned id,unsigned char decoded)
+        {
+            writeValue(static_cast<unsigned char*>(pad)+0x2698+16*id,decoded);
+        };
+        if(controllerLocomotion && !driving && !animatedView && input.gripPoseValid[0] &&
+            input.active[0] && input.padTouched[0])
+        {
+            const auto axes=VRMath::TouchpadMovement(input.trackpad[0][0],input.trackpad[0][1]);
+            auto axisByte=[](float axis)
+            {
+                // Undo the native signed decoder's additional 25% deadzone.
+                const float native=std::abs(axis)>.0001f ? std::copysign(.25f+.75f*std::abs(axis),axis):0.f;
+                return static_cast<unsigned char>(std::lround(127.5f+127.5f*native));
+            };
+            // Supply the actual shared movement values too: jump selection and
+            // takeoff query them outside the walking-only decoder call sites.
+            for(unsigned id:{12u,13u,91u}) analog(id,axisByte(axes[0]));
+            for(unsigned id:{14u,15u,90u}) analog(id,axisByte(-axes[1]));
+            const bool run=std::hypot(axes[0],axes[1])>.01f &&
+                (input.clicked[0] || std::hypot(input.trackpad[0][0],input.trackpad[0][1])>=.85f);
+            button(1,run,previousRun);
+            previousRun=run;
+        }
+        else previousRun=false;
+        if(driving && input.gripPoseValid[0])
+        {
+            const float steering=input.active[0] && input.padTouched[0] ?
+                VRMath::TouchpadMovement(input.trackpad[0][0],input.trackpad[0][1])[0]:0.f;
+            const float throttle=input.triggerActive[1] ? input.trigger[1]:0.f;
+            const float brake=input.triggerActive[0] ? input.trigger[0]:0.f;
+            const auto encodedSteer=static_cast<unsigned char>(std::lround(127.5f+127.5f*steering));
+            for(unsigned id:{30u,31u,111u}) analog(id,encodedSteer);
+            analog(40,static_cast<unsigned char>(std::lround(throttle*255.f)));
+            analog(41,static_cast<unsigned char>(std::lround(brake*255.f)));
+            padSteering=steering; padThrottle=throttle; padBrake=brake;
+            ++padDrivingUpdates;
+        }
+        else padSteering=padThrottle=padBrake=0;
+    }
+
+    bool ControllerMoveAxes(std::array<float,2>& axes,OpenXRVR::ControllerInput* snapshot=nullptr)
+    {
+        if(!firstPersonActive || vehicleView || animatedView || ragdollView ||
+            !OpenXRVR::HasFocusedViews() || (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive)) return false;
+        AcquireSRWLockShared(&headingLock);
+        const bool headingFresh=headingOwner && headingValid && GetTickCount64()-headingSampledAt<=250;
+        ReleaseSRWLockShared(&headingLock);
+        OpenXRVR::ControllerInput input{};
+        if(!headingFresh || !OpenXRVR::GetControllerInput(input) || !input.active[0] ||
+            !input.gripPoseValid[0] || !input.padTouched[0]) return false;
+        axes=VRMath::TouchpadMovement(input.trackpad[0][0],input.trackpad[0][1]);
+        if(snapshot) *snapshot=input;
+        return true;
+    }
+
+    void* __fastcall ReadPadRunControl(void* control,void* edx)
+    {
+        auto* original=runControl.unsafe_fastcall<unsigned char*>(control,edx);
+        if(padGait<0 || !original) return original;
+        // Native action bytes are XOR encoded with byte4. Supply a private
+        // read-only view for this speed query; never mutate shared controls.
+        std::memcpy(padRunControl,original,sizeof(padRunControl));
+        const auto key=padRunControl[4];
+        padRunControl[6]=static_cast<unsigned char>((padGait ? 255 : 0)^key);
+        // Sprint's native tap accumulator sees a fresh press while click is
+        // held. The original speed routine still owns stamina/exhaustion.
+        padRunControl[7]=static_cast<unsigned char>((padGait==1 ? 255 : 0)^key);
+        if(padGait==2) ++padSprintReads;
+        else if(padGait==1) ++padJogReads;
+        return padRunControl;
+    }
+
+    float __fastcall PadMovementSpeed(void* owner,void* edx,int mode,int tapMode)
+    {
+        std::array<float,2> axes{};
+        OpenXRVR::ControllerInput input{};
+        AcquireSRWLockShared(&headingLock);
+        const bool local=owner && owner==headingOwner;
+        ReleaseSRWLockShared(&headingLock);
+        const int previous=padGait;
+        if(local && ControllerMoveAxes(axes,&input))
+        {
+            const float radius=std::hypot(input.trackpad[0][0],input.trackpad[0][1]);
+            const bool moving=std::hypot(axes[0],axes[1])>.01f;
+            padGait=moving && input.clicked[0] ? 2 : moving && radius>=.85f ? 1 : 0;
+        }
+        const float result=movementSpeed.unsafe_fastcall<float>(owner,edx,mode,tapMode);
+        padGait=previous;
+        return result;
+    }
+
+    void RecordControllerAxisCaller(uintptr_t caller)
+    {
+        ++controllerAxisCalls;
+        for(auto& recorded:controllerAxisCallers)
+        {
+            auto existing=recorded.load();
+            if(existing==caller || (!existing && recorded.compare_exchange_strong(existing,caller))) break;
+        }
+    }
+
+    float __cdecl ReadControllerMoveFloatAxis(const void* value)
+    {
+        const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0x400000;
+        RecordControllerAxisCaller(caller);
+        // Ordinary CTaskSimpleMovePlayer uses normalized float axes.
+        const bool horizontal=caller==0x00A741FC;
+        const bool vertical=caller==0x00A74212;
+        std::array<float,2> axes{};
+        if(horizontal || vertical)
+        {
+            ++controllerMotorReads;
+            if(ControllerMoveAxes(axes))
+            {
+                ++controllerMoveReads;
+                return horizontal ? axes[0] : -axes[1];
+            }
+        }
+        return controllerMoveFloatAxis.ccall<float>(value);
+    }
+
+    int __cdecl ReadControllerMoveAxis(const void* value)
+    {
+        const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0x400000;
+        RecordControllerAxisCaller(caller);
+        // Restrict substitution to the normal and directional on-foot motors.
+        // Other control reads (camera, menus, vehicles, NPCs) remain native.
+        const bool horizontal=caller==0x00CD4B54 || caller==0x00CD4EB8 || caller==0x00A74701;
+        const bool vertical=caller==0x00CD4B73 || caller==0x00CD4ED7 || caller==0x00A7471E;
+        if(horizontal || vertical) ++controllerMotorReads;
+        std::array<float,2> axes{};
+        if((horizontal || vertical) && ControllerMoveAxes(axes))
+        {
+                ++controllerMoveReads;
+                // Native motors negate vertical input; OpenXR pad +Y is forward.
+                return static_cast<int>(std::lround((horizontal ? axes[0] : -axes[1])*127.5f));
+        }
+        return controllerMoveAxis.ccall<int>(value);
     }
 
     // CE CPedMoveBlendOnFoot virtual +0x10, thiscall(output*, dt), ret 8.
@@ -708,6 +1009,26 @@ std::string VRCamera::MovementStatus()
     result.pop_back();
     return result+room;
 }
+
+std::string VRCamera::ControllerMovementStatus()
+{
+    char text[600];
+    sprintf_s(text,"{\"configured\":%s,\"installed\":%s,\"axisReads\":%u,\"deadzone\":0.15,\"decoderCalls\":%u,\"motorReads\":%u,\"directionalInstalled\":%s,\"directionalCalls\":%u,\"gaitInstalled\":%s,\"jogReads\":%u,\"sprintReads\":%u,\"callers\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
+        controllerLocomotion ? "true":"false",controllerMoveAxis && controllerMoveFloatAxis ? "true":"false",controllerMoveReads.load(),
+        controllerAxisCalls.load(),controllerMotorReads.load(),
+        ordinaryWalk && directionalWalk ? "true":"false",directionalWalkCalls.load(),
+        movementSpeed && runControl ? "true":"false",padJogReads.load(),padSprintReads.load(),
+        static_cast<unsigned>(controllerAxisCallers[0].load()),static_cast<unsigned>(controllerAxisCallers[1].load()),
+        static_cast<unsigned>(controllerAxisCallers[2].load()),static_cast<unsigned>(controllerAxisCallers[3].load()),
+        static_cast<unsigned>(controllerAxisCallers[4].load()),static_cast<unsigned>(controllerAxisCallers[5].load()),
+        static_cast<unsigned>(controllerAxisCallers[6].load()),static_cast<unsigned>(controllerAxisCallers[7].load()));
+    std::string result=text; result.pop_back();
+    char buttons[340];
+    sprintf_s(buttons,",\"buttonsConfigured\":%s,\"buttonsInstalled\":%s,\"buttonUpdates\":%u,\"jumpPresses\":%u,\"enterPresses\":%u,\"drivingUpdates\":%u,\"steering\":%.3f,\"throttle\":%.3f,\"brake\":%.3f}",
+        controllerButtons ? "true":"false",controllerPadUpdate ? "true":"false",padButtonUpdates.load(),
+        padJumpPresses.load(),padEnterPresses.load(),padDrivingUpdates.load(),padSteering.load(),padThrottle.load(),padBrake.load());
+    result+=buttons; return result;
+}
 bool VRCamera::RestartAnchorProbe()
 {
     if(!probeAnchor) return false;
@@ -731,10 +1052,29 @@ void VRCamera::SetHeadlessBodyAvailable(bool available) {headlessBodyAvailable=a
 void VRCamera::Install()
 {
     CIniReader ini("");
-    debugBody=ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0)!=0;
+    debugBody=ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0)!=0 || ini.ReadInteger("VR","ExperimentalHandIK",0)!=0;
     probeAnchor=ini.ReadInteger("DEVELOPMENT","ProbeFirstPersonAnchor",0)!=0;
     probeSamples=std::clamp(ini.ReadInteger("DEVELOPMENT","FirstPersonProbeSamples",8),1,240);
     firstPerson=ini.ReadInteger("VR","ExperimentalFirstPerson",0)!=0;
+    controllerButtons=firstPerson && ini.ReadInteger("VR","ExperimentalControllerInput",0) &&
+        ini.ReadInteger("VR","ExperimentalControllerButtons",0);
+    if(controllerButtons)
+    {
+        auto update=hook::pattern("83 EC 1C 56 6A 00 6A 01 8B F1 E8 ? ? ? ? 83 C4 04 8B C8 E8 ? ? ? ? 50 E8");
+        if(update.size()==1)
+        {
+            auto* code=update.get_first<unsigned char>();
+            auto* getter=code+15+*reinterpret_cast<int32_t*>(code+11);
+            // Native GetPad returns the fixed local table on this CE build.
+            if(getter[0]==0xB8 && getter[5]==0xC3)
+            {
+                localPad=reinterpret_cast<PadGetter>(getter);
+                controllerPadUpdate=safetyhook::create_inline(code,UpdateControllerPad);
+            }
+        }
+    }
+    const float forwardOffset=ini.ReadFloat("VR","FirstPersonForwardOffset",.08f);
+    if(std::isfinite(forwardOffset)) firstPersonForwardOffset=std::clamp(forwardOffset,0.f,.15f);
     roomScale=firstPerson && ini.ReadInteger("VR","ExperimentalRoomScale",0)!=0;
     physicalCrouchEnabled=firstPerson && ini.ReadInteger("VR","ExperimentalPhysicalCrouch",0)!=0;
     const float crouchReference=ini.ReadFloat("VR","PlayerHeight",1.75f);
@@ -766,6 +1106,35 @@ void VRCamera::Install()
     {
         auto heading=hook::pattern("56 57 6A 00 8B F9 8B 0D ? ? ? ? 6A 01 E8 ? ? ? ? 8B F0 85 F6 74 75 8B 16 8B CE FF 52 0C");
         if(heading.size()==1) movementHeading=safetyhook::create_inline(heading.get_first(),WalkingHeading);
+    }
+    controllerLocomotion=headRelativeMovement && movementHeading &&
+        ini.ReadInteger("VR","ExperimentalControllerInput",0) &&
+        ini.ReadInteger("VR","ExperimentalControllerLocomotion",0);
+    if(headRelativeMovement && movementHeading && ini.ReadInteger("VR","ExperimentalHandIK",0))
+    {
+        auto ordinary=hook::pattern("55 8B EC 83 E4 F0 83 EC 38 56 57 8B 7D 08 8B F1 8B CF 89 74 24 24 E8 ? ? ? ? 8B C8 89 44 24 20");
+        auto directional=hook::pattern("55 8B EC 83 E4 F0 83 EC 28 56 57 8B 7D 08 89 4C 24 18 6A 01 8B CF E8 ? ? ? ? 8B CF E8 ? ? ? ? 8B F0");
+        if(ordinary.size()==1 && directional.size()==1)
+        {
+            directionalWalk=reinterpret_cast<DirectionalWalk>(directional.get_first());
+            ordinaryWalk=safetyhook::create_inline(ordinary.get_first(),WalkFacingHead);
+        }
+    }
+    if(controllerLocomotion)
+    {
+        // Integer and float decoders share a prologue. Include the signed
+        // normalization and integer-only result conversion to distinguish it.
+        auto axis=hook::pattern("8B 44 24 04 F3 0F 10 0D ? ? ? ? 8A 48 06 32 48 04 0F B6 C1 66 0F 6E C0 0F 5B C0 F3 0F 5C 05 ? ? ? ? F3 0F 59 05 ? ? ? ? 0F 2F C8 77 10 F3 0F 10 0D ? ? ? ? 0F 2F C1 77 03 0F 28 C8 83 EC 08 C7 44 24 04 00 00 80 3E F3 0F 11 0C 24 E8 ? ? ? ? D9 5C 24 0C");
+        if(axis.size()==1) controllerMoveAxis=safetyhook::create_inline(axis.get_first(),ReadControllerMoveAxis);
+        auto floatAxis=hook::pattern("8B 44 24 04 F3 0F 10 0D ? ? ? ? 8A 48 06 32 48 04 0F B6 C1 66 0F 6E C0 0F 5B C0 F3 0F 5C 05 ? ? ? ? F3 0F 59 05 ? ? ? ? 0F 2F C8 77 10 F3 0F 10 0D ? ? ? ? 0F 2F C1 77 03 0F 28 C8 83 EC 08 C7 44 24 04 00 00 80 3E F3 0F 11 0C 24 E8 ? ? ? ? 83 C4 08 C3");
+        if(floatAxis.size()==1) controllerMoveFloatAxis=safetyhook::create_inline(floatAxis.get_first(),ReadControllerMoveFloatAxis);
+        auto speed=hook::pattern("56 8B F1 8B 86 28 02 00 00 85 C0 0F 84 ? ? ? ? 83 C0 70 0F 84 ? ? ? ? 55 E8 ? ? ? ? 8B E8 85 ED");
+        auto run=hook::pattern("83 3D ? ? ? ? 00 75 2E 80 B9 8D 32 00 00 00 74 25");
+        if(speed.size()==1 && run.size()==1)
+        {
+            runControl=safetyhook::create_inline(run.get_first(),ReadPadRunControl);
+            if(runControl) movementSpeed=safetyhook::create_inline(speed.get_first(),PadMovementSpeed);
+        }
     }
     if(probeAnchor || roomScale)
     {
@@ -949,10 +1318,20 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
         for(const auto& row:gameCamera)
             for(float value:row)
                 if(!std::isfinite(value)) throw std::invalid_argument("Invalid game camera");
+        VRHands::PublishTrackingTransform(VRMath::Multiply(referenceInverse,gameCamera),
+            FindPlayerPed ? FindPlayerPed(0) : nullptr,useFirstPerson && !vehicle && !animated && OpenXRVR::HasFocusedViews());
+        // Move the eyes relative to the visible body, without shifting the
+        // controller/body tracking origin or changing vehicle/action anchors.
+        const auto headPose=VRMath::Multiply(VRMath::Multiply(
+            VRMath::Pose(eyes[0].position,eyes[0].orientation),referenceInverse),gameCamera);
+        const float forwardLength=std::hypot(headPose[2][0],headPose[2][1]);
         for(unsigned eye=0;eye<2;++eye)
         {
             alignas(16) VRMath::Matrix pose=VRMath::Multiply(VRMath::Multiply(
                 VRMath::Pose(eyes[eye].position,eyes[eye].orientation),referenceInverse),gameCamera);
+            if(useFirstPerson && !vehicle && !animated && forwardLength>1.e-4f)
+                for(unsigned axis=0;axis<2;++axis)
+                    pose[3][axis]-=firstPersonForwardOffset*headPose[2][axis]/forwardLength;
             alignas(16) VRMath::Matrix projection=VRMath::Projection(eyes[eye].fov,base.mNearClip,base.mFarClip);
             // Engine matrix helpers use aligned SSE loads/stores. The mirrored
             // viewport type has only four-byte alignment, so never pass an

@@ -1,5 +1,6 @@
-param([Parameter(Mandatory=$true)][int]$GameProcessId, [switch]$CollisionShape)
+param([Parameter(Mandatory=$true)][int]$GameProcessId, [switch]$CollisionShape, [switch]$Rig, [switch]$FingerRig, [switch]$BodyRig)
 $ErrorActionPreference = 'Stop'
+if($FingerRig -or $BodyRig) {$Rig=$true}
 # Read-only CE 1.2.0.59 diagnostic. No process writes, calls or suspension.
 if (-not ('GtaVrPlayerRead' -as [type])) {
     Add-Type @'
@@ -34,8 +35,132 @@ try {
     if ($taskIndex -lt 0 -or $taskIndex -gt 31) { throw 'No valid local player slot' }
     $taskInfo = [BitConverter]::ToUInt32((Read-GameBytes ($taskTableAddress + 4*$taskIndex) 4),0)
     $taskPed = [BitConverter]::ToUInt32((Read-GameBytes ($taskInfo + 0x598) 4),0)
+    if($BodyRig) {
+        # CE post-update call+10 -> fixed GetPad (B8 imm32 C3), read only.
+        $taskPadCall=$taskBase+0x8F4D00-0x400000+10
+        $taskCallBytes=Read-GameBytes $taskPadCall 5
+        if($taskCallBytes[0] -eq 0xE8) {
+            $taskGetter=$taskPadCall+5+[BitConverter]::ToInt32($taskCallBytes,1)
+            $taskGetterBytes=Read-GameBytes $taskGetter 6
+            if($taskGetterBytes[0] -eq 0xB8 -and $taskGetterBytes[5] -eq 0xC3) {
+                $taskPad=[BitConverter]::ToUInt32($taskGetterBytes,1)
+                foreach($taskAxis in @(12,13,14,15,90,91)) {
+                    $taskValue=Read-GameBytes ($taskPad+0x2698+16*$taskAxis) 8
+                    'pad axis {0}: current={1}' -f $taskAxis,($taskValue[6] -bxor $taskValue[4])
+                }
+            }
+        }
+    }
     $taskHeader = Read-GameBytes $taskPed 256
+    $taskHeldWeapon = [BitConverter]::ToUInt32((Read-GameBytes ($taskPed+0xB30) 4),0)
+    if ($taskHeldWeapon) {
+        $taskHeldModel = [BitConverter]::ToInt16((Read-GameBytes ($taskHeldWeapon+0x2E) 2),0)
+        $taskHeldState = [BitConverter]::ToInt32((Read-GameBytes ($taskHeldWeapon+0x1304) 4),0)
+        'task entity candidate CPed+B30=0x{0:X8} model={1} state+1304={2}' -f $taskHeldWeapon,$taskHeldModel,$taskHeldState
+    } else { 'task entity candidate CPed+B30=null (not equipped-weapon evidence)' }
+    $taskWeaponManager=Read-GameBytes ($taskPed+0x2B0) 160
+    $taskWeaponSlot=[BitConverter]::ToInt32($taskWeaponManager,0)
+    $taskWeaponEntity=[BitConverter]::ToUInt32($taskWeaponManager,0x14)
+    if($taskWeaponEntity) {
+        $taskWeaponObject=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponEntity+0x25C) 4),0)
+        if($taskWeaponObject) {
+            'weapon manager slot={0} entity=0x{1:X8} CWeapon=0x{2:X8} type={3}' -f $taskWeaponSlot,$taskWeaponEntity,$taskWeaponObject,[BitConverter]::ToInt32((Read-GameBytes ($taskWeaponObject+0x18) 4),0)
+            'weapon entity model={0} matrix=0x{1:X8}' -f [BitConverter]::ToInt16((Read-GameBytes ($taskWeaponEntity+0x2E) 2),0),[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponEntity+0x20) 4),0)
+            if($Rig) {
+                $taskWeaponMatrix=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponEntity+0x20) 4),0)
+                $taskWeaponMatrixBytes=Read-GameBytes $taskWeaponMatrix 64
+                for($taskRow=0;$taskRow -lt 4;$taskRow++) {
+                    'weapon matrix row{0}: {1}' -f $taskRow,((0..3 | ForEach-Object {[BitConverter]::ToSingle($taskWeaponMatrixBytes,16*$taskRow+4*$_).ToString('G6',[Globalization.CultureInfo]::InvariantCulture)}) -join ',')
+                }
+                $taskWeaponModelIndex=[BitConverter]::ToInt16((Read-GameBytes ($taskWeaponEntity+0x2E) 2),0)
+                $taskWeaponModel=[BitConverter]::ToUInt32((Read-GameBytes ($taskBase+0x1295CD8-0x400000+4*$taskWeaponModelIndex) 4),0)
+                'weapon model=0x{0:X8} muzzle bone+70={1}' -f $taskWeaponModel,[BitConverter]::ToInt32((Read-GameBytes ($taskWeaponModel+0x70) 4),0)
+                try {
+                    $taskWeaponFrag=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponModel+8) 4),0)
+                    if($taskWeaponFrag) {$taskWeaponDrawable=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponFrag+0xB4) 4),0)} else {
+                        $taskWeaponDrawPointer=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponModel+0xC) 4),0)
+                        $taskWeaponDrawable=[BitConverter]::ToUInt32((Read-GameBytes $taskWeaponDrawPointer 4),0)
+                    }
+                    $taskWeaponHierarchy=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponDrawable+0xC) 4),0)
+                    $taskWeaponBoneMatrices=[BitConverter]::ToUInt32((Read-GameBytes ($taskWeaponHierarchy+0x10) 4),0)
+                    $taskWeaponMuzzleIndex=[BitConverter]::ToInt32((Read-GameBytes ($taskWeaponModel+0x70) 4),0)
+                    $taskWeaponMuzzleBytes=Read-GameBytes ($taskWeaponBoneMatrices+64*$taskWeaponMuzzleIndex) 64
+                    for($taskRow=0;$taskRow -lt 4;$taskRow++) {
+                        'weapon muzzle local row{0}: {1}' -f $taskRow,((0..3 | ForEach-Object {[BitConverter]::ToSingle($taskWeaponMuzzleBytes,16*$taskRow+4*$_).ToString('G6',[Globalization.CultureInfo]::InvariantCulture)}) -join ',')
+                    }
+                } catch { 'weapon local muzzle unavailable: '+$_.Exception.Message }
+            }
+        }
+    } else { 'weapon manager slot={0}, no equipped entity' -f $taskWeaponSlot }
+    if($Rig) {
+        $taskModelIndex=[BitConverter]::ToInt16($taskHeader,0x2E)
+        if($taskModelIndex -lt 0) { throw 'Invalid ped model index' }
+        $taskRigModel=[BitConverter]::ToUInt32((Read-GameBytes ($taskBase+0x1295CD8-0x400000+4*$taskModelIndex) 4),0)
+        $taskRigVtable=[BitConverter]::ToUInt32((Read-GameBytes $taskRigModel 4),0)
+        $taskRigMap=[BitConverter]::ToUInt32((Read-GameBytes ($taskRigVtable+0x38) 4),0)
+        $taskRigSkeleton=[BitConverter]::ToUInt32((Read-GameBytes ($taskPed+0x100) 4),0)
+        'rig modelIndex={0} model=0x{1:X8} semanticMapperVA=0x{2:X8} skeleton=0x{3:X8}' -f $taskModelIndex,$taskRigModel,($taskRigMap-$taskBase+0x400000),$taskRigSkeleton
+        $taskRigSemanticBytes=Read-GameBytes ($taskRigModel+0x134) 32
+        'rig semanticIndices[0..31]={0}' -f ($taskRigSemanticBytes -join ',')
+        $taskRigFragment=[BitConverter]::ToUInt32((Read-GameBytes ($taskPed+0x7B4) 4),0)
+        if($taskRigFragment) {
+            $taskRigFragmentVtable=[BitConverter]::ToUInt32((Read-GameBytes $taskRigFragment 4),0)
+            $taskRigFragmentGetter=[BitConverter]::ToUInt32((Read-GameBytes ($taskRigFragmentVtable+0xE0) 4),0)
+            'rig fragment=0x{0:X8} skeletonGetterVA=0x{1:X8}' -f $taskRigFragment,($taskRigFragmentGetter-$taskBase+0x400000)
+            # Bounded observation of the live CE getter's known Niko layout.
+            # Do not apply this layout to other fragment implementations.
+            if(($taskRigFragmentGetter-$taskBase+0x400000) -eq 0x005FB8B0) {
+                $taskRigState=[BitConverter]::ToUInt32((Read-GameBytes ($taskRigFragment+0x64) 4),0)
+                if($taskRigState) { $taskRigSkeleton=[BitConverter]::ToUInt32((Read-GameBytes ($taskRigState+0x160) 4),0) }
+            }
+        }
+        if($taskRigSkeleton) {
+            if($FingerRig -or $BodyRig) {
+                $taskDefinition=[BitConverter]::ToUInt32((Read-GameBytes ($taskRigSkeleton+4) 4),0)
+                $taskDefinitionBytes=Read-GameBytes $taskDefinition 64
+                $taskBones=[BitConverter]::ToUInt32($taskDefinitionBytes,0)
+                'finger definition header={0}' -f [BitConverter]::ToString($taskDefinitionBytes)
+                'finger skeleton header={0}' -f [BitConverter]::ToString((Read-GameBytes $taskRigSkeleton 48))
+                $taskBoneIndices=@(45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89)
+                if($BodyRig) {
+                    $taskBoneCount=[BitConverter]::ToUInt16((Read-GameBytes ($taskRigSkeleton+0x10) 2),0)
+                    if($taskBoneCount -lt 1 -or $taskBoneCount -gt 255) {throw 'Invalid rig bone count'}
+                    $taskBoneIndices=0..($taskBoneCount-1)
+                }
+                foreach($taskBone in $taskBoneIndices) {
+                    $taskBoneBytes=Read-GameBytes ($taskBones+0xE0*$taskBone) 48
+                    $taskNamePointer=[BitConverter]::ToUInt32($taskBoneBytes,0)
+                    $taskName=''
+                    if($taskNamePointer -ge 0x10000) {
+                        try {$taskName=[Text.Encoding]::ASCII.GetString((Read-GameBytes $taskNamePointer 48)).Split([char]0)[0]} catch {}
+                    }
+                    'finger bone[{0}] nameCandidate={1} header={2}' -f $taskBone,$taskName,[BitConverter]::ToString($taskBoneBytes)
+                    if($taskBone -in @(47,48,49,53,54,71,72,73,75,76)) {
+                        $taskFullBone=Read-GameBytes ($taskBones+0xE0*$taskBone) 224
+                        for($taskOff=0x20;$taskOff -lt 224;$taskOff+=16) {
+                            'finger bone[{0}]+{1:X2}={2}' -f $taskBone,$taskOff,((0..3 | ForEach-Object {[BitConverter]::ToSingle($taskFullBone,$taskOff+4*$_).ToString('G6',[Globalization.CultureInfo]::InvariantCulture)}) -join ',')
+                        }
+                    }
+                }
+            }
+            $taskRigMatrices=[BitConverter]::ToUInt32((Read-GameBytes ($taskRigSkeleton+0x14) 4),0)
+            'rig matrixArray=0x{0:X8}; bone indices not assumed from semantic IDs' -f $taskRigMatrices
+            if($taskRigMatrices) {
+                foreach($taskRigSemantic in @(9,10,11,13,14,15)) {
+                    $taskRigBoneIndex=$taskRigSemanticBytes[$taskRigSemantic]
+                    if($taskRigBoneIndex -eq 255) { continue }
+                    $taskRigMatrix=Read-GameBytes ($taskRigMatrices+64*$taskRigBoneIndex) 64
+                    $taskRigXYZ=0..2 | ForEach-Object { [BitConverter]::ToSingle($taskRigMatrix,48+4*$_).ToString('G6',[Globalization.CultureInfo]::InvariantCulture) }
+                    'rig semantic={0} boneIndex={1} matrixTranslation={2} (native skeleton space)' -f $taskRigSemantic,$taskRigBoneIndex,($taskRigXYZ -join ',')
+                }
+            }
+        }
+    }
     $taskVtable = [BitConverter]::ToUInt32($taskHeader,0)
+    if($Rig) {
+        $taskRigInstanceGetter=[BitConverter]::ToUInt32((Read-GameBytes ($taskVtable+0xA0) 4),0)
+        'rig instanceGetterVA=0x{0:X8}' -f ($taskRigInstanceGetter-$taskBase+0x400000)
+    }
     $taskVisibilityMethod = [BitConverter]::ToUInt32((Read-GameBytes ($taskVtable+0x30) 4),0)
     'candidate visibility virtual +0x30: runtime=0x{0:X8} Ghidra=0x{1:X8}' -f $taskVisibilityMethod,($taskVisibilityMethod-$taskBase+0x400000)
     $taskRenderMethod = [BitConverter]::ToUInt32((Read-GameBytes ($taskVtable+0x8C) 4),0)

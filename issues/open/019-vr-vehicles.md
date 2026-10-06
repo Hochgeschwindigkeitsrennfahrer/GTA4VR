@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide usable VR vehicle cameras and controls for cars, bikes and available aircraft. Depends on #014/#015; coordinate aiming with #016. Roadmap stage 4.
+Provide usable VR vehicle cameras and controls for cars, bikes and available aircraft. Depends on #014/#015; coordinate tracked hands with closed #016 and weapon coverage with #024. Roadmap stage 4.
 
 ## Tasks
 
@@ -16,6 +16,11 @@ Provide usable VR vehicle cameras and controls for cars, bikes and available air
 A documented route passes for each supported vehicle class with usable controls and coherent headset camera/entry/exit. Aircraft coverage and any unavailable plane gameplay are stated explicitly.
 
 ## Notes / evidence
+
+### Current state — 2026-10-06
+
+The #014 car camera is accepted. #015 adds user-accepted basic Vive controls: right trigger throttle, left trigger brake/reverse, left pad touch steering, right menu entry/exit (including standstill exit), and right pad center handbrake. These are ordinary driving controls, not physical wheel/handle gripping. Remaining work includes physical cockpit interactions, bikes/aircraft/passengers and class-specific camera/control/comfort/compatibility routes. Historical statements that vehicle controls are wholly unimplemented are superseded by this summary.
+
 
 - 2026-10-04 user accepts #014's current car camera coverage for its closure. Bike/aircraft/passenger and unusual vehicle exit camera routes are deferred here; do not infer those classes passed from the accepted car route.
 

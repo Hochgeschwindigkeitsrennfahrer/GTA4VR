@@ -13,6 +13,29 @@ namespace VRMath
     using Vector = std::array<float, 4>;
     using Matrix = std::array<Vector, 4>;
 
+    inline Matrix ScaleBoneAbout(const Matrix& bone,const Vector& pivot,float scale)
+    {
+        auto result=bone;
+        if(!std::isfinite(scale) || scale<=0) return result;
+        for(unsigned axis=0;axis<3;++axis)
+        {
+            for(unsigned row=0;row<3;++row) result[row][axis]*=scale;
+            result[3][axis]=pivot[axis]+(bone[3][axis]-pivot[axis])*scale;
+        }
+        // GTA keeps metadata in W lanes; uniform scale touches only XYZ.
+        return result;
+    }
+
+    inline std::array<float,2> TouchpadMovement(float x,float y)
+    {
+        if(!std::isfinite(x) || !std::isfinite(y)) return {};
+        const float radius=std::sqrt(x*x+y*y);
+        constexpr float deadzone=.15f;
+        if(radius<=deadzone) return {};
+        const float scale=(std::min(radius,1.f)-deadzone)/((1.f-deadzone)*radius);
+        return {x*scale,y*scale};
+    }
+
     // Native weapon camera: forward=(-sin(yaw)*cos(pitch),
     // cos(yaw)*cos(pitch),sin(pitch)); viewport row 2 points backward.
     inline bool AimAngles(const Matrix& camera,float& pitch,float& yaw)
@@ -232,6 +255,15 @@ namespace VRMath
         return true;
     }
 
+    // Native GTA matrices may store metadata/NaNs in their fourth lanes.
+    // Convert their XYZ rows to an affine matrix before generic 4x4 math.
+    inline Matrix AffineXYZ(Matrix matrix)
+    {
+        for(unsigned row=0;row<3;++row) matrix[row][3]=0;
+        matrix[3][3]=1;
+        return matrix;
+    }
+
     inline Matrix InverseRigid(const Matrix& camera)
     {
         auto result = Identity();
@@ -240,6 +272,80 @@ namespace VRMath
         for (unsigned j=0; j<3; ++j)
             for (unsigned i=0; i<3; ++i) result[3][j] -= camera[3][i]*result[i][j];
         return result;
+    }
+
+    inline float Length3(const Vector& a) {return std::sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);}
+    inline Vector Difference3(const Vector& a,const Vector& b)
+    {return {a[0]-b[0],a[1]-b[1],a[2]-b[2],0};}
+    inline float Dot3(const Vector& a,const Vector& b)
+    {return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+    inline Vector Cross3(const Vector& a,const Vector& b)
+    {return {a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0],0};}
+
+    inline Matrix BlendRigidPose(const Matrix& from,const Matrix& to,float amount)
+    {
+        amount=std::clamp(amount,0.f,1.f);
+        auto result=from;
+        if(amount==0) return result;
+        for(unsigned row=0;row<4;++row) for(unsigned axis=0;axis<3;++axis)
+            result[row][axis]=from[row][axis]+(to[row][axis]-from[row][axis])*amount;
+        // Stance rotations are nearby; normalized basis interpolation avoids
+        // shearing the bones during the blend and preserves native W metadata.
+        const float xLength=Length3(result[0]);
+        if(xLength<1.e-5f) return from;
+        for(unsigned axis=0;axis<3;++axis) result[0][axis]/=xLength;
+        const float parallel=Dot3(result[1],result[0]);
+        for(unsigned axis=0;axis<3;++axis) result[1][axis]-=parallel*result[0][axis];
+        const float yLength=Length3(result[1]);
+        if(yLength<1.e-5f) return from;
+        for(unsigned axis=0;axis<3;++axis) result[1][axis]/=yLength;
+        const auto z=Cross3(result[0],result[1]);
+        for(unsigned axis=0;axis<3;++axis) result[2][axis]=z[axis];
+        return result;
+    }
+
+    // Fixed foot, two rigid segments, knee pole projected perpendicular to the
+    // hip-to-foot line. Reject unreachable targets rather than stretching legs.
+    inline bool TwoBoneKnee(const Vector& hip,const Vector& foot,const Vector& pole,
+        float upper,float lower,Vector& knee)
+    {
+        auto line=Difference3(foot,hip);
+        const float distance=Length3(line);
+        if(!std::isfinite(distance+upper+lower) || distance<1.e-5f ||
+            upper<.01f || lower<.01f || distance>upper+lower || distance<std::abs(upper-lower)) return false;
+        for(unsigned axis=0;axis<3;++axis) line[axis]/=distance;
+        auto bend=pole;
+        const float parallel=Dot3(bend,line);
+        for(unsigned axis=0;axis<3;++axis) bend[axis]-=parallel*line[axis];
+        const float length=Length3(bend);
+        if(!std::isfinite(length) || length<1.e-5f) return false;
+        const float along=(upper*upper-lower*lower+distance*distance)/(2*distance);
+        const float across=std::sqrt(std::max(0.f,upper*upper-along*along));
+        knee=hip;
+        for(unsigned axis=0;axis<3;++axis) knee[axis]+=along*line[axis]+across*bend[axis]/length;
+        return true;
+    }
+
+    // Row-vector rigid rotation taking one segment direction to another.
+    inline Matrix SegmentRotation(Vector from,Vector to)
+    {
+        const float a=Length3(from),b=Length3(to);
+        if(a<1.e-5f || b<1.e-5f) return Identity();
+        for(unsigned axis=0;axis<3;++axis) {from[axis]/=a; to[axis]/=b;}
+        auto cross=Cross3(from,to);
+        float w=1.f+std::clamp(Dot3(from,to),-1.f,1.f);
+        if(w<1.e-5f)
+        {
+            cross=Cross3(from,std::abs(from[0])<.8f ? Vector{1,0,0,0}:Vector{0,1,0,0});
+            w=0;
+        }
+        const float norm=std::sqrt(Dot3(cross,cross)+w*w);
+        if(!std::isfinite(norm) || norm<1.e-5f) return Identity();
+        const float x=cross[0]/norm,y=cross[1]/norm,z=cross[2]/norm;
+        w/=norm;
+        return {{{1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0},
+            {2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0},
+            {2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0},{0,0,0,1}}};
     }
 
     // OpenXR is Y-up. Recenter translation and yaw only; never make the

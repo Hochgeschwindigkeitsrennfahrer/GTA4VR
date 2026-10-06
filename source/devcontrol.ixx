@@ -17,6 +17,7 @@ import comvars;
 import openxrvr;
 import vrstereo;
 import vrcamera;
+import vrhands;
 import vrprofile;
 import natives;
 
@@ -186,6 +187,29 @@ namespace
         {
             response="{\"ok\":true,\"input\":"+OpenXRVR::InputStatus()+"}";
         }
+        else if(command=="hand-status") response="{\"ok\":true,\"hands\":"+VRHands::Status()+"}";
+        else if(command=="hand-calibrate left" || command=="hand-calibrate right")
+        {
+            response=VRHands::Calibrate(command=="hand-calibrate left" ? 0u : 1u)
+                ? "{\"ok\":true,\"hands\":"+VRHands::Status()+"}"
+                : "{\"ok\":false,\"error\":\"fresh focused headset and selected grip pose required\"}";
+        }
+        else if(command.rfind("hand-trim ",0)==0)
+        {
+            char side[6]{},trailing=0; int x=0,y=0,z=0;
+            const bool parsed=sscanf_s(command.c_str()+10,"%5s %d %d %d %c",side,6u,&x,&y,&z,&trailing,1u)==4;
+            response=parsed && (strcmp(side,"left")==0 || strcmp(side,"right")==0) &&
+                VRHands::Trim(strcmp(side,"left")==0 ? 0u : 1u,x,y,z)
+                ? "{\"ok\":true,\"hands\":"+VRHands::Status()+"}"
+                : "{\"ok\":false,\"error\":\"expected enabled hand IK, left/right and integer x y z trim in [-45,45]\"}";
+        }
+        else if(command.rfind("hand-rotation ",0)==0)
+        {
+            int x=0,y=0,z=0; char trailing=0;
+            response=sscanf_s(command.c_str()+14,"%d %d %d %c",&x,&y,&z,&trailing,1u)==3 && VRHands::SetRotation(x,y,z)
+                ? "{\"ok\":true,\"hands\":"+VRHands::Status()+"}"
+                : "{\"ok\":false,\"error\":\"expected enabled hand IK and integer x y z rotations in [-180,180]\"}";
+        }
         else if(command=="location-status") response=LocationStatus();
         else if(command=="location-capture") response=QueueLocation(LocationOperation::Capture);
         else if(command.rfind("location-restore ",0)==0)
@@ -194,6 +218,10 @@ namespace
             response=VRDevLocation::Parse(std::string_view(command).substr(17),value)
                 ? QueueLocation(LocationOperation::Restore,value)
                 : "{\"ok\":false,\"error\":\"expected bounded finite x y z heading\"}";
+        }
+        else if(command=="locomotion-status")
+        {
+            response="{\"ok\":true,\"locomotion\":"+VRCamera::ControllerMovementStatus()+"}";
         }
         else if(command=="movement-status")
         {

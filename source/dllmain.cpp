@@ -11,6 +11,7 @@ import vrinteropprobe;
 import vrd3d9ex;
 import vrviewprobe;
 import vrcamera;
+import vrhands;
 import vrstereo;
 import vrprofile;
 
@@ -63,6 +64,7 @@ void Init()
     DevControl::Install();
     VRInteropProbe::Install();
     VRCamera::Install();
+    VRHands::Install();
     VRViewProbe::Install();
     VRStereo::Install();
     auto pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9");

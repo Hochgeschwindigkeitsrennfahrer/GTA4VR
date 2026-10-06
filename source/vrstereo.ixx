@@ -3478,7 +3478,7 @@ void VRStereo::Install()
         Log(cameraVolumeCull ? "VR main-world camera-volume correction installed" : "VR camera-volume correction unavailable");
         if(ped.size()==1) pedRender=safetyhook::create_inline(ped.get_first(),PedRender);
         VRCamera::SetVisibilityAvailable(static_cast<bool>(pedRender));
-        if(ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0))
+        if(ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0) || ini.ReadInteger("VR","ExperimentalHandIK",0))
         {
             auto ctor=hook::pattern("53 8B D9 56 8B 43 04 C7 03 ? ? ? ? 33 05 ? ? ? ? 57 25 FF 3F 00 00");
             auto execute=hook::pattern("51 56 8B F1 57 0F B7 46 08 8B 3C 85 ? ? ? ? 8B 47 08 85 C0");
