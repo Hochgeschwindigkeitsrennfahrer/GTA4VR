@@ -87,3 +87,5 @@ User accepts expanded binocular HUD (fantastic) and requests closure/commit. Ear
 
 Core milestone complete. Broader checks transferred to #031; #007/#015/#019/#022/#030 stay open for their own scope. User distributed INI ViewHudWidth0.5 edit preserved; deployed missing-key fallback remains0.64. No all-episode or complete-mission compatibility claim.
 - After final flat-screen check, original INI restoration hash matched; VR relaunch PID7148 reached FOCUSED DXVK-Vulkan continuous stereo (386 layers, zero command-buffer overflows). Game left running on accepted build; no source rebuild or calibration changes during closure.
+
+- 2026-10-06 follow-up consolidation: #007 subsequently closed as superseded. Remaining attribution is owned by #031 (unmatched UI/transitions), #022 (phone) and #026 (cinematic post-processing); earlier references to open #007 are historical.

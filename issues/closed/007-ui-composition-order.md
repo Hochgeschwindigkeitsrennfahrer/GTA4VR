@@ -17,6 +17,16 @@ A repeatable capture and phase/draw timeline attributes each listed element to i
 
 ## Notes / evidence
 
+### Closed as superseded — 2026-10-06
+
+The core radar, native text/sprite HUD, loading and pause ownership findings were implemented and accepted in [#020](020-vr-overlays-and-subtitles.md). The original exhaustive timeline was not completed; its remaining work is consolidated into outcome-specific issues:
+
+- [#031](../open/031-ui-coverage-and-lifecycle.md) owns unmatched UI pixels, draw attribution and transitions discovered during coverage/lifecycle checks.
+- [#022](../open/022-physical-interactive-phone.md) owns the phone model/screen draw order, camera/target ownership and interaction mapping.
+- [#026](../open/026-disable-cinematic-depth-blur.md) owns cinematic post-processing order and target/history dependencies needed to remove focus blur safely.
+
+No separate full-pipeline investigation is required before those tasks. Historical observations below are retained; statements that this issue remains open describe its earlier scope.
+
 - 2026-10-06 #020 radar watch: `00D76360` statically resembles a radar HUD composer but had zero calls in two CE1.2.0.59 VR runs; it is not the active boundary. Native CRadarNY ring textures are loaded at `005DB040`/`005DCA20` into `010344D0/D4`. `00903060` draws normalized health/armor ring geometry through `00903330`; runtime hook calls advance continuously. It runs in the render executor, so the watch copies the current viewport directly after original emission instead of appending simulation commands. Ghidra bookmarks distinguish unused and active candidates, and program saved. Pixel contents and health/armor acceptance pending. Full UI timeline remains open.
 - On 2026-10-01 the user deferred UI presentation decisions and prioritized first-person work. #014 may proceed while #007 remains open. Its required regression boundary is to preserve non-world radar/menu cameras and UI state, avoid duplicate UI/script updates, and verify pause/resume and flat-screen behavior. Investigate a specific boundary only if a camera change breaks it; full pixel attribution and UI redesign need not block camera bringup.
 - #003 associated `PhoneModel` and `Script2d` with the phone, `FrontEnd` with the pause map, and mapped viewport-command order through G-buffer, lighting, DrawScene, radar, and post-processing. Those traces did not attribute final pixels or locate subtitles. See [`docs/rendering-pipeline.md`](../../docs/rendering-pipeline.md).

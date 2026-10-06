@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace the gameplay phone overlay with a physical phone that the player can hold and operate in the world. Depends on #015/#016/#020 and phone attribution in #007. Roadmap stage 6.
+Replace the gameplay phone overlay with a physical phone that the player can hold and operate in the world. Depends on #015/#016/#020; this issue owns remaining phone attribution, using the findings preserved in closed #007. Roadmap stage 6.
 
 ## Tasks
 
@@ -16,6 +16,8 @@ Replace the gameplay phone overlay with a physical phone that the player can hol
 A held phone can be operated physically for the recorded required game functions without a duplicate overlay or blocked mission progression.
 
 ## Notes / evidence
+
+- 2026-10-06: remaining phone model/screen draw order and camera/target ownership investigation transferred here when #007 was closed as superseded. Include that evidence in the native phone mapping before implementing physical presentation.
 
 - User wants the phone to be a physical in-world object. Existing PhoneModel/Script2d observations in #003/#007 are starting evidence, not a complete interaction mapping.
 - Requested on 2026-10-01. Implementation and runtime acceptance remain pending.

@@ -20,7 +20,7 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [004 — Select an OpenXR graphics bridge (closed)](closed/004-select-openxr-bridge.md)
 - [005 — Add opt-in OpenXR initialization (closed)](closed/005-openxr-initialization.md)
 - [006 — Route two eye views with safe visibility and targets (closed)](closed/006-eye-visibility-and-targets.md)
-- [007 — Attribute UI and post-processing draw order](open/007-ui-composition-order.md)
+- [007 — Attribute UI and post-processing draw order (superseded)](closed/007-ui-composition-order.md)
 - [008 — Persist reverse-engineering findings in Ghidra (closed)](closed/008-ghidra-project-workflow.md)
 - [009 — Local development command bridge (closed)](closed/009-local-development-command-bridge.md)
 - [010 — Traffic-light lamps missing in the right eye](open/010-traffic-light-right-eye.md). Isolated follow-up; the user does not require it to block #006.
