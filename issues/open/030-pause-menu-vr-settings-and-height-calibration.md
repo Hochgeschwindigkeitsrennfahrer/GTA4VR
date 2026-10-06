@@ -20,3 +20,5 @@ Players can open VR settings in the pause menu, set or explicitly calibrate thei
 ## Notes / evidence
 
 - 2026-10-04: Requested by the user while testing #014. Interim `[VR] PlayerHeight=1.75` meters is stored in the ASI INI; physical crouch enters at1.1375m (65%) and exits at1.3125m (75%). Height calibration UI is deferred to this issue. UI presentation choices for gameplay overlays in #020 remain separate.
+
+- 2026-10-06: include ViewHudWidth/ViewHudDistance, wrist radar size/offsets and generic car dashboard placement in the settings inventory. #020 supplies accepted stereo HUD and tracked pause-menu pointer; #031 owns broader UI coverage. Preserve the user's distributed ViewHudWidth0.5 preference when designing the settings UI.

@@ -18,6 +18,7 @@ module;
 #include <atomic>
 #include <cmath>
 #include <filesystem>
+#include "includes/vrmath.hpp"
 
 export module openxrvr;
 
@@ -44,8 +45,24 @@ export namespace OpenXRVR
         bool triggerActive[2]{},padTouched[2]{};
         bool menuActive[2]{},menuPressed[2]{};
         float trigger[2]{};
+        // Gameplay actions are independent of the finger/pose observations above.
+        bool moveActive=false,moveEnabled=false,sprint=false,jump=false,interact=false;
+        float move[2]{},fire=0,steer=0,accelerate=0,brake=0;
+        bool fireActive=false,support=false,handbrake=false,exitVehicle=false;
+        bool cycle=false,nextWeapon=false,previousWeapon=false;
+        float cycleDirection=0;
+        bool pause=false,select[2]{},back=false;
         unsigned long long sampledAt=0;
     };
+    struct PanelPointer
+    {
+        bool active=false,hit=false,down=false,back=false;
+        float u=0,v=0;
+        float origin[3]{},end[3]{};
+        unsigned long long sampledAt=0;
+    };
+    bool GetPanelPointer(PanelPointer& pointer);
+    void SetDriving(bool driving);
     bool GetControllerInput(ControllerInput& input);
     std::string InputStatus();
     void Install();
@@ -63,6 +80,7 @@ export namespace OpenXRVR
     bool SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsigned width,unsigned height,
         const EyeView (&views)[2],long long poseTime);
     void SetEyeImageProvider(void (*provider)()); // Called on EndScene before any D3D11 eye copy.
+    bool SetPanelImage(IDirect3DTexture9* texture,HANDLE shared,unsigned width,unsigned height);
 }
 
 namespace
@@ -140,6 +158,12 @@ namespace
     uint64_t eyeSampledAt=0;
     bool controllerEnabled=false,inputReady=false;
     XrActionSet inputActions=XR_NULL_HANDLE;
+    XrActionSet gameplayActions=XR_NULL_HANDLE,drivingActions=XR_NULL_HANDLE,menuActions=XR_NULL_HANDLE,systemActions=XR_NULL_HANDLE;
+    enum class Action {Move,MoveEnable,Sprint,Jump,Interact,Fire,Support,Cycle,CycleDirection,Next,Previous,
+        Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,Count};
+    XrAction actions[static_cast<unsigned>(Action::Count)]{};
+    std::atomic<bool> drivingInput=false;
+    OpenXRVR::PanelPointer panelPointer{};
     XrAction padAction=XR_NULL_HANDLE,clickAction=XR_NULL_HANDLE,aimAction=XR_NULL_HANDLE;
     XrAction gripPoseAction=XR_NULL_HANDLE,gripAction=XR_NULL_HANDLE;
     XrAction triggerAction=XR_NULL_HANDLE,touchAction=XR_NULL_HANDLE;
@@ -185,6 +209,11 @@ namespace
         HANDLE sharedHandle=nullptr;
     };
     EyeSwapchain* eyeChains=nullptr; // Explicit render-thread cleanup, never loader-lock COM destruction.
+    EyeSwapchain* panelChain=nullptr;
+    DxvkVulkan::Bridge* panelBridge=nullptr;
+    unsigned panelWidth=0,panelHeight=0,panelFrames=0;
+    bool panelActive=false,panelAnchored=false;
+    XrPosef panelPose{{0,0,0,1},{0,0,-2}};
     OpenXRVR::EyeView imageViews[2]{};
     unsigned imageWidth=0,imageHeight=0;
     long long imagePoseTime=0;
@@ -317,7 +346,8 @@ namespace
         rateWindowStart=0;
         rateWindowLayers=0;
         haveEyeImages=false;
-        if(vulkanBridge && !vulkanBridge->Destroy())
+        panelActive=panelAnchored=false;
+        if((panelBridge && !panelBridge->Destroy()) || (vulkanBridge && !vulkanBridge->Destroy()))
         {
             // Keep session/images alive until the pending GPU work completes.
             // A timed-out command must not leave the runtime holding freed memory.
@@ -329,6 +359,13 @@ namespace
             return;
         }
         delete vulkanBridge; vulkanBridge=nullptr;
+        delete panelBridge;panelBridge=nullptr;
+        if(panelChain)
+        {
+            if(panelChain->handle!=XR_NULL_HANDLE) api.destroySwapchain(panelChain->handle);
+            delete panelChain;panelChain=nullptr;
+        }
+        panelWidth=panelHeight=panelFrames=0;
         for(unsigned i=0;eyeChains && i<2;++i)
         {
             auto& eye=eyeChains[i];
@@ -369,7 +406,11 @@ namespace
             Check("xrDestroySession", xrDestroySession(session));
             session = XR_NULL_HANDLE;
         }
-        if(inputActions!=XR_NULL_HANDLE) api.destroyActionSet(inputActions);
+        for(auto set:{inputActions,gameplayActions,drivingActions,menuActions,systemActions})
+            if(set!=XR_NULL_HANDLE) api.destroyActionSet(set);
+        gameplayActions=drivingActions=menuActions=systemActions=XR_NULL_HANDLE;
+        for(auto& action:actions) action=XR_NULL_HANDLE;
+        AcquireSRWLockExclusive(&eyeLock);panelPointer={};ReleaseSRWLockExclusive(&eyeLock);
         inputActions=XR_NULL_HANDLE;
         padAction=clickAction=aimAction=XR_NULL_HANDLE;
         gripPoseAction=gripAction=XR_NULL_HANDLE;
@@ -391,45 +432,71 @@ namespace
     bool CreateControllerActions()
     {
         if(!controllerEnabled) return true;
-        XrActionSetCreateInfo set{XR_TYPE_ACTION_SET_CREATE_INFO};
-        strcpy_s(set.actionSetName,"gameplay"); strcpy_s(set.localizedActionSetName,"GTA IV gameplay");
-        if(!Check("xrCreateActionSet",api.createActionSet(instance,&set,&inputActions))) return false;
+        auto makeSet=[&](const char* name,const char* label,unsigned priority,XrActionSet& handle){
+            XrActionSetCreateInfo set{XR_TYPE_ACTION_SET_CREATE_INFO};set.priority=priority;
+            strcpy_s(set.actionSetName,name);strcpy_s(set.localizedActionSetName,label);
+            return Check(name,api.createActionSet(instance,&set,&handle));
+        };
+        if(!makeSet("hands","Hand animation and tracking",0,inputActions) ||
+            !makeSet("on_foot","On foot",0,gameplayActions) ||
+            !makeSet("driving","Driving",0,drivingActions) ||
+            !makeSet("menus","Menus",1,menuActions) ||
+            !makeSet("system","Pause menu",0,systemActions)) return false;
         if(!Check("left hand path",api.stringToPath(instance,"/user/hand/left",&handPaths[0])) ||
             !Check("right hand path",api.stringToPath(instance,"/user/hand/right",&handPaths[1]))) return false;
-        auto create=[&](const char* name,const char* label,XrActionType type,XrAction& action)
-        {
-            XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
-            strcpy_s(info.actionName,name); strcpy_s(info.localizedActionName,label);
-            info.actionType=type; info.countSubactionPaths=2; info.subactionPaths=handPaths;
-            return Check(name,api.createAction(inputActions,&info,&action));
-        };
-        if(!create("trackpad","Trackpad",XR_ACTION_TYPE_VECTOR2F_INPUT,padAction) ||
-            !create("trackpad_click","Trackpad click",XR_ACTION_TYPE_BOOLEAN_INPUT,clickAction) ||
-            !create("aim_pose","Controller aim",XR_ACTION_TYPE_POSE_INPUT,aimAction) ||
-            !create("grip_pose","Controller grip pose",XR_ACTION_TYPE_POSE_INPUT,gripPoseAction) ||
-            !create("grip","Close hand",XR_ACTION_TYPE_BOOLEAN_INPUT,gripAction) ||
-            !create("trigger","Index finger curl",XR_ACTION_TYPE_FLOAT_INPUT,triggerAction) ||
-            !create("trackpad_touch","Thumb contact",XR_ACTION_TYPE_BOOLEAN_INPUT,touchAction) ||
-            !create("menu_button","Vehicle entry/exit",XR_ACTION_TYPE_BOOLEAN_INPUT,menuAction)) return false;
         std::vector<XrActionSuggestedBinding> bindings;
-        for(unsigned hand=0;hand<2;++hand)
-            for(auto binding: {std::pair{padAction,"/input/trackpad"},
-                std::pair{clickAction,"/input/trackpad/click"},std::pair{aimAction,"/input/aim/pose"},
-                std::pair{gripPoseAction,"/input/grip/pose"},std::pair{gripAction,"/input/squeeze/click"},
-                std::pair{triggerAction,"/input/trigger/value"},std::pair{touchAction,"/input/trackpad/touch"},
-                std::pair{menuAction,"/input/menu/click"}})
-            {
-                const std::string path=std::string(hand ? "/user/hand/right" : "/user/hand/left")+binding.second;
-                XrPath xrPath=XR_NULL_PATH;
-                if(!Check("Vive binding path",api.stringToPath(instance,path.c_str(),&xrPath))) return false;
-                bindings.push_back({binding.first,xrPath});
-            }
+        auto bind=[&](XrAction action,unsigned hand,const char* component){
+            if(!component) return true; // Rebindable actions without a default physical input.
+            const std::string path=std::string(hand ? "/user/hand/right":"/user/hand/left")+component;
+            XrPath xrPath=XR_NULL_PATH;
+            if(!Check("Vive binding path",api.stringToPath(instance,path.c_str(),&xrPath))) return false;
+            bindings.push_back({action,xrPath});return true;
+        };
+        auto create=[&](XrActionSet set,const char* name,const char* label,XrActionType type,XrAction& action,
+            int hand,const char* component){
+            XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+            strcpy_s(info.actionName,name);strcpy_s(info.localizedActionName,label);info.actionType=type;
+            if(hand<0){info.countSubactionPaths=2;info.subactionPaths=handPaths;}
+            if(!Check(name,api.createAction(set,&info,&action))) return false;
+            return hand<0 ? bind(action,0,component)&&bind(action,1,component):bind(action,hand,component);
+        };
+        if(!create(inputActions,"thumb_direction","Thumb pose direction",XR_ACTION_TYPE_VECTOR2F_INPUT,padAction,-1,"/input/trackpad") ||
+            !create(inputActions,"point_pose","Pointing pose",XR_ACTION_TYPE_POSE_INPUT,aimAction,-1,"/input/aim/pose") ||
+            !create(inputActions,"hand_pose","Hand pose",XR_ACTION_TYPE_POSE_INPUT,gripPoseAction,-1,"/input/grip/pose") ||
+            !create(inputActions,"close_hand","Close free hand",XR_ACTION_TYPE_BOOLEAN_INPUT,gripAction,-1,"/input/squeeze/click") ||
+            !create(inputActions,"curl_index","Curl index finger",XR_ACTION_TYPE_FLOAT_INPUT,triggerAction,-1,"/input/trigger/value") ||
+            !create(inputActions,"thumb_contact","Rest thumb",XR_ACTION_TYPE_BOOLEAN_INPUT,touchAction,-1,"/input/trackpad/touch")) return false;
+        auto game=[&](Action id,XrActionSet set,const char* name,const char* label,XrActionType type,int hand,const char* component){
+            return create(set,name,label,type,actions[static_cast<unsigned>(id)],hand,component);
+        };
+        const auto boolean=XR_ACTION_TYPE_BOOLEAN_INPUT,scalar=XR_ACTION_TYPE_FLOAT_INPUT,vector=XR_ACTION_TYPE_VECTOR2F_INPUT;
+        if(!game(Action::Move,gameplayActions,"move","Move",vector,0,"/input/trackpad") ||
+            !game(Action::MoveEnable,gameplayActions,"move_enable","Enable movement (touch)",boolean,0,"/input/trackpad/touch") ||
+            !game(Action::Sprint,gameplayActions,"sprint","Sprint",boolean,0,"/input/trackpad/click") ||
+            !game(Action::Jump,gameplayActions,"jump","Jump",boolean,1,"/input/trackpad/click") ||
+            !game(Action::Interact,gameplayActions,"interact","Enter vehicle / interact",boolean,1,"/input/menu/click") ||
+            !game(Action::Fire,gameplayActions,"fire","Fire equipped weapon",scalar,1,"/input/trigger/value") ||
+            !game(Action::Support,gameplayActions,"support_weapon","Support weapon",boolean,0,"/input/squeeze/click") ||
+            !game(Action::Cycle,gameplayActions,"cycle_weapon","Activate weapon selection",boolean,1,"/input/trackpad/click") ||
+            !game(Action::CycleDirection,gameplayActions,"weapon_direction","Weapon selection direction",vector,1,"/input/trackpad") ||
+            !game(Action::Next,gameplayActions,"next_weapon","Next weapon",boolean,1,nullptr) ||
+            !game(Action::Previous,gameplayActions,"previous_weapon","Previous weapon",boolean,1,nullptr) ||
+            !game(Action::Steer,drivingActions,"steer","Steer",vector,0,"/input/trackpad") ||
+            !game(Action::SteerEnable,drivingActions,"steer_enable","Enable steering (touch)",boolean,0,"/input/trackpad/touch") ||
+            !game(Action::Accelerate,drivingActions,"accelerate","Accelerate",scalar,1,"/input/trigger/value") ||
+            !game(Action::Brake,drivingActions,"brake","Brake / reverse",scalar,0,"/input/trigger/value") ||
+            !game(Action::Handbrake,drivingActions,"handbrake","Handbrake",boolean,1,"/input/trackpad/click") ||
+            !game(Action::Exit,drivingActions,"exit_vehicle","Exit vehicle",boolean,1,"/input/menu/click") ||
+            !game(Action::Pause,systemActions,"pause","Open / close pause menu",boolean,0,"/input/menu/click") ||
+            !game(Action::Select,menuActions,"select","Select / drag",boolean,-1,"/input/trigger/click") ||
+            !game(Action::Back,menuActions,"back","Back",boolean,1,"/input/menu/click")) return false;
         XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         if(!Check("Vive profile path",api.stringToPath(instance,"/interaction_profiles/htc/vive_controller",&suggest.interactionProfile))) return false;
         suggest.countSuggestedBindings=static_cast<uint32_t>(bindings.size()); suggest.suggestedBindings=bindings.data();
         if(!Check("Vive suggested bindings",api.suggestBindings(instance,&suggest))) return false;
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-        attach.countActionSets=1; attach.actionSets=&inputActions;
+        XrActionSet sets[]{inputActions,gameplayActions,drivingActions,menuActions,systemActions};
+        attach.countActionSets=5; attach.actionSets=sets;
         if(!Check("xrAttachSessionActionSets",api.attachActionSets(session,&attach))) return false;
         for(unsigned hand=0;hand<2;++hand)
         {
@@ -440,7 +507,7 @@ namespace
             if(!Check("xrCreateActionSpace(grip)",api.createActionSpace(session,&space,&gripSpaces[hand]))) return false;
         }
         inputReady=true;
-        Log("Vive Wand actions attached; input observation enabled, no game input injection");
+        Log("Semantic gameplay, driving, menu and hand actions attached with Vive defaults");
         return true;
     }
 
@@ -449,9 +516,47 @@ namespace
         OpenXRVR::ControllerInput sample{};
         if(inputReady && sessionState==XR_SESSION_STATE_FOCUSED)
         {
-            XrActiveActionSet active{inputActions,XR_NULL_PATH};
-            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=1; sync.activeActionSets=&active;
+            const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+            XrActiveActionSet active[]{{inputActions,XR_NULL_PATH},{systemActions,XR_NULL_PATH},
+                {menu ? menuActions : drivingInput.load() ? drivingActions : gameplayActions,XR_NULL_PATH}};
+            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=3; sync.activeActionSets=active;
             if(api.syncActions(session,&sync)==XR_SUCCESS)
+            {
+                auto getBool=[&](Action id,bool* available=nullptr,XrPath path=XR_NULL_PATH){
+                    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};get.action=actions[static_cast<unsigned>(id)];get.subactionPath=path;
+                    XrActionStateBoolean value{XR_TYPE_ACTION_STATE_BOOLEAN};
+                    const bool valid=api.getBoolean(session,&get,&value)==XR_SUCCESS && value.isActive;
+                    if(available)*available=valid;return valid && value.currentState;
+                };
+                auto getFloat=[&](Action id,bool* available=nullptr){
+                    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};get.action=actions[static_cast<unsigned>(id)];
+                    XrActionStateFloat value{XR_TYPE_ACTION_STATE_FLOAT};
+                    const bool valid=api.getFloat(session,&get,&value)==XR_SUCCESS && value.isActive && std::isfinite(value.currentState);
+                    if(available)*available=valid;return valid ? std::clamp(value.currentState,0.f,1.f):0.f;
+                };
+                auto getVector=[&](Action id,bool* available=nullptr){
+                    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};get.action=actions[static_cast<unsigned>(id)];
+                    XrActionStateVector2f value{XR_TYPE_ACTION_STATE_VECTOR2F};
+                    const bool valid=api.getVector2(session,&get,&value)==XR_SUCCESS && value.isActive && std::isfinite(value.currentState.x+value.currentState.y);
+                    if(available)*available=valid;return valid ? std::array<float,2>{std::clamp(value.currentState.x,-1.f,1.f),std::clamp(value.currentState.y,-1.f,1.f)}:std::array<float,2>{};
+                };
+                const auto move=getVector(Action::Move,&sample.moveActive);
+                sample.move[0]=move[0];sample.move[1]=move[1];
+                bool enableActive=false;sample.moveEnabled=getBool(Action::MoveEnable,&enableActive)||!enableActive;
+                sample.sprint=getBool(Action::Sprint);sample.interact=getBool(Action::Interact);
+                sample.fire=getFloat(Action::Fire,&sample.fireActive);sample.support=getBool(Action::Support);
+                const auto direction=getVector(Action::CycleDirection);sample.cycleDirection=direction[0];
+                sample.cycle=getBool(Action::Cycle);sample.nextWeapon=getBool(Action::Next);sample.previousWeapon=getBool(Action::Previous);
+                // Vive's default shares click between center jump and side weapon selection.
+                // Independent Jump bindings work without a weapon-direction binding.
+                sample.jump=getBool(Action::Jump) && (!sample.cycle || std::hypot(direction[0],direction[1])<.35f);
+                const auto steer=getVector(Action::Steer);
+                enableActive=false;const bool steering=getBool(Action::SteerEnable,&enableActive)||!enableActive;
+                sample.steer=steering ? VRMath::TouchpadMovement(steer[0],steer[1])[0]:0;
+                sample.accelerate=getFloat(Action::Accelerate);sample.brake=getFloat(Action::Brake);
+                sample.handbrake=getBool(Action::Handbrake);sample.exitVehicle=getBool(Action::Exit);
+                sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
+                for(unsigned hand=0;hand<2;++hand)sample.select[hand]=getBool(Action::Select,nullptr,handPaths[hand]);
                 for(unsigned hand=0;hand<2;++hand)
                 {
                     XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO}; get.subactionPath=handPaths[hand];
@@ -463,13 +568,8 @@ namespace
                         sample.trackpad[hand][0]=std::clamp(pad.currentState.x,-1.f,1.f);
                         sample.trackpad[hand][1]=std::clamp(pad.currentState.y,-1.f,1.f);
                     }
-                    XrActionStateBoolean click{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=clickAction;
-                    if(api.getBoolean(session,&get,&click)==XR_SUCCESS && click.isActive) sample.clicked[hand]=click.currentState;
                     XrActionStateBoolean touch{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=touchAction;
                     if(api.getBoolean(session,&get,&touch)==XR_SUCCESS && touch.isActive) sample.padTouched[hand]=touch.currentState;
-                    XrActionStateBoolean menu{XR_TYPE_ACTION_STATE_BOOLEAN}; get.action=menuAction;
-                    if(api.getBoolean(session,&get,&menu)==XR_SUCCESS && menu.isActive)
-                    {sample.menuActive[hand]=true; sample.menuPressed[hand]=menu.currentState;}
                     XrActionStateFloat trigger{XR_TYPE_ACTION_STATE_FLOAT}; get.action=triggerAction;
                     if(api.getFloat(session,&get,&trigger)==XR_SUCCESS && trigger.isActive && std::isfinite(trigger.currentState))
                     {
@@ -518,8 +618,33 @@ namespace
                     }
                 }
         }
+        }
         sample.sampledAt=GetTickCount64();
         AcquireSRWLockExclusive(&eyeLock); controllerInput=sample; ReleaseSRWLockExclusive(&eyeLock);
+    }
+
+    void UpdatePanelPointer()
+    {
+        OpenXRVR::PanelPointer pointer{};pointer.sampledAt=GetTickCount64();
+        const auto& input=controllerInput; // Same render callback that publishes it.
+        const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+        pointer.back=menu && input.back;
+        const unsigned hand=input.poseValid[1] ? 1:0;
+        if(menu && panelActive && panelAnchored && sessionState==XR_SESSION_STATE_FOCUSED && input.poseValid[hand])
+        {
+            pointer.active=true;
+            const auto aim=VRMath::Pose(input.position[hand],input.orientation[hand]);
+            const float pos[]{panelPose.position.x,panelPose.position.y,panelPose.position.z};
+            const float rot[]{panelPose.orientation.x,panelPose.orientation.y,panelPose.orientation.z,panelPose.orientation.w};
+            const auto panel=VRMath::Pose(pos,rot);
+            const VRMath::Vector direction{-aim[2][0],-aim[2][1],-aim[2][2],0};
+            float distance=2.f;
+            pointer.hit=VRMath::RayPanel(panel,aim[3],direction,2.4f,2.4f*(panelHeight-4)/panelWidth,pointer.u,pointer.v,distance);
+            if(!pointer.hit)distance=2.f;
+            pointer.down=pointer.hit && input.select[hand];
+            for(unsigned a=0;a<3;++a){pointer.origin[a]=aim[3][a];pointer.end[a]=aim[3][a]+distance*direction[a];}
+        }
+        AcquireSRWLockExclusive(&eyeLock);panelPointer=pointer;ReleaseSRWLockExclusive(&eyeLock);
     }
 
     bool CreateRuntime()
@@ -759,6 +884,7 @@ namespace
         if (XR_FAILED(result))
         { Check("xrWaitFrame", result); Fallback("OpenXR frame wait failed"); return; }
         SampleControllerInput(state.predictedDisplayTime);
+        if(!panelActive || !panelAnchored || sessionState!=XR_SESSION_STATE_FOCUSED) UpdatePanelPointer();
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
         locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         locate.displayTime = state.predictedDisplayTime;
@@ -802,8 +928,9 @@ namespace
         XrCompositionLayerProjectionView projectionViews[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
             {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
-        bool copied=haveEyeImages && state.shouldRender;
+        XrCompositionLayerQuad panel{XR_TYPE_COMPOSITION_LAYER_QUAD},ray{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader* layers[2]{};
+        bool copied=haveEyeImages && state.shouldRender && !panelActive;
         gameplayPacing=haveEyeImages && state.shouldRender;
         for(unsigned eye=0;eye<2 && copied;++eye)
         {
@@ -877,12 +1004,88 @@ namespace
             layer.space=localSpace;
             layer.viewCount=2;
             layer.views=projectionViews;
+            layers[0]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
             end.layerCount=1; end.layers=layers;
         }
-        else if(haveEyeImages && state.shouldRender)
+        else if(haveEyeImages && state.shouldRender && !panelActive)
         {
             // Destroying the session releases any outstanding acquisition.
             Fallback("OpenXR eye transfer failed; returning to desktop"); return;
+        }
+        if(panelActive && panelChain && state.shouldRender && eyeViewsValid)
+        {
+            if(!panelAnchored)
+            {
+                const auto& q=views[0].pose.orientation;
+                const float fx=-2*(q.x*q.z+q.w*q.y),fz=-(1-2*(q.x*q.x+q.y*q.y));
+                const float yaw=std::hypot(fx,fz)>.05f ? std::atan2(-fx,-fz):0.f;
+                panelPose.orientation={0,std::sin(yaw*.5f),0,std::cos(yaw*.5f)};
+                panelPose.position={(views[0].pose.position.x+views[1].pose.position.x)*.5f-2*std::sin(yaw),
+                    (views[0].pose.position.y+views[1].pose.position.y)*.5f,
+                    (views[0].pose.position.z+views[1].pose.position.z)*.5f-2*std::cos(yaw)};
+                if(floorSpace) panelPose.position.y=std::max(panelPose.position.y,1.2f);
+                panelAnchored=true;
+            }
+            UpdatePanelPointer();
+            uint32_t index=0;
+            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            if(!CheckImageStep("xrAcquireSwapchainImage(panel)",RuntimeQueueCall(VRProfile::Metric::XRQueueAcquire,
+                [&](){return api.acquireSwapchainImage(panelChain->handle,&acquire,&index);})))
+                {Fallback("Panel acquisition failed");return;}
+            XrSwapchainImageWaitInfo waitImage{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};waitImage.timeout=1000000000;
+            if(!CheckImageStep("xrWaitSwapchainImage(panel)",api.waitSwapchainImage(panelChain->handle,&waitImage)))
+                {Fallback("Panel image wait failed");return;}
+            bool done=false;
+            if(vulkanEnabled)
+                done=index<panelChain->vulkanImages.size() && panelBridge->Copy(0,panelChain->vulkanImages[index].image);
+            else if(index<panelChain->images.size())
+            {
+                context->CopyResource(panelChain->images[index].texture,panelChain->shared.Get());
+                D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT,0};Microsoft::WRL::ComPtr<ID3D11Query> fence;
+                if(SUCCEEDED(device->CreateQuery(&desc,&fence)))
+                {
+                    context->End(fence.Get());context->Flush();
+                    const auto deadline=GetTickCount64()+1000;HRESULT result;
+                    do {result=context->GetData(fence.Get(),nullptr,0,0);if(result==S_FALSE)Sleep(0);}
+                    while(result==S_FALSE && GetTickCount64()<deadline);
+                    done=result==S_OK;
+                }
+            }
+            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            if(!done || !CheckImageStep("xrReleaseSwapchainImage(panel)",RuntimeQueueCall(VRProfile::Metric::XRQueueRelease,
+                [&](){return api.releaseSwapchainImage(panelChain->handle,&release);})))
+                {Fallback("Panel transfer failed");return;}
+            panel.space=localSpace;panel.eyeVisibility=XR_EYE_VISIBILITY_BOTH;panel.pose=panelPose;
+            panel.size={2.4f,2.4f*(panelHeight-4)/panelWidth};
+            panel.subImage.swapchain=panelChain->handle;
+            panel.subImage.imageRect={{0,4},{static_cast<int32_t>(panelWidth),static_cast<int32_t>(panelHeight-4)}};
+            layers[0]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
+            end.layerCount=1;end.layers=layers;++panelFrames;
+            const auto& pointer=panelPointer;
+            if(pointer.active)
+            {
+                VRMath::Vector center{0,0,0,1},direction{};
+                for(unsigned a=0;a<3;++a){center[a]=(pointer.origin[a]+pointer.end[a])*.5f;direction[a]=pointer.end[a]-pointer.origin[a];}
+                const float length=VRMath::Length3(direction);
+                if(length>.01f)
+                {
+                    for(unsigned a=0;a<3;++a)direction[a]/=length;
+                    VRMath::Vector normal{views[0].pose.position.x-center[0],views[0].pose.position.y-center[1],views[0].pose.position.z-center[2],0};
+                    auto right=VRMath::Cross3(direction,normal);const float width=VRMath::Length3(right);
+                    if(width>.001f)
+                    {
+                        for(unsigned a=0;a<3;++a)right[a]/=width;
+                        normal=VRMath::Cross3(right,direction);
+                        const VRMath::Matrix basis{right,direction,normal,center};const auto q=VRMath::Quaternion(basis);
+                        ray.space=localSpace;ray.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+                        ray.pose={{q[0],q[1],q[2],q[3]},{center[0],center[1],center[2]}};
+                        ray.size={.003f,length};ray.subImage.swapchain=panelChain->handle;
+                        // Solid-color atlas strip; menu image excludes these four rows.
+                        ray.subImage.imageRect={{0,0},{4,4}};
+                        layers[1]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ray);end.layerCount=2;
+                    }
+                }
+            }
         }
         {
             VRProfile::Scope profile(VRProfile::Metric::XREnd);
@@ -933,11 +1136,12 @@ void OpenXRVR::Shutdown()
 
 std::string OpenXRVR::Status()
 {
-    char text[360];
-    sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u,\"eyeImages\":%s,\"stereoLayers\":%u,\"displayRefreshHz\":%.3f,\"submittedHz\":%.2f,\"graphicsBackend\":\"%s\"}",
+    char text[500];
+    sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u,\"eyeImages\":%s,\"stereoLayers\":%u,\"displayRefreshHz\":%.3f,\"submittedHz\":%.2f,\"graphicsBackend\":\"%s\",\"panelActive\":%s,\"panelFrames\":%u}",
         enabled ? "true" : "false", running ? "true" : "false",
         permanentFailure ? "true" : "false", StateName(sessionState), frameCount,
-        haveEyeImages ? "true" : "false",submittedFrames,displayRefreshHz.load(),submittedHz.load(),vulkanEnabled ? "DXVK-Vulkan" : "D3D9Ex-D3D11");
+        haveEyeImages ? "true" : "false",submittedFrames,displayRefreshHz.load(),submittedHz.load(),vulkanEnabled ? "DXVK-Vulkan" : "D3D9Ex-D3D11",
+        panelActive ? "true":"false",panelFrames);
     return text;
 }
 
@@ -1021,6 +1225,15 @@ std::string OpenXRVR::InputStatus()
         input.menuActive[0] ? "true":"false",input.menuActive[1] ? "true":"false",
         input.menuPressed[0] ? "true":"false",input.menuPressed[1] ? "true":"false");
     result.pop_back(); result+=menu;
+    PanelPointer pointer{};GetPanelPointer(pointer);
+    result.pop_back();
+    char semantic[650];
+    sprintf_s(semantic,",\"actions\":{\"move\":[%.3f,%.3f],\"moveEnabled\":%s,\"fire\":%.3f,\"jump\":%s,\"sprint\":%s,\"support\":%s,\"pause\":%s,\"select\":[%s,%s],\"back\":%s},\"pointer\":{\"active\":%s,\"hit\":%s,\"uv\":[%.4f,%.4f],\"down\":%s}}",
+        input.move[0],input.move[1],input.moveEnabled ? "true":"false",input.fire,
+        input.jump ? "true":"false",input.sprint ? "true":"false",input.support ? "true":"false",
+        input.pause ? "true":"false",input.select[0] ? "true":"false",input.select[1] ? "true":"false",input.back ? "true":"false",
+        pointer.active ? "true":"false",pointer.hit ? "true":"false",pointer.u,pointer.v,pointer.down ? "true":"false");
+    result+=semantic;
     return result;
 }
 
@@ -1082,6 +1295,14 @@ bool OpenXRVR::SetEyeImages(const HANDLE (&shared)[2], unsigned width,unsigned h
     return true;
 }
 
+void OpenXRVR::SetDriving(bool driving) {drivingInput=driving;}
+
+bool OpenXRVR::GetPanelPointer(PanelPointer& pointer)
+{
+    AcquireSRWLockShared(&eyeLock);pointer=panelPointer;ReleaseSRWLockShared(&eyeLock);
+    return pointer.sampledAt && GetTickCount64()-pointer.sampledAt<=150;
+}
+
 bool OpenXRVR::UsesVulkan() {return vulkanEnabled;}
 
 bool OpenXRVR::SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsigned width,unsigned height,
@@ -1119,6 +1340,65 @@ bool OpenXRVR::SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsign
     }
     imageViews[0]=views[0]; imageViews[1]=views[1]; imagePoseTime=poseTime;
     if(producerActive.load())++producerPairs;
+    return true;
+}
+
+bool OpenXRVR::SetPanelImage(IDirect3DTexture9* texture,HANDLE shared,unsigned width,unsigned height)
+{
+    if(!texture) {panelActive=panelAnchored=false;return true;}
+    if(!CanAcceptEyeImages() || !width || !height) return false;
+    if(panelChain && (width!=panelWidth || height!=panelHeight)) return false;
+    if(!panelChain)
+    {
+        panelChain=new EyeSwapchain;
+        panelWidth=width;panelHeight=height;
+        if(vulkanEnabled)
+        {
+            panelBridge=new DxvkVulkan::Bridge;
+            IDirect3DTexture9* textures[2]{texture,texture};
+            if(!panelBridge->Attach(*RageDirect3DDevice9::m_pRealDevice) || !panelBridge->SetTextures(textures,width,height))
+                {Fallback("Panel Vulkan interop unavailable");return false;}
+        }
+        else if(!shared || FAILED(device->OpenSharedResource(shared,__uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(panelChain->shared.GetAddressOf()))))
+                {Fallback("Panel D3D11 shared texture unavailable");return false;}
+        uint32_t count=0;
+        if(XR_FAILED(api.enumerateSwapchainFormats(session,0,&count,nullptr)))
+            {Fallback("Panel formats unavailable");return false;}
+        std::vector<int64_t> formats(count);
+        const int64_t format=vulkanEnabled ? static_cast<int64_t>(VK_FORMAT_B8G8R8A8_SRGB):static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+        if(XR_FAILED(api.enumerateSwapchainFormats(session,count,&count,formats.data())) ||
+            std::find(formats.begin(),formats.end(),format)==formats.end())
+                {Fallback("Panel texture format unavailable");return false;}
+        XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        create.format=format;create.sampleCount=1;create.width=width;create.height=height;
+        create.faceCount=1;create.arraySize=1;create.mipCount=1;
+        if(!Check("xrCreateSwapchain(panel)",api.createSwapchain(session,&create,&panelChain->handle)))
+            {Fallback("Panel swapchain unavailable");return false;}
+        uint32_t images=0;
+        if(XR_FAILED(api.enumerateSwapchainImages(panelChain->handle,0,&images,nullptr)) || !images)
+            {Fallback("Panel images unavailable");return false;}
+        XrResult result;
+        if(vulkanEnabled)
+        {
+            panelChain->vulkanImages.resize(images);
+            for(auto& image:panelChain->vulkanImages)image.type=XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+            result=api.enumerateSwapchainImages(panelChain->handle,images,&images,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(panelChain->vulkanImages.data()));
+        }
+        else
+        {
+            panelChain->images.resize(images);
+            for(auto& image:panelChain->images)image.type=XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+            result=api.enumerateSwapchainImages(panelChain->handle,images,&images,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(panelChain->images.data()));
+        }
+        if(XR_FAILED(result)) {Fallback("Panel image enumeration failed");return false;}
+        Log("World-space loading/menu screen ready before stereo-world targets");
+    }
+    if(!panelActive)panelAnchored=false;
+    panelActive=true;
     return true;
 }
 

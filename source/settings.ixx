@@ -543,8 +543,34 @@ private:
         return selectOption.ccall<uint8_t>(menu, row, adjusted);
     }
 
+    static inline std::function<bool(float&,float&,bool&,bool&,uint64_t&)> vrMenuPointer;
+    static inline uint64_t vrMouseSample=0;
+    static inline unsigned vrMouseCurrent=0,vrMousePrevious=0;
+    static inline bool vrMouseOwned=false;
+    static void ApplyVRMenuPointer()
+    {
+        if(!vrMenuPointer || !mousePosition || !mouseScale) return;
+        float u=0,v=0;bool select=false,back=false;uint64_t stamp=0;
+        const bool valid=vrMenuPointer(u,v,select,back,stamp);
+        if(!valid && !vrMouseOwned)return;
+        if(stamp!=vrMouseSample || !valid)
+        {
+            vrMousePrevious=vrMouseCurrent;vrMouseCurrent=valid ? (select ? 1u:0u)|(back ? 8u:0u):0;
+            vrMouseSample=stamp;
+        }
+        if(valid && u>=0 && v>=0 && mouseScale[0]>0 && mouseScale[2]>0)
+        {
+            mousePosition[0]=static_cast<int32_t>(std::lround(u/mouseScale[0]));
+            mousePosition[3]=static_cast<int32_t>(std::lround(v/mouseScale[2]));
+        }
+        mousePosition[1]=(mousePosition[1]&~9)|vrMousePrevious;
+        mousePosition[2]=(mousePosition[2]&~9)|vrMouseCurrent;
+        vrMouseOwned=valid;
+    }
+
     static uint8_t __cdecl ProcessMenu(int32_t menu)
     {
+        ApplyVRMenuPointer();
         auto previous = std::exchange(selectedButton, -1);
         auto previousMenu = std::exchange(inputMenu, menu);
         auto previousSubmenu = std::exchange(openSubmenu, -1);
@@ -716,6 +742,7 @@ private:
 
     static uint8_t __fastcall ProcessTabs(uint8_t* state, void*, uint8_t inside)
     {
+        ApplyVRMenuPointer();
         tabState = state;
         if (!HasTabs(state))
             return CallProcessTabs(state, inside);
@@ -747,6 +774,7 @@ private:
 
     static uint8_t __cdecl QueryInput(int32_t input, uint8_t sound, uint8_t flags, uint8_t force, uint8_t tabsInput, uint8_t unknown, uint8_t repeat)
     {
+        ApplyVRMenuPointer();
         if (tabInputState && mouseTabRequest && (input == 2 || input == 8))
         {
             if (input == 2)
@@ -1567,6 +1595,8 @@ public:
     }
 public:
     // A custom screen is shown in place of the Display screen
+    static void SetVRMenuPointerProvider(std::function<bool(float&,float&,bool&,bool&,uint64_t&)> provider)
+    { vrMenuPointer=std::move(provider); }
     static bool IsCustomScreenActive() { return activePage != -1; }
     // Before the game frees the screens' rows (frontend XML reload)
     static void ResetCustomScreens() { ResetPages(); }

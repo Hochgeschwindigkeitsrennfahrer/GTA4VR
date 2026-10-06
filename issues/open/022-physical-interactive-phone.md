@@ -19,3 +19,5 @@ A held phone can be operated physically for the recorded required game functions
 
 - User wants the phone to be a physical in-world object. Existing PhoneModel/Script2d observations in #003/#007 are starting evidence, not a complete interaction mapping.
 - Requested on 2026-10-01. Implementation and runtime acceptance remain pending.
+
+- 2026-10-06: unread-SMS envelope is routed to wrist/car radar in #020, with active/expiry coverage in #031. This is notification presentation only; phone model/screen interaction remains unimplemented here.

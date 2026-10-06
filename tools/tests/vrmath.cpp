@@ -13,6 +13,23 @@ static void Near(float actual, float expected, float tolerance=1e-4f)
 
 int main()
 {
+    float u=0,v=0,distance=0;
+    auto menuScreen=VRMath::Identity();menuScreen[3]={0,1.5f,-2,1};
+    if(!VRMath::RayPanel(menuScreen,{0,1.5f,0,1},{0,0,-1,0},2.4f,1.35f,u,v,distance))return 1;
+    Near(u,.5f);Near(v,.5f);Near(distance,2);
+    if(!VRMath::RayPanel(menuScreen,{.6f,1.8375f,0,1},{0,0,-1,0},2.4f,1.35f,u,v,distance))return 1;
+    Near(u,.75f);Near(v,.25f);
+    if(VRMath::RayPanel(menuScreen,{0,1.5f,-3,1},{0,0,1,0},2.4f,1.35f,u,v,distance))return 1;
+    if(VRMath::RayPanel(menuScreen,{0,1.5f,0,1},{1,0,0,0},2.4f,1.35f,u,v,distance))return 1;
+    if(VRMath::RayPanel(menuScreen,{4,1.5f,0,1},{0,0,-1,0},2.4f,1.35f,u,v,distance))return 1;
+    // Quaternion reconstruction includes 180-degree branches used by beam quads.
+    for(const auto& rotation:{VRMath::Identity(),VRMath::SegmentRotation({0,1,0,0},{0,0,-1,0}),
+        VRMath::SegmentRotation({0,0,1,0},{0,0,-1,0})})
+    {
+        const auto q=VRMath::Quaternion(rotation);const float origin[]{0,0,0},quat[]{q[0],q[1],q[2],q[3]};
+        const auto restored=VRMath::Pose(origin,quat);
+        for(unsigned r=0;r<3;++r)for(unsigned c=0;c<3;++c)Near(restored[r][c],rotation[r][c]);
+    }
     auto fitBone=VRMath::Identity();
     fitBone[3]={12,22,34,NAN}; fitBone[0][3]=NAN;
     const VRMath::Vector fitPivot{10,20,30,1};
@@ -342,5 +359,24 @@ int main()
     if(std::abs(VRMath::Dot3(halfway[0],halfway[1]))>1.e-5f ||
         std::abs(VRMath::Length3(halfway[2])-1)>1.e-5f || halfway[0][3]!=123 ||
         halfway[3][0]!=1 || VRMath::BlendRigidPose(stance,settled,0)!=stance) return 1;
-    std::puts("VR math: camera/visibility, knee/segment rotation and rigid stance blending passed");
+    // A binocular HUD must converge on one plane despite asymmetric eye FOVs.
+    auto hudLeft=VRMath::Identity(),hudRight=VRMath::Identity();
+    hudLeft[3][0]=-.032f;hudRight[3][0]=.032f;
+    const auto hudHead=VRMath::BlendRigidPose(hudLeft,hudRight,.5f);
+    const auto hudPoint=VRMath::Transform({.3f,.1f,-2.f,1},hudHead);
+    const float hudFovs[2][4]{{-.9f,.7f,.8f,-.6f},{-.7f,.9f,.85f,-.65f}};
+    float pixels[2]{};
+    for(unsigned eye=0;eye<2;++eye)
+    {
+        const auto& camera=eye ? hudRight:hudLeft;
+        const auto p=VRMath::Projection(hudFovs[eye],.05f,1500.f);
+        const auto clip=VRMath::Transform(hudPoint,VRMath::Multiply(VRMath::InverseRigid(camera),p));
+        const float x=clip[0]/clip[3],y=clip[1]/clip[3];
+        pixels[eye]=x;
+        // Recover the ray and intersect the plane at2m: both eyes see the same point.
+        Near(camera[3][0]+2.f*(x+p[2][0])/p[0][0],hudPoint[0]);
+        Near(camera[3][1]+2.f*(y+p[2][1])/p[1][1],hudPoint[1]);
+    }
+    if(std::abs(pixels[0]-pixels[1])<.01f) return 1;
+    std::puts("VR math: camera/visibility, rig, and binocular HUD convergence passed");
 }

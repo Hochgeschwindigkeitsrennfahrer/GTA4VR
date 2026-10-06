@@ -26,6 +26,7 @@ export namespace VRCamera
     bool ShowLocalBody(const void* entity);
     void SetHeadlessBodyAvailable(bool available);
     bool IsFirstPersonActive();
+    bool GetVehicleHudAnchor(VRMath::Matrix& anchor); // World-list builder only; snapshot with eye commands.
     bool Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (&eyes)[2],
         rage::grcViewport (&output)[2]);
 }
@@ -71,6 +72,8 @@ namespace
     Vehicle seatVehicle=0;
     Ped seatPed=0;
     bool seatAnchorValid=false;
+    bool seatIsCar=false,vehicleHudValid=false;
+    VRMath::Matrix vehicleHudAnchor{};
     VRMath::Vector seatOffset{};
     float vehicleEyeHeightOffset=.075f;
     unsigned anchorFrames=0, anchorSamples=0;
@@ -536,21 +539,28 @@ namespace
         controllerPadUpdate.unsafe_fastcall<void>(pad,edx);
         if(!localPad || pad!=localPad()) return;
         OpenXRVR::ControllerInput input{};
+        // Pause is a global action, including when gameplay injection is gated.
+        // CE control 76 is INPUT_FRONTEND_PAUSE (IV-SDK ePadControls).
+        static bool previousPause=false;
+        const bool pause=OpenXRVR::HasFocusedViews() && OpenXRVR::GetControllerInput(input) && input.pause;
+        auto* pauseValue=static_cast<unsigned char*>(pad)+0x2698+16*76;
+        const auto pauseKey=pauseValue[4];
+        pauseValue[6]=static_cast<unsigned char>(std::max<unsigned>(pauseValue[6]^pauseKey,pause ? 255:0)^pauseKey);
+        pauseValue[7]=static_cast<unsigned char>(std::max<unsigned>(pauseValue[7]^pauseKey,previousPause ? 255:0)^pauseKey);
+        previousPause=pause;
         const bool fresh=firstPersonActive && !ragdollView && OpenXRVR::HasFocusedViews() &&
             !(CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) &&
             !(CTimer::ms_bScriptPause && *CTimer::ms_bScriptPause) &&
             OpenXRVR::GetControllerInput(input) && input.gripPoseValid[1];
-        const bool center=fresh && input.clicked[1] &&
-            std::abs(input.trackpad[1][0])<.25f &&
-            std::hypot(input.trackpad[1][0],input.trackpad[1][1])<.35f;
-        const bool menu=fresh && input.menuActive[1] && input.menuPressed[1];
+        const bool center=fresh && (vehicleView ? input.handbrake:input.jump);
+        const bool menu=fresh && (vehicleView ? input.exitVehicle:input.interact);
         if(!fresh)
         {
             buttonsArmed=false; previousJump=previousEnter=previousHandbrake=previousRun=false;
             padSteering=padThrottle=padBrake=0;
             return; // The freshly updated native values already cleared VR input.
         }
-        if(!buttonsArmed && !input.clicked[1] && !menu) buttonsArmed=true;
+        if(!buttonsArmed && !center && !menu) buttonsArmed=true;
         auto writeValue=[](unsigned char* value,unsigned char decoded)
         {
             value[6]=decoded^value[4];
@@ -586,9 +596,9 @@ namespace
             writeValue(static_cast<unsigned char*>(pad)+0x2698+16*id,decoded);
         };
         if(controllerLocomotion && !driving && !animatedView && input.gripPoseValid[0] &&
-            input.active[0] && input.padTouched[0])
+            input.moveActive && input.moveEnabled)
         {
-            const auto axes=VRMath::TouchpadMovement(input.trackpad[0][0],input.trackpad[0][1]);
+            const auto axes=VRMath::TouchpadMovement(input.move[0],input.move[1]);
             auto axisByte=[](float axis)
             {
                 // Undo the native signed decoder's additional 25% deadzone.
@@ -600,17 +610,16 @@ namespace
             for(unsigned id:{12u,13u,91u}) analog(id,axisByte(axes[0]));
             for(unsigned id:{14u,15u,90u}) analog(id,axisByte(-axes[1]));
             const bool run=std::hypot(axes[0],axes[1])>.01f &&
-                (input.clicked[0] || std::hypot(input.trackpad[0][0],input.trackpad[0][1])>=.85f);
+                (input.sprint || std::hypot(input.move[0],input.move[1])>=.85f);
             button(1,run,previousRun);
             previousRun=run;
         }
         else previousRun=false;
         if(driving && input.gripPoseValid[0])
         {
-            const float steering=input.active[0] && input.padTouched[0] ?
-                VRMath::TouchpadMovement(input.trackpad[0][0],input.trackpad[0][1])[0]:0.f;
-            const float throttle=input.triggerActive[1] ? input.trigger[1]:0.f;
-            const float brake=input.triggerActive[0] ? input.trigger[0]:0.f;
+            const float steering=input.steer;
+            const float throttle=input.accelerate;
+            const float brake=input.brake;
             const auto encodedSteer=static_cast<unsigned char>(std::lround(127.5f+127.5f*steering));
             for(unsigned id:{30u,31u,111u}) analog(id,encodedSteer);
             analog(40,static_cast<unsigned char>(std::lround(throttle*255.f)));
@@ -629,9 +638,9 @@ namespace
         const bool headingFresh=headingOwner && headingValid && GetTickCount64()-headingSampledAt<=250;
         ReleaseSRWLockShared(&headingLock);
         OpenXRVR::ControllerInput input{};
-        if(!headingFresh || !OpenXRVR::GetControllerInput(input) || !input.active[0] ||
-            !input.gripPoseValid[0] || !input.padTouched[0]) return false;
-        axes=VRMath::TouchpadMovement(input.trackpad[0][0],input.trackpad[0][1]);
+        if(!headingFresh || !OpenXRVR::GetControllerInput(input) || !input.moveActive ||
+            !input.gripPoseValid[0] || !input.moveEnabled) return false;
+        axes=VRMath::TouchpadMovement(input.move[0],input.move[1]);
         if(snapshot) *snapshot=input;
         return true;
     }
@@ -663,9 +672,9 @@ namespace
         const int previous=padGait;
         if(local && ControllerMoveAxes(axes,&input))
         {
-            const float radius=std::hypot(input.trackpad[0][0],input.trackpad[0][1]);
+            const float radius=std::hypot(input.move[0],input.move[1]);
             const bool moving=std::hypot(axes[0],axes[1])>.01f;
-            padGait=moving && input.clicked[0] ? 2 : moving && radius>=.85f ? 1 : 0;
+            padGait=moving && input.sprint ? 2 : moving && radius>=.85f ? 1 : 0;
         }
         const float result=movementSpeed.unsafe_fastcall<float>(owner,edx,mode,tapMode);
         padGait=previous;
@@ -860,7 +869,14 @@ namespace
             if(!vehicle || !Natives::DoesVehicleExist(vehicle)) return false;
             Natives::GetCarHeading(vehicle,&heading);
             if(seatVehicle!=vehicle || seatPed!=ped)
-            {seatVehicle=vehicle; seatPed=ped; seatAnchorValid=false;}
+            {
+                seatVehicle=vehicle; seatPed=ped; seatAnchorValid=false;seatIsCar=false;
+                if(NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::GET_CAR_MODEL)) &&
+                    NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_THIS_MODEL_A_CAR)))
+                {
+                    uint32_t model=0;Natives::GetCarModel(vehicle,&model);seatIsCar=Natives::IsThisModelACar(model);
+                }
+            }
             // Calibrate once after the ped is seated. Animated bone transforms
             // can lag the vehicle and must not supply the moving camera origin.
             if(!seatAnchorValid && Natives::IsCharSittingInAnyCar(ped) &&
@@ -1185,9 +1201,16 @@ void VRCamera::Install()
 
 bool VRCamera::IsFirstPersonActive() {return firstPersonActive;}
 
+bool VRCamera::GetVehicleHudAnchor(VRMath::Matrix& anchor)
+{
+    if(!vehicleHudValid)return false;
+    anchor=vehicleHudAnchor;return true;
+}
+
 bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (&eyes)[2],
     rage::grcViewport (&output)[2])
 {
+    vehicleHudValid=false;
     if (!setCamera || !setProjection || !base.mIsPerspective || base.mInvertZInProjectionMatrix)
         {InvalidateHeading(); StopRoomMotion(); return false;}
     if(restartAnchorProbe.exchange(false))
@@ -1214,10 +1237,13 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
         VRMath::Matrix vehicleBasis{};
         const bool useFirstPerson=firstPerson && visibilityAvailable &&
             GameplayAnchor(anchor,heading,measuredHeight,groundZ,vehicle,ducking,airborne,vehicleBasis,animated,ragdoll,exiting);
+        vehicleHudValid=useFirstPerson && vehicle && seatAnchorValid && seatIsCar && !exiting;
+        if(vehicleHudValid){vehicleHudAnchor=vehicleBasis;vehicleHudAnchor[3]=anchor;}
         auto bodyAnchor=anchor;
         if(useFirstPerson!=firstPersonActive || vehicle!=anchorVehicle) recenter=true;
         anchorVehicle=vehicle;
         vehicleView=useFirstPerson && vehicle!=0;
+        OpenXRVR::SetDriving(vehicleView);
         crouchedView=useFirstPerson && ducking;
         airborneView=useFirstPerson && airborne;
         animatedView=useFirstPerson && animated;

@@ -30,6 +30,8 @@ import openxrvr;
 import vrprofile;
 import vrcamera;
 import d3dx9_43;
+import vrhud;
+import vrhands;
 
 export namespace VRStereo
 {
@@ -185,6 +187,7 @@ namespace
     void* worldParent=nullptr;
     bool setupThisFrame=false,prepared=false;
     int buildingEye=-1,renderEye=-1;
+    thread_local bool composingHud=false;
     unsigned buildingStage=0;
     unsigned hiddenPlayerCalls[2]{};
     unsigned renderStage=0;
@@ -194,6 +197,13 @@ namespace
     bool mirror=true;
     unsigned publishedFrame=0;
     OpenXRVR::EyeView completedViews[2]{};
+    VRMath::Matrix completedViewProjection[2]{};
+    VRMath::Vector completedEyePosition[2]{};
+    VRMath::Matrix completedEyeCamera[2]{};
+    VRMath::Matrix completedWrist[2]{};
+    bool completedWristValid[2]{};
+    VRMath::Matrix completedDashboard[2]{};
+    bool completedDashboardValid[2]{};
     long long completedPoseTime=0;
     std::atomic<DWORD> routingThread{0};
     std::atomic<unsigned> routingGeneration{1};
@@ -1557,9 +1567,9 @@ namespace
     }
 
     HRESULT WINAPI SetTarget(IDirect3DDevice9* self,DWORD index,IDirect3DSurface9* surface)
-    {FlushLiveMesh(self);return setTarget.unsafe_stdcall<HRESULT>(self,index,OnRoutingThread() ? MapSurface(surface,renderEye) : surface);}
+    {FlushLiveMesh(self);return setTarget.unsafe_stdcall<HRESULT>(self,index,OnRoutingThread() && !composingHud ? MapSurface(surface,renderEye) : surface);}
     HRESULT WINAPI SetDepth(IDirect3DDevice9* self,IDirect3DSurface9* surface)
-    {FlushLiveMesh(self);return setDepth.unsafe_stdcall<HRESULT>(self,OnRoutingThread() ? MapSurface(surface,renderEye) : surface);}
+    {FlushLiveMesh(self);return setDepth.unsafe_stdcall<HRESULT>(self,OnRoutingThread() && !composingHud ? MapSurface(surface,renderEye) : surface);}
     HRESULT WINAPI SetTexture(IDirect3DDevice9* self,DWORD stage,IDirect3DBaseTexture9* texture)
     {
         texture=OnRoutingThread() ? MapTexture(texture,renderEye):texture;
@@ -1609,7 +1619,7 @@ namespace
     }
     HRESULT WINAPI Stretch(IDirect3DDevice9* self,IDirect3DSurface9* source,const RECT* sourceRect,
         IDirect3DSurface9* destination,const RECT* destinationRect,D3DTEXTUREFILTERTYPE filter)
-    {FlushLiveMesh(self);const bool route=GetCurrentThreadId()==routingThread;
+    {FlushLiveMesh(self);const bool route=GetCurrentThreadId()==routingThread && !composingHud;
      return stretch.unsafe_stdcall<HRESULT>(self,route ? MapSurface(source,renderEye) : source,sourceRect,
         route ? MapSurface(destination,renderEye) : destination,destinationRect,filter);}
 
@@ -1968,12 +1978,20 @@ namespace
         bool begin;
         OpenXRVR::EyeView views[2]{};
         float camera[16]{};
+        VRMath::Matrix viewProjection{},wristSnapshot{},dashboardSnapshot{};
+        bool wristValid=false,dashboardValid=false;
         float shadowForward[4]{};
         long long poseTime;
     public:
         EyeMarker(int value,unsigned role,unsigned id,bool start):CBaseDC(),eye(value),stage(role),frame(id),begin(start),poseTime(viewTime)
         {views[0]=xrViews[0]; views[1]=xrViews[1]; std::memcpy(camera,eyeViewports[value].mViewInverseMatrix,sizeof(camera));
-         std::memcpy(shadowForward,gameShadowForward,sizeof(shadowForward));}
+         std::memcpy(shadowForward,gameShadowForward,sizeof(shadowForward));
+         VRMath::Matrix cameraWorld{},projection{};
+         std::memcpy(cameraWorld.data(),eyeViewports[value].mViewInverseMatrix,sizeof(cameraWorld));
+         std::memcpy(projection.data(),eyeViewports[value].mProjectionMatrix,sizeof(projection));
+         viewProjection=VRMath::Multiply(VRMath::InverseRigid(cameraWorld),projection);
+         wristValid=VRHands::GetWrist(0,wristSnapshot);
+         dashboardValid=VRCamera::GetVehicleHudAnchor(dashboardSnapshot);}
         int32_t GetSize() override {return sizeof(EyeMarker);}
         void DrawCommand() override
         {
@@ -2170,6 +2188,11 @@ namespace
                 if(eye) outsideStart=VRProfile::Begin(); else interEyeStart=VRProfile::Begin();
                 if(completedFrame!=frame) {completedFrame=frame; completedEyes=0;}
                 completedEyes|=1u<<eye;
+                completedViewProjection[eye]=viewProjection;
+                std::memcpy(completedEyeCamera[eye].data(),camera,sizeof(camera));
+                completedWrist[eye]=wristSnapshot;completedWristValid[eye]=wristValid;
+                completedDashboard[eye]=dashboardSnapshot;completedDashboardValid[eye]=dashboardValid;
+                std::memcpy(completedEyePosition[eye].data(),camera+12,sizeof(VRMath::Vector));
                 if(completedEyes==3)
                 {completedViews[0]=views[0]; completedViews[1]=views[1]; completedPoseTime=poseTime;}
             }
@@ -2510,6 +2533,13 @@ namespace
         // session can accept it instead of permanently disabling submission.
         if(!OpenXRVR::CanAcceptEyeImages()) return;
         VRProfile::Scope profile(VRProfile::Metric::Publish);
+        VRHud::CaptureRadar(device,resources->originalBack.Get());
+        composingHud=true;
+        for(unsigned eye=0;eye<2;++eye) VRHud::Draw(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],completedEyePosition[eye],completedWristValid[eye] ? &completedWrist[eye]:nullptr,completedDashboardValid[eye] ? &completedDashboard[eye]:nullptr);
+        const auto hudPose=VRMath::BlendRigidPose(completedEyeCamera[0],completedEyeCamera[1],.5f);
+        for(unsigned eye=0;eye<2;++eye) VRHud::DrawOverlay(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],hudPose);
+        VRHud::EndOverlayFrame();
+        composingHud=false;
         if(mirror && maxFrames!=1)
             mirror=Check("desktop eye mirror",stretch.unsafe_stdcall<HRESULT>(device,
                 resources->finalSurface[0].Get(),nullptr,resources->originalBack.Get(),nullptr,D3DTEXF_NONE));
@@ -3197,6 +3227,7 @@ namespace
 
 void VRStereo::Shutdown()
 {
+    VRHud::Reset();
     cpuOmitRequested=99;cpuOmitMode=0;cpuOmitDeadline=0;cpuOmitHook.reset();
     liveMeshRequested=0;liveMeshMode=0;liveMeshPackets.reset();liveMeshRenderer=VRRigidInstance::Renderer{};liveMeshClear.reset();RemoveLiveMeshResourceHooks();
     billboardInstancingRequested=false;
@@ -3380,6 +3411,10 @@ std::string VRStereo::Status()
 
 void VRStereo::Install()
 {
+    VRHud::SetOverlayRouting([](bool begin){
+        if(begin && (!OnRoutingThread() || renderEye>=0 || composingHud)) return false;
+        composingHud=begin;return true;
+    });
     CIniReader ini("");
     if(!ini.ReadInteger("VR","ExperimentalStereo",0)) return;
     if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=0 && !OpenXRVR::UsesVulkan())
@@ -3500,8 +3535,10 @@ void VRStereo::Install()
     enabled=true;
     OpenXRVR::SetEyeImageProvider([]()
     {
-        if(!enabled || !ready || !RageDirect3DDevice9::m_pRealDevice) return;
+        if(!enabled || !RageDirect3DDevice9::m_pRealDevice) return;
         auto* device=*RageDirect3DDevice9::m_pRealDevice;
+        if(VRHud::PublishScreen(device,!ready)) return;
+        if(!ready) return;
         if(device) {CaptureEyes(device); PublishEyes(device);}
     });
     FusionFix::onGameProcessEvent() += []()
@@ -3554,7 +3591,7 @@ void VRStereo::Install()
         static unsigned frames=0;
         if(!enabled || !RageDirect3DDevice9::m_pRealDevice) return;
         auto* device=*RageDirect3DDevice9::m_pRealDevice;
-        if(ready) {if(device) {CaptureEyes(device); PublishEyes(device);} return;}
+        if(ready) {if(device && !VRHud::WantsScreen(false)) {CaptureEyes(device); PublishEyes(device);} return;}
         if(maxFrames && stereoFrames>=maxFrames) return;
         if(!CTimer::ms_bUserPause || !CTimer::ms_bScriptPause || *CTimer::ms_bUserPause || *CTimer::ms_bScriptPause) return;
         if(++frames<180) return;

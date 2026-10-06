@@ -98,6 +98,13 @@ struct Bridge {
     }
     bool Copy(unsigned eye,VkImage target) {
         if(eye>1 || !target || !sources[eye] || pending) return false;
+        // DXVK can relocate a resource's Vulkan backing storage. Keeping the
+        // D3D9 texture alive does not pin the VkImage obtained on the first
+        // frame. Resolve it after pending producer commands, for every copy.
+        Flush();
+        using Info=HRESULT(STDMETHODCALLTYPE*)(IUnknown*,VkImage*,VkImageLayout*,VkImageCreateInfo*);
+        if(FAILED(Method<Info>(textureInterop[eye].Get(),3)(textureInterop[eye].Get(),
+            &sources[eye],&layouts[eye],nullptr)) || !sources[eye]) return false;
         Transition(eye,layouts[eye],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         Flush();
         using Wait=bool(STDMETHODCALLTYPE*)(IUnknown*,IDirect3DResource9*,DWORD);

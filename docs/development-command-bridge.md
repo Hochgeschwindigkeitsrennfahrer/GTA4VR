@@ -1,5 +1,9 @@
 # Local game command bridge
 
+`input-status` includes semantic gameplay/menu action samples and `pointer`
+(`active`, `hit`, normalized `uv`, `down`) alongside hand pose/finger observations.
+See [VR controller actions](vr-controller-actions.md) for bindings and menu input.
+
 The PowerShell client accepts a bounded4096-byte response; commands remain limited to128 bytes. `hand-status` includes a `physics` object reporting native hand collision-shape readiness, active shapes, lifecycle counts, excluded collision pairs and maximum target error when ExperimentalHandPhysics is enabled. It also reports `armForceLimit`, `recoveryDistance`, `recoveries` and `limitedDrives` for the bounded motor on owned hand bodies. Counts confirm code coverage; contact behavior still requires a gameplay check. The old sweep/per-prop impulse counters and ExperimentalHandContact option were removed.
 
 `profile-start`, `profile-start-cpu`, `profile-start-cpu-noflush`, `profile-start-cpu-noao`, `profile-stop`, `profile-status` and `profile-metric <name>` control/read a bounded 30-second in-memory timing capture. The CPU-only start skips D3D9 GPU timestamp queries to measure observer overhead. The no-flush start temporarily changes D3D11 completion polling after explicit Flush while retaining the completion barrier and timeout. The no-AO start temporarily bypasses FusionFix ambient occlusion for effect isolation; stop, expiry or an ordinary start restores the saved behavior without writing settings. It is a quality-changing diagnostic, not an equivalent-quality performance comparison. See [profiling procedure and metric definitions](frame-profiling.md) and `tools/capture-frame-profile.ps1` for apartment/street comparisons. Profiling is inactive until explicitly started through the opt-in development bridge; these commands do not write saves or inject gameplay input.
@@ -297,3 +301,11 @@ With opt-in hand IK/head-relative movement, locomotion-status additionally repor
 For pad gait, locomotion-status reports gaitInstalled/jogReads/sprintReads. Jog requests begin at85% raw left-pad radius; click while moving requests sprint. Counts establish native action-read coverage only. The native speed routine retains stamina/exhaustion and directional speed limits.
 
 hand-status includes bodyHeightEnabled/playerHeight/nativeBodyHeight/bodyScale for ExperimentalBodyHeight, and poseFinishReady/poseFinishUpdates for the native supporting-bone pass moved after tracked IK. Authored head/toe rest transforms plus BodyHeadAllowance, not live crouched pose, determine the estimated reference height. The visible body fit retains native physics size and camera/world scale.
+
+## Wrist HUD diagnostics (#020)
+
+`tools/game-command.ps1 hud-status` reports watch enablement, native radar hook calls, capture/draw counts, failures and the source viewport bounds. Inspect with `| ConvertTo-Json -Depth 5`. Draw success does not establish correct position, pixels or readability; inspect a fresh headset/eye image.
+
+`tools/game-command.ps1 hud-capture` requests one source radar and post-draw eye PNG on the next drawable watch frame. Outputs are local `plugins/GTAIV.VR.wrist-radar.png` and `GTAIV.VR.wrist-eye.png`; they remain outside Git. This one-shot readback can hitch and is not a performance capture.
+
+OpenXR status now reports panelActive and panelFrames for the loading/pause screen. The screen can submit while eyeImages=false; panelFrames counts completed panel transfers prepared for frame submission, separate from stereoLayers/native gameplay FPS. hud-status reports the sampled native wanted count; zero hides its star row. These counters require visual acceptance for orientation, readability and timing.

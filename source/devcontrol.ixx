@@ -18,6 +18,7 @@ import openxrvr;
 import vrstereo;
 import vrcamera;
 import vrhands;
+import vrhud;
 import vrprofile;
 import natives;
 
@@ -188,6 +189,8 @@ namespace
             response="{\"ok\":true,\"input\":"+OpenXRVR::InputStatus()+"}";
         }
         else if(command=="hand-status") response="{\"ok\":true,\"hands\":"+VRHands::Status()+"}";
+        else if(command=="hud-capture") {VRHud::Capture();response="{\"ok\":true,\"accepted\":true}";}
+        else if(command=="hud-status") response="{\"ok\":true,\"hud\":"+VRHud::Status()+"}";
         else if(command=="hand-calibrate left" || command=="hand-calibrate right")
         {
             response=VRHands::Calibrate(command=="hand-calibrate left" ? 0u : 1u)

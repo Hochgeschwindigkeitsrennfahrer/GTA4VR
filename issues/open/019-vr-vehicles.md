@@ -27,3 +27,5 @@ The #014 car camera is accepted. #015 adds user-accepted basic Vive controls: ri
 - 2026-10-02: first-person vehicle camera support and entry/exit camera continuity are now required before #014 closes. Coordinate seated/riding anchors there; this issue retains VR vehicle controls, physical interactions and the broader vehicle route.
 - User requests cars/bikes/planes. Do not assume the base game has playable planes or silently replace that requirement with helicopters. Split class-specific implementation issues when the inventory establishes scope.
 - Requested on 2026-10-01. Implementation and runtime acceptance remain pending.
+
+- 2026-10-06: #020 implements accepted generic seat-relative car radar/health/armor/wanted panel; car radar yaw uses native vehicle heading. Wrist presentation resumes on foot/bikes. Default car offset is0.45m right,0.55m forward,0.32m down from stable seat eyes; size0.16m. Per-model placement, bikes/aircraft/passengers and physical cockpit interaction remain this issue. Broader UI compatibility is #031.

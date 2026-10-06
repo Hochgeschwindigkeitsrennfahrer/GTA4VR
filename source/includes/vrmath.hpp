@@ -454,4 +454,37 @@ namespace VRMath
             {0,1,0,-low[1]+margin},{0,-1,0,high[1]+margin},
             {0,0,1,-low[2]+margin},{0,0,-1,high[2]+margin}}};
     }
+    // A panel's front faces local +Z. Ray points down the OpenXR aim -Z axis.
+    inline bool RayPanel(const Matrix& panel,const Vector& origin,const Vector& direction,
+        float width,float height,float& u,float& v,float& distance)
+    {
+        const auto inverse=InverseRigid(panel);
+        const auto o=Transform(origin,inverse),d=Transform(direction,inverse);
+        if(!std::isfinite(o[0]+o[1]+o[2]+d[0]+d[1]+d[2]+width+height) ||
+            width<=0 || height<=0 || o[2]<=0 || d[2]>=-.0001f) return false;
+        distance=-o[2]/d[2];
+        if(distance<.01f || distance>10.f) return false;
+        u=.5f+(o[0]+distance*d[0])/width;
+        v=.5f-(o[1]+distance*d[1])/height;
+        return u>=0 && u<=1 && v>=0 && v<=1;
+    }
+
+    inline Vector Quaternion(const Matrix& m)
+    {
+        // Transpose the row-vector rotation for the usual quaternion formula.
+        const float trace=m[0][0]+m[1][1]+m[2][2];
+        Vector q{};
+        if(trace>0){const float s=2*std::sqrt(trace+1);
+            q={(m[1][2]-m[2][1])/s,(m[2][0]-m[0][2])/s,(m[0][1]-m[1][0])/s,s*.25f};}
+        else {
+            unsigned i=0;if(m[1][1]>m[i][i])i=1;if(m[2][2]>m[i][i])i=2;
+            const unsigned j=(i+1)%3,k=(i+2)%3;
+            const float s=2*std::sqrt(std::max(0.f,1+m[i][i]-m[j][j]-m[k][k]));
+            if(s<.00001f)return {0,0,0,1};
+            q[i]=s*.25f;q[j]=(m[i][j]+m[j][i])/s;q[k]=(m[i][k]+m[k][i])/s;
+            q[3]=(m[j][k]-m[k][j])/s;
+        }
+        return q;
+    }
+
 }

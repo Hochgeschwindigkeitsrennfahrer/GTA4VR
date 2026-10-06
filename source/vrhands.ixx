@@ -22,6 +22,7 @@ export namespace VRHands
     bool SetRotation(int x,int y,int z);
     bool Calibrate(unsigned hand);
     bool Trim(unsigned hand,int x,int y,int z);
+    bool GetWrist(unsigned hand,VRMath::Matrix& world);
 }
 
 namespace
@@ -38,6 +39,9 @@ namespace
     } physicsRig;
     void PublishPhysicsPose();
     SRWLOCK targetLock=SRWLOCK_INIT;
+    SRWLOCK wristLock=SRWLOCK_INIT;
+    VRMath::Matrix publishedWrists[2]{};
+    uint64_t publishedWristAt[2]{};
     bool fitBodyHeight=false;
     bool supportGripEnabled=false;
     std::atomic<bool> supportGripping=false,supportReady=false;
@@ -371,11 +375,11 @@ namespace
     {
         OpenXRVR::ControllerInput input{};
         if(!OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) ||
-            !input.active[1] || !input.gripPoseValid[1]) {weaponClickLatched=true; return;}
-        if(!input.clicked[1]) {weaponClickLatched=false; return;}
+            !input.gripPoseValid[1]) {weaponClickLatched=true; return;}
+        if(!input.cycle && !input.nextWeapon && !input.previousWeapon) {weaponClickLatched=false; return;}
         if(weaponClickLatched) return;
         weaponClickLatched=true;
-        const float horizontal=input.trackpad[1][0];
+        const float horizontal=input.previousWeapon ? -1.f:input.nextWeapon ? 1.f:input.cycleDirection;
         if(!std::isfinite(horizontal) || std::abs(horizontal)<.25f) return;
         void* owner=nullptr; uint64_t at=0;
         AcquireSRWLockShared(&targetLock); owner=targetOwner; at=targetAt; ReleaseSRWLockShared(&targetLock);
@@ -472,9 +476,9 @@ namespace
         // injection or aiming task; native Fire owns readiness/ammo/cadence.
         OpenXRVR::ControllerInput input{};
         if(!weaponFire || !OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) ||
-            !input.gripPoseValid[1] || !input.triggerActive[1]) {triggerLatched=false; return;}
-        if(input.trigger[1]<.3f) {triggerLatched=false; return;}
-        if(input.trigger[1]<.7f || triggerLatched) return;
+            !input.gripPoseValid[1] || !input.fireActive) {triggerLatched=false; return;}
+        if(input.fire<.3f) {triggerLatched=false; return;}
+        if(input.fire<.7f || triggerLatched) return;
         triggerLatched=true;
         void* owner=nullptr; uint64_t at=0;
         AcquireSRWLockShared(&targetLock); owner=targetOwner; at=targetAt; ReleaseSRWLockShared(&targetLock);
@@ -780,7 +784,7 @@ namespace
                 supportDistance=std::sqrt(distanceSquared);
                 // Proximity permits acquisition; the held grip button owns
                 // release. Do not detach when the physical support Wand moves.
-                supporting=input.gripActive[0] && input.gripped[0] &&
+                supporting=input.support &&
                     (supportGripping || distanceSquared<.12f*.12f);
                 if(supporting) targets[0]=supportTarget;
             }
@@ -875,6 +879,13 @@ namespace
     {
         for(unsigned hand=0;hand<2;++hand)
         {
+            if(physicsRig.valid[hand])
+            {
+                AcquireSRWLockExclusive(&wristLock);
+                publishedWrists[hand]=VRMath::AffineXYZ(physicsRig.matrices[physicsRig.wrist[hand]]);
+                publishedWristAt[hand]=GetTickCount64();
+                ReleaseSRWLockExclusive(&wristLock);
+            }
             if(!physicsRig.valid[hand] || fingerRig.count[hand]!=15) continue;
             const auto wrist=physicsRig.matrices[physicsRig.wrist[hand]][3];
             const auto elbow=physicsRig.matrices[physicsRig.elbow[hand]][3];
@@ -916,6 +927,16 @@ void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* own
     targetAt=active ? GetTickCount64() : 0;
     if(!active) supportGripping=false;
     ReleaseSRWLockExclusive(&targetLock);
+}
+
+bool VRHands::GetWrist(unsigned hand,VRMath::Matrix& world)
+{
+    if(hand>1 || !OpenXRVR::HasFocusedViews()) return false;
+    AcquireSRWLockShared(&wristLock);
+    world=publishedWrists[hand];
+    const auto at=publishedWristAt[hand];
+    ReleaseSRWLockShared(&wristLock);
+    return at && GetTickCount64()-at<=100;
 }
 
 bool VRHands::Active(void* owner)

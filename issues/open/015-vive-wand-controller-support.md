@@ -2,13 +2,16 @@
 
 ## Goal
 
+Accepted foundation (2026-10-06): independent semantic OpenXR actions for SteamVR rebinding, separate finger inputs, and pause-menu point/select/back with a visible ray. Remaining work is haptics and explicit tracking-recovery/combined-movement validation.
+
 Add tracked OpenXR controller input and controller-driven locomotion, initially verified with the user's Vive Wands on SteamVR. Depends on #005; integrate with the room-scale movement implemented in #014. Roadmap stage 4. This issue does not block #014's headset-only acceptance.
 
 ## Tasks
 
-- [ ] Define semantic OpenXR actions for grip/aim poses, trigger, grip, trackpad locomotion/selection, menu and haptics; record the actual Vive Wand binding layout.
+- [x] Define semantic OpenXR pose, hand, gameplay, driving and menu actions; record the actual Vive Wand binding layout.
+- [ ] Add and verify haptic actions/feedback.
 - [x] Attach/synchronize action sets, validate pose validity and convert controller poses through the same tracking origin and world scale as the headset.
-- [ ] Provide visible hands/controller proxies, left/right ownership and usable menu/locomotion bindings without conflicting game input.
+- [x] Provide visible hands/controller proxies, left/right ownership and usable menu/locomotion bindings without conflicting game input.
 - [x] Define controller locomotion's directional reference and body-facing policy, keeping stationary head rotation independent of body facing.
 - [ ] Verify combined controller and room-scale movement without double-counting physical translation.
 - [ ] Verify both wands, tracking loss/recovery, disconnect/reconnect and VR-disabled keyboard/gamepad behavior.
@@ -19,9 +22,17 @@ Both Vive Wands report correct tracked poses and usable bound inputs/haptics in 
 
 ## Notes / evidence
 
+### 2026-10-06 — semantic actions and menu pointing
+
+- User accepted pause opening, tracked pointing/selection/drag/back and the named action groups in SteamVR's binding editor. This completes the current semantic-action/menu request. Haptics and the issue's broader loss/reconnect/combined-route gates remain open; no new performance claim.
+
+- Split OpenXR actions into Hand animation and tracking, On foot, Driving, Menus and Pause menu sets. Gameplay now consumes Move, Sprint, Jump, Fire, Support weapon, weapon selection, steering/pedals and interaction actions, independently of finger animation. Menu context replaces the on-foot/driving set; pose sampling continues. Vive defaults preserved; independent Next/Previous weapon actions are available without default bindings. [Bindings and limits](../../docs/vr-controller-actions.md).
+- Win32 Release/x64 compiler host passed (`issue020-pointer-release.log`, existing dependency PDB warnings). Ray-plane/front-face/UV and quaternion reconstruction tests passed. Installed ASI/INI backed up at ignored `build/issue020-before-pointer-20261006-140246`; installed INI unchanged. Deployed SHA256 `CD6AD95267AA63817FE362BC1C936DBD3FA1A81D3E008D1DCFEEE78AD947DA66`.
+- CE1.2.0.59 / SteamVR2.17.10 / DXVK-Vulkan PID24104: all action creations, suggested bindings and five-set attachment succeeded. FOCUSED, ready/fresh controller snapshots and semantic Move XY observed. World-space loading screen returned to continuous stereo, without reported runtime failure. Pointer use and SteamVR binding-editor acceptance requested; these runtime observations alone do not establish native menu selection or every gameplay mapping.
+
 ### Current state — 2026-10-06
 
-#016 is closed for accepted tracked hands/standard-pistol work. Vive touch-only locomotion, backward/strafe, edge jogging, held-click sprint, weapon cycling, right-menu vehicle entry/exit, running jump, basic steering/throttle/brake and handbrake have been implemented and accepted. Controller poses/finger actions are live. Remaining #015 work: haptic actions/output, general menu/navigation bindings, explicit tracking-loss/disconnect/reconnect and combined room-scale acceptance, and final VR-disabled controls verification (coordinate #024). Historical notes below retain their original pending states; this summary supersedes them for accepted controls.
+#016 is closed for accepted tracked hands/standard-pistol work. Vive touch-only locomotion, backward/strafe, edge jogging, held-click sprint, weapon cycling, right-menu vehicle entry/exit, running jump, basic steering/throttle/brake and handbrake have been implemented and accepted. Controller poses/finger actions are live. Remaining #015 work: haptic actions/output, explicit tracking-loss/disconnect/reconnect and combined room-scale acceptance, and final VR-disabled controls verification (coordinate #024). Historical notes below retain their original pending states; this summary supersedes them for accepted controls.
 
 
 - 2026-10-05 #016 adds per-hand grip pose spaces and squeeze/click action alongside the existing aim/trackpad observations. `input-status` exposes grip validity/button/position. Traversal bindings/haptics and this issue's broader acceptance remain pending; #016 intentionally starts with arm tracking.
@@ -85,3 +96,5 @@ Both Vive Wands report correct tracked poses and usable bound inputs/haptics in 
 - Final retry via Rockstar launcher reached PID23104, FOCUSED SteamVR2.17.10 / DXVK-Vulkan, continuous stereo ready with513 built frames and0 command overflows; buttonsInstalled=true and515 fresh button updates. Earlier direct/Steam startup attempts did not reach the bridge and launcher reported unexpected exit; retry succeeded. No claimed exit/jump acceptance from these initialization counters.
 
 - 2026-10-06: user accepts the corrected native history and shared movement/run injection: standstill vehicle exit and running jumps now work ("Yup, that works!"). SHA256 C42D46544007475501AEACB3E6BD335E63E83A65C96AE6BB1A1BEB5693C8AFB6. Broader controller/episode acceptance remains open.
+
+- 2026-10-06: semantic action sets and tracked pause ray/select/drag/back are user-accepted. General pause-menu navigation is implemented; remaining gates are haptics, explicit tracking loss/reconnect and combined controller/room-scale route evidence. UI mission/lifecycle coverage is now #031. Do not repeat accepted menu binding work.
