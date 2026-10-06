@@ -1,5 +1,11 @@
 # 015 — OpenXR controller support with Vive Wands
 
+### Closed — user accepted — 2026-10-06
+
+The user accepts current Vive Wand support and requests closure. Tracked poses, semantic SteamVR bindings, locomotion, gameplay/car buttons, finger inputs and menu pointing were implemented and accepted during #014/#016/#020/#022 work. Haptics and formal tracking-loss/reconnect/combined-route checks were not completed; the user does not require those original gates to keep this issue open. No new compatibility claim for those unchecked items.
+
+Historical scope and observations follow; pending statements describe the earlier issue state.
+
 ## Goal
 
 Accepted foundation (2026-10-06): independent semantic OpenXR actions for SteamVR rebinding, separate finger inputs, and pause-menu point/select/back with a visible ray. Remaining work is haptics and explicit tracking-recovery/combined-movement validation.

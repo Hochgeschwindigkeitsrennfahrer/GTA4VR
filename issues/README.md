@@ -24,22 +24,22 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [008 — Persist reverse-engineering findings in Ghidra (closed)](closed/008-ghidra-project-workflow.md)
 - [009 — Local development command bridge (closed)](closed/009-local-development-command-bridge.md)
 - [010 — Traffic-light lamps missing in the right eye](open/010-traffic-light-right-eye.md). Isolated follow-up; the user does not require it to block #006.
-- [011 — Validate camera scale, pose timing and auxiliary views](open/011-camera-scale-and-auxiliary-views.md). Roadmap stage 3 validation following the first stereo image.
-- [012 — Diagnose intermittent early startup exits](open/012-intermittent-early-startup-exit.md). Track launch reliability separately from stereo pixel correctness.
+- [011 — Validate camera scale, pose timing and auxiliary views (superseded)](closed/011-camera-scale-and-auxiliary-views.md). Outdated broad validation; remaining defects have individual issues.
+- [012 — Diagnose intermittent early startup exits (closed, external)](closed/012-intermittent-early-startup-exit.md). Rockstar Launcher/Windows issues, per user.
 - [013 — Profile and improve the native-refresh frame budget](open/013-profile-native-refresh-frame-budget.md). Explain the remaining scene-dependent submission drops.
 - [014 — First-person headset camera and room-scale movement (closed)](closed/014-first-person-headset-camera.md)
-- [015 — OpenXR controller support with Vive Wands](open/015-vive-wand-controller-support.md)
+- [015 — OpenXR controller support with Vive Wands (closed)](closed/015-vive-wand-controller-support.md)
 - [016 — 6DOF hands, firearm aiming and shooting](closed/016-six-dof-hands-and-firearms.md)
 - [017 — 6DOF hand and knife combat](open/017-six-dof-melee-combat.md)
 - [018 — Grab and manipulate physics objects with 6DOF hands](open/018-six-dof-physics-object-grabbing.md)
 - [019 — VR vehicle interaction and driving](open/019-vr-vehicles.md)
 - [020 — VR minimap, subtitles and gameplay overlays (closed)](closed/020-vr-overlays-and-subtitles.md)
-- [021 — VR weapon wheel](open/021-vr-weapon-wheel.md)
+- [021 — VR weapon wheel (canceled)](closed/021-vr-weapon-wheel.md)
 - [022 — Physical interactive in-world phone (closed)](closed/022-physical-interactive-phone.md)
 - [023 — Fix world objective markers visible only in the left eye](open/023-objective-markers-both-eyes.md)
 - [024 — Firearm coverage and physical weapon reloading](open/024-physical-weapon-reloading.md)
 - [025 — Physics-based money and weapon drops](open/025-physical-money-and-weapon-drops.md)
-- [026 — Remove cinematic depth and focus blur in VR](open/026-disable-cinematic-depth-blur.md)
+- [026 — Remove cinematic depth and focus blur in VR (closed)](closed/026-disable-cinematic-depth-blur.md)
 - [027 — Fix stereo water shimmer and reflections](open/027-stereo-water-shading.md)
 - [028 — Independent third-person desktop view with VR-only character visibility](open/028-independent-desktop-view.md)
 - [029 — Diagnose crashes during first-person free roam (closed)](closed/029-diagnose-free-roam-crashes.md)

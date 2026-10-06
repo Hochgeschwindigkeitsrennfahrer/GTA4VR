@@ -1,5 +1,11 @@
 # 021 — VR weapon wheel
 
+### Closed as canceled — 2026-10-06
+
+The user cancels the custom weapon wheel: use the existing native weapon swapping with accepted Wand bindings instead. No wheel implementation is required or claimed. Remaining firearm behavior belongs to #024.
+
+Historical scope and observations follow; pending statements describe the earlier issue state.
+
 ## Goal
 
 Provide a controller-operated weapon wheel with readable selection and reliable weapon switching. Depends on #015/#020; coordinate equipped weapon transforms with #016. Roadmap stage 4.

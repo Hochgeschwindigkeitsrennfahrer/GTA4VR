@@ -22,8 +22,8 @@ A repeatable capture and phase/draw timeline attributes each listed element to i
 The core radar, native text/sprite HUD, loading and pause ownership findings were implemented and accepted in [#020](020-vr-overlays-and-subtitles.md). The original exhaustive timeline was not completed; its remaining work is consolidated into outcome-specific issues:
 
 - [#031](../open/031-ui-coverage-and-lifecycle.md) owns unmatched UI pixels, draw attribution and transitions discovered during coverage/lifecycle checks.
-- [#022](../closed/022-physical-interactive-phone.md) owns the phone model/screen draw order, camera/target ownership and interaction mapping.
-- [#026](../open/026-disable-cinematic-depth-blur.md) owns cinematic post-processing order and target/history dependencies needed to remove focus blur safely.
+- [#022](../closed/022-physical-interactive-phone.md) records the accepted native phone model/screen ownership and interaction mapping; broader phone route coverage remains #031.
+- [#026](../closed/026-disable-cinematic-depth-blur.md) is now closed: the user disabled cinematic focus blur through an existing game option, so a custom bypass is unnecessary.
 
 No separate full-pipeline investigation is required before those tasks. Historical observations below are retained; statements that this issue remains open describe its earlier scope.
 

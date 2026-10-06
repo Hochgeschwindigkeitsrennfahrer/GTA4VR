@@ -1,5 +1,11 @@
 # 011 — Validate camera scale, pose timing and auxiliary views
 
+### Closed as outdated / superseded — 2026-10-06
+
+The user considers the camera/scale/pose foundation working and requests closure; remaining specific defects already have individual issues. Camera/hands acceptance is in #014/#016, performance #013, stereo defects #010/#023/#027 and independent desktop views #028. Historical unchecked measurement tasks are not claimed newly measured by this closure.
+
+Historical scope and observations follow; pending statements describe the earlier issue state.
+
 ## Goal
 
 Move the first stereo world image from #006 toward roadmap stage 3: measured camera behavior and correct auxiliary views throughout a repeatable route. Depends on #006. UI composition remains #007 and the isolated right-eye traffic lamp remains #010.
@@ -9,7 +15,7 @@ Move the first stereo world image from #006 toward roadmap stage 3: measured cam
 - [ ] Measure game units per meter with a reproducible physical/headset reference; verify IPD and translation parallax at several distances.
 - [ ] Verify recenter, near clipping, on-foot and vehicle camera behavior with the accepted level-headset locomotion reference, without feeding pitch/roll into movement.
 - [ ] Measure the delay from predicted pose to rendered image and submission. Replace the previous-callback pose pipeline when supported by measured scheduling evidence; retain one simulation update per stereo frame.
-- [ ] Test water, mirror and interior/exterior reflections explicitly in both eyes. The first-image implementation shares auxiliary views generated from the game camera; decide which need separate eye views. Water mismatch reproduction and repair are owned by [#027](027-stereo-water-shading.md); use its evidence here rather than duplicating the investigation.
+- [ ] Test water, mirror and interior/exterior reflections explicitly in both eyes. The first-image implementation shares auxiliary views generated from the game camera; decide which need separate eye views. Water mismatch reproduction and repair are owned by [#027](../open/027-stereo-water-shading.md); use its evidence here rather than duplicating the investigation.
 - [ ] Test rain/clouds, particles, glass, AO/history and other temporal effects while moving and turning in the headset. Capture reproducible failures and apply scoped fixes.
 - [ ] Coordinate route timing with #013. The 90 Hz sample in #006 does not establish sustained native refresh on every route.
 - [ ] Retest ordinary flat-screen mode after camera or render changes; track GTA IV and the episodes separately.

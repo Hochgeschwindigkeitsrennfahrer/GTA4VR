@@ -1,5 +1,11 @@
 # 012 — Diagnose intermittent early startup exits
 
+### Closed as external / outside fork scope — 2026-10-06
+
+The user attributes startup problems to Rockstar Launcher behavior and unrelated Windows problems and requests closure. No FusionFix/VR startup fix is claimed. Preserve historical fault/retry evidence below; continue verifying GTAIV.exe actually starts and avoid duplicate launches as documented in AGENTS.md.
+
+Historical scope and observations follow; pending statements describe the earlier issue state.
+
 ## Goal
 
 Make launch testing reproducible by identifying intermittent exits before FusionFix initialization. Do not attribute them to the VR renderer without a supported call stack and controlled comparison.

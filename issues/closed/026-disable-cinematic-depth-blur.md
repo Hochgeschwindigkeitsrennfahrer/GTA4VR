@@ -1,5 +1,11 @@
 # 026 — Remove cinematic depth and focus blur in VR
 
+### Closed — resolved through game option — 2026-10-06
+
+The user confirms an existing game option disables the unwanted cinematic depth/focus blur and requests closure. No custom shader bypass or cinematic patch is needed. The exact option/value was not provided in this request and no setting was changed during closure. The original implementation/capture checklist below is superseded by this user-accepted configuration solution.
+
+Historical scope and observations follow; pending statements describe the earlier issue state.
+
 ## Goal
 
 Remove cinematic depth-of-field/focus blur from the VR image while preserving other required post-processing and ordinary flat-screen behavior. Own the required post-processing attribution here, using the findings preserved in closed #007. Roadmap stage 5.
