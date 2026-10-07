@@ -21,6 +21,16 @@ export namespace VRHandPhysics
     void Publish(void* owner,void* held,unsigned hand,const VRMath::Vector* points,const VRMath::Matrix& wrist,bool supporting);
     void PublishBlade(void* owner,void* held,const VRMath::Vector* world,const VRMath::Vector* tracked,uint64_t sampledAt,const VRMelee::Profile& profile);
     bool IsGrabbing(unsigned hand);
+    class WeaponQueryScope
+    {
+        void* previousOwner;
+        void* previousWeapon;
+    public:
+        WeaponQueryScope(void* owner,void* held);
+        ~WeaponQueryScope();
+        WeaponQueryScope(const WeaponQueryScope&)=delete;
+        WeaponQueryScope& operator=(const WeaponQueryScope&)=delete;
+    };
     bool Resolve(void* owner,unsigned hand,VRMath::Matrix& wrist);
     std::string Status();
     std::string CombatStatus();
@@ -28,7 +38,10 @@ export namespace VRHandPhysics
 
 namespace
 {
-    SafetyHookInline pairHook{},queryHook{},overlapHook{},ragdollDeactivateHook{},ragdollSettleHook{};
+    SafetyHookInline pairHook{},queryHook{},rayHook{},overlapHook{},ragdollDeactivateHook{},ragdollSettleHook{};
+    thread_local void* shotOwner=nullptr;
+    thread_local void* shotWeapon=nullptr;
+    std::atomic<unsigned> excludedShotQueries=0;
     thread_local bool selectingGrab=false;
     thread_local void* punchOwner=nullptr;
     thread_local void* strikeWeapon=nullptr;
@@ -248,6 +261,20 @@ namespace
         if(strikeWeapon && instance && *reinterpret_cast<void**>(static_cast<char*>(instance)+0xC)==strikeWeapon) return false;
         if(selectingGrab && std::find(grabCandidates.begin(),grabCandidates.end(),instance)==grabCandidates.end()) return false;
         return queryHook.thiscall<bool>(query,bound,instance);
+    }
+
+    bool __fastcall RayBound(void* query,void*,void* bound,void* instance)
+    {
+        // B60430 -> A545A0 -> 738F10 -> 73A370. Reject before hit writes,
+        // including compound recursion; genuine scenery/NPCs remain eligible.
+        if(shotOwner && instance)
+        {
+            auto* bytes=static_cast<unsigned char*>(instance);
+            void* entity=(bytes[0xA]&0x40) ? *reinterpret_cast<void**>(bytes+0xC):nullptr;
+            if(IsProxy(instance) || entity==shotOwner || (entity && entity==shotWeapon))
+            {++excludedShotQueries;return false;}
+        }
+        return rayHook.thiscall<bool>(query,bound,instance);
     }
 
     bool __fastcall GrabOverlapBound(void* query,void*,void* bound,void* instance)
@@ -1281,6 +1308,9 @@ void VRHandPhysics::Publish(void* owner,void* held,unsigned hand,const VRMath::V
 }
 
 bool VRHandPhysics::IsGrabbing(unsigned hand) {return hand<2 && (grabbing[hand].load() || doorGrabbing[hand].load() || ragdollGrabbing[hand].load());}
+VRHandPhysics::WeaponQueryScope::WeaponQueryScope(void* owner,void* held):previousOwner(shotOwner),previousWeapon(shotWeapon)
+{shotOwner=owner;shotWeapon=held;}
+VRHandPhysics::WeaponQueryScope::~WeaponQueryScope() {shotOwner=previousOwner;shotWeapon=previousWeapon;}
 
 void VRHandPhysics::PublishBlade(void* owner,void* held,const VRMath::Vector* world,const VRMath::Vector* tracked,uint64_t sampledAt,const VRMelee::Profile& profile)
 {
@@ -1319,7 +1349,9 @@ std::string VRHandPhysics::Status()
     sprintf_s(value,"{\"enabled\":%s,\"ready\":%s,\"failed\":%s,\"activeShapes\":%u,\"created\":%u,\"removed\":%u,\"updates\":%u,\"excludedPairs\":%u,\"excludedQueries\":%u,\"maxTargetError\":%.4f,\"armForceLimit\":%.1f,\"recoveryDistance\":%.2f,\"recoveries\":%u,\"limitedDrives\":%u}",
         enabled ? "true":"false",(pairHook && queryHook) ? "true":"false",failed ? "true":"false",active.load(),created.load(),removed.load(),updates.load(),excludedPairs.load(),excludedQueries.load(),maxError.load(),armForce,recoveryDistance,recoveries.load(),limitedDrives.load());
     std::string result=value;result.pop_back();
-    return result+",\"grabEnabled\":"+(grabbingEnabled ? "true":"false")+
+    return result+",\"shotFilterReady\":"+(rayHook ? "true":"false")+
+        ",\"excludedShotQueries\":"+std::to_string(excludedShotQueries.load())+
+        ",\"grabEnabled\":"+(grabbingEnabled ? "true":"false")+
         ",\"grabbing\":["+(grabbing[0] ? std::string("true"):std::string("false"))+","+(grabbing[1] ? "true":"false")+
         "],\"grabAttempts\":"+std::to_string(grabAttempts.load())+",\"grabStarts\":"+std::to_string(grabStarts.load())+
         ",\"grabReleases\":"+std::to_string(grabReleases.load())+",\"grabRejected\":"+std::to_string(grabRejected.load())+
@@ -1484,6 +1516,8 @@ void VRHandPhysics::Install()
     auto queryTarget=injector::GetBranchDestination(query.get_first(21)).as_int();
     queryHook=safetyhook::create_inline(reinterpret_cast<void*>(queryTarget),QueryBound);
     if(!queryHook) {pairHook.reset(); failed=true; return;}
+    auto ray=hook::pattern("56 FF 75 20 8B CF E8 ? ? ? ? 84 C0 74 11 6A 00 8D 46 10 50 8B CF E8 ? ? ? ? 84 C0");
+    if(ray.size()==1) rayHook=safetyhook::create_inline(reinterpret_cast<void*>(injector::GetBranchDestination(ray.get_first(6)).as_int()),RayBound);
     if(grabbingEnabled)
     {
         // Unique caller bytes at CE739E57 resolve the stationary narrowphase;

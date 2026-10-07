@@ -80,6 +80,7 @@ export namespace OpenXRVR
     bool HasFocusedViews(); // Fresh pose and focus gate for gameplay direction.
     bool CanAcceptEyeImages(); // Render callback thread; false while stopped or recreating.
     bool PacesGameplay(); // Atomic; true while the runtime requests stereo frames.
+    bool IsSessionRunning(); // Atomic; focus/overlay changes do not stop the session.
     bool SetEyeImages(const HANDLE (&shared)[2], unsigned width, unsigned height,
         const EyeView (&views)[2], long long poseTime); // Render callback thread after D3D9 GPU completion.
     bool UsesVulkan();
@@ -184,7 +185,7 @@ namespace
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
-    bool running = false;
+    std::atomic<bool> running = false;
     bool enabled = false;
     bool vulkanEnabled=false;
     DxvkVulkan::Bridge* vulkanBridge=nullptr;
@@ -1195,6 +1196,8 @@ std::string OpenXRVR::ProducerTestStatus()
     sprintf_s(text,"{\"ok\":true,\"active\":%s,\"remainingMs\":%llu,\"completedPairs\":%llu,\"cachedPose\":true,\"headsetSubmissions\":false,\"gpuCompletionVerified\":false}",
         producerActive.load() ? "true":"false",deadline>now ? deadline-now:0,producerPairs.load());return text;
 }
+
+bool OpenXRVR::IsSessionRunning() {return running.load();}
 
 bool OpenXRVR::PacesGameplay()
 {

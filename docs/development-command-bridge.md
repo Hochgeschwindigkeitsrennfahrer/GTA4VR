@@ -1,5 +1,27 @@
 # Local game command bridge
 
+`reload-status` reports #024's opt-in standard-pistol chamber/magazine/reserve,
+discarded rounds and gesture/pose counters. `pistol-status` reports the last native
+NPC bullet hit's shape/part, base/applied damage and immediate health snapshots;
+queued damage may be applied after those snapshots. It also reports the local VR
+aimed-headshot hook readiness/check/override counters and magazine-holding state.
+The aimed-headshot correction selects native aiming eligibility; body/base damage
+remains unchanged. Both status commands are read-only.
+`pistol-status` also reports native aim-threat readiness, raised/target state,
+query/event counts and accepted vehicle-occupant events. These count native
+queries and queued events; visible NPC reactions require a gameplay check.
+`slidePullSounds` and `slideReleaseSounds` in `reload-status` count positional
+slide-audio requests, not proof that the sound was audible.
+`reload-weapon-config` reloads `plugins/VRWeapons/pistol.ini` on the simulation
+callback without restarting. Check `reload-status` for an increased
+`configRevision` and `configValid=true`; invalid/missing files retain the prior
+profile. It updates a held magazine and cancels its current insertion guide
+without changing ammo. See [profile keys](physical-pistol-reloading.md#runtime-weapon-profiles).
+`pistol-test` selects the standard pistol on the simulation callback with the
+same free-roam safeguards as `melee-test`. It preserves ammo if already owned,
+otherwise supplies 34 rounds for testing. Check `melee-test-status` for completion.
+See [physical reloads](physical-pistol-reloading.md) for the asset dependency.
+
 `combat-status` reports the opt-in #017 tracked punch/knife gates, native damage
 readiness, per-hand fist/speed/hit observations and last native damage/target.
 Knife fields include fresh blade readiness, speed, threshold, damage and

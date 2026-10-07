@@ -18,6 +18,7 @@ import openxrvr;
 import vrstereo;
 import vrcamera;
 import vrhands;
+import vrreload;
 import vrhandphysics;
 import vrhud;
 import vrprofile;
@@ -96,9 +97,10 @@ namespace
             {ReleaseSRWLockExclusive(&meleeTestLock);return;}
             if(!*error)
             {
-                // Fixed melee types only, no address/script execution or save.
-                // This replaces the native melee inventory slot for testing.
-                Natives::GiveWeaponToChar(ped,meleeTestType,1,false);
+                // Fixed test types only, no address/script execution or save.
+                // Preserve an owned pistol's ammunition when selecting it.
+                if(meleeTestType!=7 || !Natives::HasCharGotWeapon(ped,7))
+                    Natives::GiveWeaponToChar(ped,meleeTestType,meleeTestType==7 ? 34u:1u,false);
                 Natives::SetCurrentCharWeapon(ped,meleeTestType,true);
                 uint32_t selected=~0u;
                 if(!Natives::GetCurrentCharWeapon(ped,&selected) || selected!=meleeTestType) error="native equip readback failed";
@@ -252,6 +254,12 @@ namespace
         else if(command=="hand-status") response="{\"ok\":true,\"hands\":"+VRHands::Status()+"}";
         else if(command=="combat-status") response="{\"ok\":true,\"combat\":"+VRHandPhysics::CombatStatus()+"}";
         else if(command=="melee-test-status") response=MeleeTestStatus();
+        else if(command=="reload-status") response="{\"ok\":true,\"reload\":"+VRReloadRuntime::Status()+"}";
+        else if(command=="reload-weapon-config") response=VRReloadRuntime::ReloadConfig() ?
+            "{\"ok\":true,\"accepted\":true,\"configFile\":\"VRWeapons/pistol.ini\"}" :
+            "{\"ok\":false,\"error\":\"physical reload module disabled\"}";
+        else if(command=="pistol-status") response="{\"ok\":true,\"pistol\":"+VRHands::PistolStatus()+"}";
+        else if(command=="pistol-test") response=QueueMeleeTest(7);
         else if(command=="melee-test bat" || command=="melee-test cue" || command=="melee-test knife")
             response=QueueMeleeTest(command=="melee-test bat" ? 1u:(command=="melee-test cue" ? 2u:3u));
         else if(command=="hud-capture") {VRHud::Capture();response="{\"ok\":true,\"accepted\":true}";}

@@ -12,6 +12,7 @@ import comvars;
 import openxrvr;
 import natives;
 import vrhandphysics;
+import vrreload;
 
 export namespace VRHands
 {
@@ -21,6 +22,7 @@ export namespace VRHands
     bool Active(void* owner);
     void SetTraversalState(void* owner,bool moving,bool neutralAllowed);
     std::string Status();
+    std::string PistolStatus();
     bool SetRotation(int x,int y,int z);
     bool Calibrate(unsigned hand);
     bool Trim(unsigned hand,int x,int y,int z);
@@ -371,6 +373,25 @@ namespace
     using WeaponFire=char (__thiscall*)(void*,void*,const VRMath::Matrix*,const VRMath::Vector*,const VRMath::Vector*,
         uint32_t,uint32_t,uint32_t,uint32_t,float);
     WeaponFire weaponFire=nullptr;
+    SafetyHookInline weaponFireHook{};
+    SafetyHookInline bulletHitHook{};
+    SafetyHookMid aimedHeadshotHook{};
+    std::atomic<unsigned> aimedHeadshotChecks=0,aimedHeadshotOverrides=0;
+    using AimTarget=void* (__cdecl*)(void*,const VRMath::Vector*,const VRMath::Vector*,bool,bool);
+    using AimEventCtor=void* (__thiscall*)(void*,void*);
+    using AimEventDtor=void (__thiscall*)(void*);
+    using AimAddEvent=void* (__thiscall*)(void*,void*,bool,bool);
+    AimTarget aimTarget=nullptr;
+    AimEventCtor aimEventCtor=nullptr;
+    AimEventDtor aimEventDtor=nullptr;
+    AimAddEvent aimAddEvent=nullptr;
+    float aimRaiseBelowHead=.40f,aimDwell=0;
+    void* aimCandidate=nullptr;
+    uint64_t aimSampleAt=0;
+    std::atomic<bool> aimRaised=false,aimHasTarget=false;
+    std::atomic<unsigned> aimQueries=0,aimEvents=0,aimVehicleEvents=0;
+    std::atomic<unsigned> bulletHits=0,bulletPart=~0u,bulletShape=~0u;
+    std::atomic<float> bulletDamage=0,bulletApplied=0,bulletHealthBefore=0,bulletHealthAfter=0;
     bool triggerLatched=false;
     std::atomic<unsigned> triggerAttempts{0},triggerShots{0};
     bool weaponSwapEnabled=false,weaponClickLatched=true;
@@ -435,6 +456,57 @@ namespace
         return weapon;
     }
 
+    char __fastcall FireWeapon(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
+        const VRMath::Vector* origin,const VRMath::Vector* target,uint32_t force,uint32_t a,uint32_t b,uint32_t c,float damage)
+    {
+        if(!VRReloadRuntime::CanFire(shooter,weapon)) return 0;
+        const auto fired=weaponFireHook.unsafe_fastcall<char>(weapon,edx,shooter,frame,origin,target,force,a,b,c,damage);
+        if(fired) VRReloadRuntime::Fired(shooter,weapon);
+        return fired;
+    }
+
+    float __fastcall BulletHit(void* weapon,void*,void* shooter,void* frame,void* hit,float damage)
+    {
+        void* local=nullptr;AcquireSRWLockShared(&targetLock);local=targetOwner;ReleaseSRWLockShared(&targetLock);
+        const bool observed=shooter && shooter==local &&
+            *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==7;
+        void* victim=nullptr;
+        if(observed && hit)
+        {
+            auto* instance=*reinterpret_cast<unsigned char**>(hit);
+            if(instance && (instance[0xA]&0x40)) victim=*reinterpret_cast<void**>(instance+0xC);
+        }
+        using Health=float (__thiscall*)(void*);
+        Health health=victim ? reinterpret_cast<Health>((*reinterpret_cast<void***>(victim))[0xFC/4]):nullptr;
+        const float before=health ? health(victim):0;
+        const float applied=bulletHitHook.thiscall<float>(weapon,shooter,frame,hit,damage);
+        if(observed)
+        {
+            bulletDamage=damage;bulletApplied=applied;bulletHealthBefore=before;
+            bulletHealthAfter=health ? health(victim):0;
+            bulletShape=hit ? *reinterpret_cast<unsigned short*>(static_cast<char*>(hit)+0x50):~0u;
+            bulletPart=hit ? *reinterpret_cast<unsigned short*>(static_cast<char*>(hit)+0x52):~0u;
+            ++bulletHits;
+        }
+        return applied;
+    }
+
+    void AimedPistolHeadshot(SafetyHookContext& regs)
+    {
+        // CE CA46E3: JNZ following the native player aiming-bit test. Reached
+        // only after immunity, weapon-class, head/neck and player checks.
+        // EDI is the damage event (shooter0, amount4, part8, weaponTypeC).
+        // Carry VR aiming eligibility through the ordinary native branch;
+        // do not write the player's aiming flags or multiply base damage.
+        auto* event=reinterpret_cast<unsigned char*>(regs.edi);
+        if(!event || *reinterpret_cast<unsigned*>(event+0xC)!=7 || !OpenXRVR::HasFocusedViews()) return;
+        auto* shooter=*reinterpret_cast<void**>(event);
+        if(!VRHands::Active(shooter)) return;
+        ++aimedHeadshotChecks;
+        constexpr uintptr_t ZeroFlag=0x40;
+        if(regs.eflags & ZeroFlag) {regs.eflags &= ~ZeroFlag;++aimedHeadshotOverrides;}
+    }
+
     char __fastcall FirePistol(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
         const VRMath::Vector* origin,const VRMath::Vector* target,uint32_t flag,uint32_t extra,float damage)
     {
@@ -468,6 +540,7 @@ namespace
                     for(unsigned axis=0;axis<3;++axis) end[axis]=muzzle[axis]+(*gun)[0][axis]*scale;
                     end[3]=1;
                     ++muzzleShots;
+                    VRHandPhysics::WeaponQueryScope shotScope(shooter,entity);
                     return pistolFireHook.unsafe_fastcall<char>(weapon,edx,shooter,gun,&muzzle,&end,flag,extra,damage);
                 }
             }
@@ -491,6 +564,7 @@ namespace
         void* entity=nullptr;
         void* weapon=EquippedWeapon(owner,entity);
         if(!weapon || *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)!=7) return;
+        if(!VRReloadRuntime::CanFire(owner,weapon)) {VRReloadRuntime::EmptyTrigger(owner,weapon);return;}
         auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!gun) return;
         alignas(16) VRMath::Vector muzzle{0,0,0,1},end{0,0,0,1};
@@ -507,7 +581,74 @@ namespace
         const float scale=range/std::sqrt(length2);
         for(unsigned axis=0;axis<3;++axis) end[axis]=muzzle[axis]+(*gun)[0][axis]*scale;
         ++triggerAttempts;
+        VRHandPhysics::WeaponQueryScope shotScope(owner,entity);
         if(weaponFire(weapon,owner,gun,&muzzle,&end,0,0,0,0,-1.f)) ++triggerShots;
+    }
+
+    void ProcessPistolThreat()
+    {
+        auto reset=[] {aimCandidate=nullptr;aimDwell=0;aimSampleAt=0;aimRaised=false;aimHasTarget=false;};
+        OpenXRVR::ControllerInput input{};OpenXRVR::EyeView eyes[2]{};long long display=0;
+        if(!aimTarget || !aimEventCtor || !aimEventDtor || !aimAddEvent ||
+            !OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) ||
+            !input.gripPoseValid[1] || input.phoneActive || Natives::IsPauseMenuActive() ||
+            !OpenXRVR::GetEyeViews(eyes,display)) {reset();return;}
+        // Tracking-space height follows physical crouching and does not depend
+        // on an animated shoulder or a vanilla aiming pose.
+        const float head=(eyes[0].position[1]+eyes[1].position[1])*.5f;
+        if(!std::isfinite(head+input.gripPosition[1][1]) ||
+            input.gripPosition[1][1]<head-aimRaiseBelowHead) {reset();return;}
+        void* owner=nullptr;uint64_t at=0;
+        AcquireSRWLockShared(&targetLock);owner=targetOwner;at=targetAt;ReleaseSRWLockShared(&targetLock);
+        if(!owner || !at || GetTickCount64()-at>100) {reset();return;}
+        Ped player=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&player);
+        if(!player || !Natives::DoesCharExist(player) || Natives::IsCharDead(player) ||
+            Natives::IsCharInAnyCar(player)) {reset();return;}
+        void* entity=nullptr;void* weapon=EquippedWeapon(owner,entity);
+        if(!weapon || *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)!=7) {reset();return;}
+        auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
+        if(!gun) {reset();return;}
+        alignas(16) VRMath::Vector muzzle{0,0,0,1},end{0,0,0,1};
+        muzzleLookup(weapon,&muzzle,gun,3);
+        const float length=VRMath::Length3((*gun)[0]);
+        const float range=weaponRange(weapon,owner);
+        const float offset=VRMath::Length3(VRMath::Difference3(muzzle,(*gun)[3]));
+        if(!std::isfinite(length+range+offset) || length<.7f || length>1.3f ||
+            range<=.1f || range>=2000.f || offset>2.f) {reset();return;}
+        for(unsigned a=0;a<3;++a) end[a]=muzzle[a]+(*gun)[0][a]*(std::min(range,20.f)/length);
+        void* victim=nullptr;
+        {
+            // Use the same native ped/occupant and obstruction query as
+            // CTaskComplexPlayerGun. Exclude only our own rig and weapon.
+            VRHandPhysics::WeaponQueryScope query(owner,entity);
+            victim=aimTarget(owner,&muzzle,&end,false,true);
+        }
+        ++aimQueries;aimRaised=true;
+        auto* ped=static_cast<unsigned char*>(victim);
+        if(!ped || victim==owner || (*reinterpret_cast<uint32_t*>(ped+0x28)&0x3C0)!=0xC0 ||
+            (ped[0x268]&1) || !*reinterpret_cast<void**>(ped+0x224))
+        {aimCandidate=nullptr;aimDwell=0;aimSampleAt=0;aimHasTarget=false;return;}
+        aimHasTarget=true;
+        const auto now=GetTickCount64();
+        // Never dereference a retained candidate: each frame obtains a fresh
+        // native result. Long gaps and target changes restart the dwell.
+        if(victim!=aimCandidate || !aimSampleAt || now-aimSampleAt>100)
+        {aimCandidate=victim;aimDwell=0;aimSampleAt=now;return;}
+        float dt=0;Natives::GetFrameTime(&dt);
+        if(!std::isfinite(dt) || dt<0) {reset();return;}
+        aimDwell+=std::min(dt,.05f);aimSampleAt=now;
+        auto* frame=*reinterpret_cast<VRMath::Matrix**>(ped+0x20);
+        if(!frame) {reset();return;}
+        const float distance=VRMath::Length3(VRMath::Difference3((*frame)[3],(*gun)[3]));
+        // Native player-gun dwell: .2s nearby, rising to2s at20m.
+        const float delay=std::max(0.f,(distance-5.f)/15.f)*1.8f+.2f;
+        if(!std::isfinite(distance) || distance>20.f || aimDwell<delay) return;
+        alignas(16) unsigned char event[0x20]{};
+        aimEventCtor(event,owner);
+        auto* group=static_cast<char*>(*reinterpret_cast<void**>(ped+0x224))+0x84;
+        if(aimAddEvent(group,event,false,true))
+        {++aimEvents;if((ped[0x26C]&4) && *reinterpret_cast<void**>(ped+0xB30)) ++aimVehicleEvents;}
+        aimEventDtor(event);aimDwell=0;
     }
 
     void ResolveFingerRig(void* skeleton)
@@ -567,15 +708,17 @@ namespace
     }
 
     void UpdateFingers(VRMath::Matrix* matrices,unsigned hand,int wrist,const OpenXRVR::ControllerInput& input,
-        const VRMath::Matrix* nativePose,const VRMath::Matrix& nativeWrist,bool supporting=false)
+        const VRMath::Matrix* nativePose,const VRMath::Matrix& nativeWrist,bool supporting=false,bool sliding=false)
     {
         if(!fingersEnabled || fingerRig.count[hand]!=15) return;
         for(const auto& finger:fingerRig.joints[hand])
         {
             if(finger.joint==0 && finger.parent!=static_cast<unsigned>(wrist)) return;
         }
+        const bool magazineGrabbing=!nativePose && hand==0 && VRReloadRuntime::HoldsMagazine();
         const bool propGrabbing=!nativePose && VRHandPhysics::IsGrabbing(hand);
-        const bool closed=!nativePose && (propGrabbing || supporting || (input.gripActive[hand] && input.gripped[hand]));
+        const bool holding=propGrabbing || magazineGrabbing || sliding;
+        const bool closed=!nativePose && (holding || supporting || (input.gripActive[hand] && input.gripped[hand]));
         const float trigger=supporting ? 1.f : (input.triggerActive[hand] ? input.trigger[hand] : 0.f);
         const bool touched=supporting || (input.padTouched[hand] && input.active[hand]);
         unsigned index=0;
@@ -584,16 +727,17 @@ namespace
         for(const auto& finger:fingerRig.joints[hand])
         {
             auto local=finger.rest;
-            // An acquired prop owns a cupped holding pose for ALL fingers,
+            // An acquired prop/magazine owns a holding pose for ALL fingers,
             // independent of trigger/pad input. Otherwise retain free-hand
             // animation and the game's authored equipped-weapon grip.
-            const float amount=propGrabbing ? (finger.finger==0 ? 1.f:.6f) : finger.finger==0 ? (touched ? 1.f:0.f) :
+            const float amount=sliding ? (finger.finger==0 ? .8f:.65f) : magazineGrabbing ? (finger.finger==0 ? .85f:.75f) :
+                propGrabbing ? (finger.finger==0 ? 1.f:.6f) : finger.finger==0 ? (touched ? 1.f:0.f) :
                 (finger.finger==1 ? trigger : (closed ? 1.f:0.f));
             const float curl=finger.finger==0 ?
-                (propGrabbing ? (finger.joint==0 ? 30.f:15.f) :
+                (holding ? (finger.joint==0 ? 30.f:15.f) :
                     (finger.joint==0 ? 25.f+20.f*(supporting ? 0.f:input.trackpad[hand][1]) : 20.f)) :
                 (finger.joint==0 ? 65.f : (finger.joint==1 ? 85.f:60.f));
-            const float lateral=!propGrabbing && !supporting && finger.finger==0 && finger.joint==0 && touched ?
+            const float lateral=!holding && !supporting && finger.finger==0 && finger.joint==0 && touched ?
                 20.f*input.trackpad[hand][0]*(hand==0 ? 1.f:-1.f) : 0.f;
             const float origin[3]={};
             const float curlHalf=curl*amount*.00872664626f;
@@ -813,7 +957,7 @@ namespace
                 supportDistance=std::sqrt(distanceSquared);
                 // Proximity permits acquisition; the held grip button owns
                 // release. Do not detach when the physical support Wand moves.
-                supporting=input.support && !VRHandPhysics::IsGrabbing(0) &&
+                supporting=input.support && !VRReloadRuntime::UsesLeftHand() && !VRHandPhysics::IsGrabbing(0) &&
                     (supportGripping || distanceSquared<.12f*.12f);
                 if(supporting) targets[0]=supportTarget;
             }
@@ -829,6 +973,9 @@ namespace
         }
         VRMath::Matrix solvedRight{};
         bool rightSolved=false;
+        VRMath::Matrix slideRelative{};
+        const bool sliding=VRReloadRuntime::SlideGrip(owner,held,slideRelative);
+        physicsRig.supporting[0]=supporting || sliding;
         for(unsigned order=0;order<2;++order)
         {
             const unsigned hand=1-order;
@@ -839,13 +986,13 @@ namespace
             for(unsigned axis=0;axis<3;++axis)
                 target[3][axis]=pivot[axis]+(target[3][axis]-pivot[axis]-
                     (trackedBody && axis==2 ? bodyVerticalOffset:0.f))/scale;
-            if(hand==0 && supporting)
+            if(hand==0 && (supporting || sliding))
             {
                 if(!rightSolved) {supportGripping=false; continue;}
                 // Anchor to the actual solved wrist, not the requested Wand
                 // pose: native reach limits can move the pistol hand away
                 // from that request. Express attachment spacing before fit.
-                auto relative=supportRelative;
+                auto relative=sliding ? slideRelative:supportRelative;
                 for(unsigned axis=0;axis<3;++axis) relative[3][axis]/=scale;
                 target=VRMath::Multiply(relative,solvedRight);
             }
@@ -889,7 +1036,7 @@ namespace
                     for(const auto& row:solvedRight) for(float value:row)
                         rightSolved &= std::isfinite(value);
                 }
-                if(hand==0 && supporting)
+                if(hand==0 && (supporting || sliding))
                 {
                     // IK positions the elbow/arm, but its endpoint clamp must
                     // not make an attached hand slide over the gun. Retain
@@ -898,7 +1045,7 @@ namespace
                         for(unsigned axis=0;axis<3;++axis)
                             matrices[wrist][row][axis]=absoluteTarget[row][axis];
                 }
-                UpdateFingers(matrices,hand,wrist,input,preserveGrip ? nativePose : nullptr,nativeWrist,hand==0 && supporting);
+                UpdateFingers(matrices,hand,wrist,input,preserveGrip ? nativePose : nullptr,nativeWrist,hand==0 && supporting,hand==0 && sliding);
             }
         }
     }
@@ -909,6 +1056,8 @@ namespace
 {
     void PublishPhysicsPose()
     {
+        if(physicsRig.valid[0] && physicsRig.valid[1])
+            VRReloadRuntime::Publish(physicsRig.owner,physicsRig.trackingTransform,physicsRig.requested);
         for(unsigned hand=0;hand<2;++hand)
         {
             if(physicsRig.valid[hand])
@@ -1178,6 +1327,7 @@ void VRHands::Install()
     if(finishPose.size()==1) finishPoseHook=safetyhook::create_inline(finishPose.get_first(),FinishPose);
     fingersEnabled=ini.ReadInteger("VR","ExperimentalFingerGrip",0)!=0;
     supportGripEnabled=ini.ReadInteger("VR","ExperimentalSupportGrip",0)!=0;
+    VRReloadRuntime::Install();
     weaponSwapEnabled=ini.ReadInteger("VR","ExperimentalWeaponSwap",0)!=0;
     if(weaponSwapEnabled) FusionFix::onGameProcessEvent() += ProcessWeaponSwap;
     if(ini.ReadInteger("VR","ExperimentalPistolAim",0))
@@ -1190,12 +1340,32 @@ void VRHands::Install()
             muzzleLookup=reinterpret_cast<MuzzleLookup>(muzzle.get_first());
             weaponRange=reinterpret_cast<WeaponRange>(range.get_first());
             pistolFireHook=safetyhook::create_inline(fire.get_first(),FirePistol);
+            auto impact=hook::pattern("55 8B EC 83 E4 F0 83 EC 28 8B 45 10 56 57 FF 30 89 4C 24 14 E8 ? ? ? ? 8B 75 08 8B F8 83 C4 04 8B 47 6C");
+            if(impact.size()==1) bulletHitHook=safetyhook::create_inline(impact.get_first(),BulletHit);
+            auto aimedHeadshot=hook::pattern("F6 80 D0 03 00 00 08 75 17 8D 44 24 1C 50 8D 44 24 24 50 51 E8 ? ? ? ? 83 C4 0C 84 C0 74 0B");
+            if(aimedHeadshot.size()==1) aimedHeadshotHook=safetyhook::create_mid(aimedHeadshot.get_first(7),AimedPistolHeadshot);
+            // CE A6F17D native target query; A6F437 constructs and sends the
+            // gun-aim event to the selected ped's intelligence event group.
+            auto target=hook::pattern("6A 01 6A 00 8D 44 24 28 50 8D 44 24 3C 50 57 E8 ? ? ? ? 6A 00 89 44 24 28 6A 01 8D 44 24 3C");
+            auto threat=hook::pattern("57 8D 4C 24 34 E8 ? ? ? ? 6A 01 6A 00 8D 44 24 38 50 8B 44 24 18 8B 88 24 02 00 00 81 C1 84 00 00 00 E8 ? ? ? ? 8D 4C 24 30 C7 46 38 00 00 00 00 E8");
+            if(target.size()==1 && threat.size()==1)
+            {
+                aimTarget=reinterpret_cast<AimTarget>(injector::GetBranchDestination(target.get_first(15)).as_int());
+                aimEventCtor=reinterpret_cast<AimEventCtor>(injector::GetBranchDestination(threat.get_first(5)).as_int());
+                aimAddEvent=reinterpret_cast<AimAddEvent>(injector::GetBranchDestination(threat.get_first(35)).as_int());
+                aimEventDtor=reinterpret_cast<AimEventDtor>(injector::GetBranchDestination(threat.get_first(51)).as_int());
+                aimRaiseBelowHead=ini.ReadFloat("VR","PistolAimRaiseBelowHead",.40f);
+                if(!std::isfinite(aimRaiseBelowHead)) aimRaiseBelowHead=.40f;
+                aimRaiseBelowHead=std::clamp(aimRaiseBelowHead,.15f,1.f);
+                FusionFix::onGameProcessEvent() += ProcessPistolThreat;
+            }
             if(pistolFireHook && ini.ReadInteger("VR","ExperimentalPistolTrigger",0))
             {
                 auto dispatch=hook::pattern("55 8B EC 83 E4 F0 83 EC 68 56 8B F1 57 FF 76 18 89 74 24 50 E8");
                 if(dispatch.size()==1)
                 {
                     weaponFire=reinterpret_cast<WeaponFire>(dispatch.get_first());
+                    weaponFireHook=safetyhook::create_inline(dispatch.get_first(),FireWeapon);
                     FusionFix::onGameProcessEvent() += ProcessPistolTrigger;
                 }
             }
@@ -1217,4 +1387,21 @@ void VRHands::Install()
         }
         catch(const std::invalid_argument&) { /* Invalid optional calibration retains default basis. */ }
     }
+}
+
+std::string VRHands::PistolStatus()
+{
+    return "{\"hitObserverReady\":"+std::string(bulletHitHook ? "true":"false")+
+        ",\"aimedHeadshotReady\":"+(aimedHeadshotHook ? "true":"false")+
+        ",\"aimedHeadshotChecks\":"+std::to_string(aimedHeadshotChecks.load())+
+        ",\"aimedHeadshotOverrides\":"+std::to_string(aimedHeadshotOverrides.load())+
+        ",\"aimThreatReady\":"+(aimTarget && aimEventCtor && aimEventDtor && aimAddEvent ? "true":"false")+
+        ",\"aimRaised\":"+(aimRaised ? "true":"false")+",\"aimHasTarget\":"+(aimHasTarget ? "true":"false")+
+        ",\"aimQueries\":"+std::to_string(aimQueries.load())+",\"aimEvents\":"+std::to_string(aimEvents.load())+
+        ",\"aimVehicleEvents\":"+std::to_string(aimVehicleEvents.load())+
+        ",\"magazineGrip\":"+(VRReloadRuntime::HoldsMagazine() ? "true":"false")+
+        ",\"hits\":"+std::to_string(bulletHits.load())+",\"part\":"+std::to_string(bulletPart.load())+
+        ",\"shape\":"+std::to_string(bulletShape.load())+",\"baseDamage\":"+std::to_string(bulletDamage.load())+
+        ",\"appliedDamage\":"+std::to_string(bulletApplied.load())+",\"healthBefore\":"+std::to_string(bulletHealthBefore.load())+
+        ",\"healthAfter\":"+std::to_string(bulletHealthAfter.load())+"}";
 }
