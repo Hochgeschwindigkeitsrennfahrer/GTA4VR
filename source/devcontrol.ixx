@@ -99,8 +99,8 @@ namespace
             {
                 // Fixed test types only, no address/script execution or save.
                 // Preserve an owned pistol's ammunition when selecting it.
-                if((meleeTestType!=7 && meleeTestType!=15) || !Natives::HasCharGotWeapon(ped,meleeTestType))
-                    Natives::GiveWeaponToChar(ped,meleeTestType,meleeTestType==7 ? 34u:(meleeTestType==15 ? 60u:1u),false);
+                if((meleeTestType!=7 && meleeTestType!=9 && meleeTestType!=15) || !Natives::HasCharGotWeapon(ped,meleeTestType))
+                    Natives::GiveWeaponToChar(ped,meleeTestType,meleeTestType==7 ? 34u:(meleeTestType==9 ? 18u:(meleeTestType==15 ? 60u:1u)),false);
                 Natives::SetCurrentCharWeapon(ped,meleeTestType,true);
                 uint32_t selected=~0u;
                 if(!Natives::GetCurrentCharWeapon(ped,&selected) || selected!=meleeTestType) error="native equip readback failed";
@@ -260,6 +260,7 @@ namespace
             "{\"ok\":false,\"error\":\"physical reload module disabled\"}";
         else if(command=="pistol-status") response="{\"ok\":true,\"pistol\":"+VRHands::PistolStatus()+"}";
         else if(command=="pistol-test") response=QueueMeleeTest(7);
+        else if(command=="pistol-test deagle") response=QueueMeleeTest(9);
         else if(command=="rifle-test m4") response=QueueMeleeTest(15);
         else if(command=="melee-test bat" || command=="melee-test cue" || command=="melee-test knife")
             response=QueueMeleeTest(command=="melee-test bat" ? 1u:(command=="melee-test cue" ? 2u:3u));

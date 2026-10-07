@@ -14,7 +14,7 @@ Loose-magazine assets remain a separate dependency and are not distributed here.
 `plugins/VRWeapons/m4.ini` supports the pistol profile's magazine hand rotation,
 offset, insertion axis/tip/travel, snap radius and alignment fields. The initial
 M4 reload sequence is accepted, with user-tuned insertion travel0.05m adopted as
-the default. The charging-hand rearward correction still needs acceptance. It also exposes
+the default. The charging-hand rearward correction is accepted. It also exposes
 `RackTravel`, `RackThreshold` and `RackGrabRadius` in meters. `RackGripOffsetX/Y/Z`
 move the acquisition point and snapped palm relative to the charging-handle bone
 in weapon-local meters; negative X moves rearward toward the stock. The default

@@ -39,8 +39,9 @@ namespace
     struct SlideHand {void* owner=nullptr;void* gun=nullptr;VRMath::Matrix local{},gripInverse{};uint64_t at=0;} slideHand;
     void* owner=nullptr;void* currentWeapon=nullptr;void* gunEntity=nullptr;
     std::atomic<unsigned> currentType=7;
-    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[2];
-    const char* ProfileFile(unsigned type) {return type==15 ? "VRWeapons/m4.ini":"VRWeapons/pistol.ini";}
+    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[3];
+    unsigned AmmoIndex(unsigned type) {return type==15 ? 1u:(type==9 ? 2u:0u);}
+    const char* ProfileFile(unsigned type) {return type==15 ? "VRWeapons/m4.ini":(type==9 ? "VRWeapons/deagle.ini":"VRWeapons/pistol.ini");}
     std::atomic<void*> guardedWeapon=nullptr,visualGun=nullptr,visualMagazine=nullptr;
     std::atomic<bool> chamberReady=true,inserted=true,leftBusy=false;
     std::atomic<float> slideDistance=0;
@@ -66,6 +67,7 @@ namespace
     Profile Defaults(unsigned type)
     {
         Profile value;
+        if(type==9) value.recoilKick=8.f;
         if(type==15)
         {
             value.axis={0,0,1,0};value.tip={-.0421465f,-.023525f,.0169907f,1};
@@ -192,7 +194,7 @@ namespace
         auto* weapon=*reinterpret_cast<void**>(static_cast<char*>(entity)+0x25C);
         if(!weapon) return nullptr;
         const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-        return (type==7 || type==15) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
+        return (type==7 || type==9 || type==15) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
     }
     bool ResolveRig(void* entity)
     {
@@ -224,7 +226,10 @@ namespace
             resolved[b]=true;
             auto* name=*reinterpret_cast<const char**>(bones+b*0xE0);
             if(name && !std::strcmp(name,currentType==15 ? "M4_Mag":"Mag")) magazineBone=b;
-            if(name && !std::strcmp(name,currentType==15 ? "M4_Gun_Cock1":"Gun_Cock1")) slideBone=b;
+            // Animated combat pistol uses Cock1 for the hammer; Breach is
+            // the slide. The Glock and M4 retain their accepted rack bones.
+            const char* rackBone=currentType==15 ? "M4_Gun_Cock1":(currentType==9 ? "Gun_Breach":"Gun_Cock1");
+            if(name && !std::strcmp(name,rackBone)) slideBone=b;
             if(name && !std::strcmp(name,"gun_grip")) primaryGripBone=b;
         }
         for(unsigned b=0;b<boneCount;++b) if(!resolved[b]) return false;
@@ -393,9 +398,9 @@ namespace
         Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
         if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharDead(ped))
         {guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;leftBusy=false;initialized=false;
-            savedAmmo[0]={};savedAmmo[1]={};DeleteMagazine();return;}
+            for(auto& saved:savedAmmo) saved={};DeleteMagazine();return;}
         if(owner!=view.owner)
-        {DeleteMagazine();initialized=false;owner=view.owner;guardedWeapon=nullptr;savedAmmo[0]={};savedAmmo[1]={};}
+        {DeleteMagazine();initialized=false;owner=view.owner;guardedWeapon=nullptr;for(auto& saved:savedAmmo) saved={};}
         void* entity=nullptr;void* weapon=Equipped(view.owner,entity);
         const unsigned type=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
         if(initialized && (!weapon || type!=currentType))
@@ -409,7 +414,7 @@ namespace
             {
                 Natives::SetCharAmmo(ped,currentType.load(),ammo.NativeTotal());
                 Natives::SetAmmoInClip(ped,currentType.load(),ammo.Clip());
-                savedAmmo[currentType==15 ? 1:0]={ammo,true};
+                savedAmmo[AmmoIndex(currentType)]={ammo,true};
             }
             initialized=false;racking=false;slideDistance=0;leftBusy=false;DeleteMagazine();
         }
@@ -426,7 +431,7 @@ namespace
         {
             Natives::GetAmmoInClip(ped,type,&clip);Natives::GetMaxAmmoInClip(ped,type,&capacity);
             if(capacity<2 || capacity>64 || total>100000) return;
-            auto& saved=savedAmmo[type==15 ? 1:0];
+            auto& saved=savedAmmo[AmmoIndex(type)];
             if(saved.valid)
             {
                 ammo=saved.ammo;
@@ -584,8 +589,8 @@ bool VRReloadRuntime::SlideGrip(void* ped,void* gun,VRMath::Matrix& relative)
 bool VRReloadRuntime::ReloadConfig() {if(!enabled) return false;configPending=true;return true;}
 std::array<float,4> VRReloadRuntime::RecoilSettings(unsigned type)
 {
-    if(type!=15) return {};
-    if(type!=currentType || !enabled) return {6.f,.15f,.18f,75.f};
+    if(type!=9 && type!=15) return {};
+    if(type!=currentType || !enabled) {const auto defaults=Defaults(type);return {defaults.recoilKick,defaults.recoilSupportScale,defaults.recoilRecovery,defaults.recoilMaximum};}
     return {recoilKick.load(),recoilSupportScale.load(),recoilRecovery.load(),recoilMaximum.load()};
 }
 std::string VRReloadRuntime::Status()

@@ -87,5 +87,11 @@ int main()
     Check(rifle.Fired() && rifle.Fired() && rifle.Clip()==28);
     Check(rifle.Resume(58,30) && rifle.Clip()==28 && rifle.reserve==30);
     rifle.Begin(0,60,30);Check(rifle.Resume(60,30) && !rifle.Ready() && rifle.Clip()==0);
-    std::puts("pistol/rifle reload accounting passed");
+    VRReload::Pistol combat;combat.Begin(9,27,9);
+    Check(combat.Fired() && combat.Clip()==8 && combat.NativeTotal()==26);
+    Check(combat.Resume(26,9) && combat.Clip()==8 && combat.reserve==18);
+    Check(combat.Eject()==7 && combat.Clip()==1);
+    Check(combat.TakeMagazine() && combat.held==8 && combat.Insert() && combat.Clip()==9);
+    Check(combat.Fired() && combat.Clip()==8 && rifle.Clip()==0 && gun.Clip()==16);
+    std::puts("pistol/rifle/combat pistol reload accounting passed");
 }
