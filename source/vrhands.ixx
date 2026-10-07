@@ -1,6 +1,8 @@
 module;
 #include <common.hxx>
 #include "includes/vrmath.hpp"
+#include "includes/vrgrip.hpp"
+#include "includes/vrmelee.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -34,8 +36,11 @@ namespace
         void* held=nullptr;
         VRMath::Matrix* matrices=nullptr;
         int wrist[2]{-1,-1},elbow[2]{-1,-1};
-        VRMath::Vector requested[2]{};
+        VRMath::Matrix requested[2]{};
         bool valid[2]{};
+        bool supporting[2]{};
+        VRMath::Matrix trackingTransform{};
+        uint64_t sampledAt=0;
     } physicsRig;
     void PublishPhysicsPose();
     SRWLOCK targetLock=SRWLOCK_INIT;
@@ -569,7 +574,8 @@ namespace
         {
             if(finger.joint==0 && finger.parent!=static_cast<unsigned>(wrist)) return;
         }
-        const bool closed=!nativePose && (supporting || (input.gripActive[hand] && input.gripped[hand]));
+        const bool propGrabbing=!nativePose && VRHandPhysics::IsGrabbing(hand);
+        const bool closed=!nativePose && (propGrabbing || supporting || (input.gripActive[hand] && input.gripped[hand]));
         const float trigger=supporting ? 1.f : (input.triggerActive[hand] ? input.trigger[hand] : 0.f);
         const bool touched=supporting || (input.padTouched[hand] && input.active[hand]);
         unsigned index=0;
@@ -578,14 +584,16 @@ namespace
         for(const auto& finger:fingerRig.joints[hand])
         {
             auto local=finger.rest;
-            // Grip affects only middle/ring/little. Index follows analog
-            // trigger pressure; thumb follows pad contact and its 2D position.
-            const float amount=finger.finger==0 ? (touched ? 1.f:0.f) :
+            // An acquired prop owns a cupped holding pose for ALL fingers,
+            // independent of trigger/pad input. Otherwise retain free-hand
+            // animation and the game's authored equipped-weapon grip.
+            const float amount=propGrabbing ? (finger.finger==0 ? 1.f:.6f) : finger.finger==0 ? (touched ? 1.f:0.f) :
                 (finger.finger==1 ? trigger : (closed ? 1.f:0.f));
             const float curl=finger.finger==0 ?
-                (finger.joint==0 ? 25.f+20.f*(supporting ? 0.f:input.trackpad[hand][1]) : 20.f) :
+                (propGrabbing ? (finger.joint==0 ? 30.f:15.f) :
+                    (finger.joint==0 ? 25.f+20.f*(supporting ? 0.f:input.trackpad[hand][1]) : 20.f)) :
                 (finger.joint==0 ? 65.f : (finger.joint==1 ? 85.f:60.f));
-            const float lateral=!supporting && finger.finger==0 && finger.joint==0 && touched ?
+            const float lateral=!propGrabbing && !supporting && finger.finger==0 && finger.joint==0 && touched ?
                 20.f*input.trackpad[hand][0]*(hand==0 ? 1.f:-1.f) : 0.f;
             const float origin[3]={};
             const float curlHalf=curl*amount*.00872664626f;
@@ -607,6 +615,26 @@ namespace
             ++index;
         }
         fingerClosed[hand]=closed; ++fingerUpdates[hand];
+    }
+
+    bool ResolveMeleeProfile(void* held,uint32_t type,VRMelee::Profile& profile)
+    {
+        if(type==3) {profile=VRMelee::Knife;return true;}
+        if(type!=1 && type!=2) return false;
+        const auto index=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
+        if(index<0) return false;
+        auto* models=reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+(0x01295CD8-0x00400000));
+        auto* model=static_cast<char*>(models[index]);
+        if(!model) return false;
+        auto* fragment=*reinterpret_cast<char**>(model+8);
+        void* drawable=nullptr;
+        if(fragment) drawable=*reinterpret_cast<void**>(fragment+0xB4);
+        else if(auto* slot=*reinterpret_cast<void***>(model+0xC)) drawable=*slot;
+        if(!drawable) return false;
+        VRMath::Vector low{},high{};
+        std::memcpy(low.data(),static_cast<char*>(drawable)+0x20,12);
+        std::memcpy(high.data(),static_cast<char*>(drawable)+0x30,12);
+        return VRMelee::ClubProfile(type,low,high,profile);
     }
 
     bool ResolveSupportGrip(void* model)
@@ -739,6 +767,7 @@ namespace
         void* held=nullptr;
         void* weapon=EquippedWeapon(owner,held);
         physicsRig={}; physicsRig.owner=owner; physicsRig.held=held; physicsRig.matrices=matrices;
+        physicsRig.trackingTransform=transform; physicsRig.sampledAt=input.sampledAt;
         finish.publish=true;
         const bool holdingWeapon=weapon && *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)!=0;
         weaponGrip=holdingWeapon;
@@ -784,15 +813,18 @@ namespace
                 supportDistance=std::sqrt(distanceSquared);
                 // Proximity permits acquisition; the held grip button owns
                 // release. Do not detach when the physical support Wand moves.
-                supporting=input.support &&
+                supporting=input.support && !VRHandPhysics::IsGrabbing(0) &&
                     (supportGripping || distanceSquared<.12f*.12f);
                 if(supporting) targets[0]=supportTarget;
             }
         }
         supportGripping=supporting;
+        physicsRig.supporting[0]=supporting;
         for(unsigned hand=0;hand<2;++hand)
         {
-            physicsRig.requested[hand]=targets[hand][3];
+            // Keep the tracked pose before collision feedback/IK. Physics must
+            // chase the Wand, never its own collision-resolved wrist rotation.
+            physicsRig.requested[hand]=targets[hand];
             if(input.gripPoseValid[hand]) VRHandPhysics::Resolve(owner,hand,targets[hand]);
         }
         VRMath::Matrix solvedRight{};
@@ -889,9 +921,9 @@ namespace
             if(!physicsRig.valid[hand] || fingerRig.count[hand]!=15) continue;
             const auto wrist=physicsRig.matrices[physicsRig.wrist[hand]][3];
             const auto elbow=physicsRig.matrices[physicsRig.elbow[hand]][3];
-            auto shift=VRMath::Difference3(physicsRig.requested[hand],wrist);
+            auto shift=VRMath::Difference3(physicsRig.requested[hand][3],wrist);
             VRMath::Vector points[VRHandPhysics::NodeCount]{};
-            points[0]=physicsRig.requested[hand];
+            points[0]=physicsRig.requested[hand][3];
             unsigned tip=2;
             for(unsigned i=0;i<15;++i)
             {
@@ -912,9 +944,43 @@ namespace
             for(unsigned i=7;i<10;++i)
                 for(unsigned axis=0;axis<3;++axis)
                     points[i][axis]=wrist[axis]+(elbow[axis]-wrist[axis])*((i-6)/3.f);
-            for(unsigned i=1;i<VRHandPhysics::NodeCount;++i)
+            for(unsigned i=1;i<VRHandPhysics::ContactNodeCount;++i)
                 for(unsigned axis=0;axis<3;++axis) points[i][axis]+=shift[axis];
-            VRHandPhysics::Publish(physicsRig.owner,physicsRig.held,hand,points);
+            const auto gripWrist=VRMath::AffineXYZ(physicsRig.requested[hand]);
+            // Palm/fingertip contacts also use tracked orientation. Translation
+            // alone would leave their targets rotated with the blocked hand.
+            auto solvedWrist=physicsRig.matrices[physicsRig.wrist[hand]];
+            if(VRGrip::Rigid(solvedWrist))
+            {
+                const auto toTracked=VRMath::Multiply(VRMath::InverseRigid(solvedWrist),gripWrist);
+                for(unsigned i=1;i<7;++i)
+                {
+                    auto point=points[i];
+                    for(unsigned axis=0;axis<3;++axis) point[axis]-=shift[axis];
+                    point[3]=1;points[i]=VRMath::Transform(point,toTracked);
+                }
+            }
+            points[VRHandPhysics::ContactNodeCount]=gripWrist[3];
+            VRHandPhysics::Publish(physicsRig.owner,physicsRig.held,hand,points,gripWrist,physicsRig.supporting[hand]);
+        }
+        // Use the rendered equipped entity, not a gun-muzzle semantic (the
+        // knife has none). Transform back to tracking space for motion gating
+        // so locomotion with a stationary blade cannot become an attack.
+        void* held=nullptr;
+        void* weapon=EquippedWeapon(physicsRig.owner,held);
+        VRMelee::Profile profile{};
+        if(held && held==physicsRig.held && weapon && ResolveMeleeProfile(held,
+            *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18),profile))
+        {
+            auto* frame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(held)+0x20);
+            if(frame)
+            {
+                const auto world=VRMelee::SampleBlade(profile,VRMath::AffineXYZ(*frame));
+                auto tracked=world;
+                const auto inverse=VRMath::InverseRigid(physicsRig.trackingTransform);
+                for(auto& point:tracked) point=VRMath::Transform(point,inverse);
+                VRHandPhysics::PublishBlade(physicsRig.owner,held,world.data(),tracked.data(),physicsRig.sampledAt,profile);
+            }
         }
     }
 }

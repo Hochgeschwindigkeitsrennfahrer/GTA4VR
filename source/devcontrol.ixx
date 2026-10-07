@@ -18,6 +18,7 @@ import openxrvr;
 import vrstereo;
 import vrcamera;
 import vrhands;
+import vrhandphysics;
 import vrhud;
 import vrprofile;
 import natives;
@@ -47,6 +48,66 @@ namespace
     bool locationBusy=false,locationValid=false;
     std::atomic<bool> locationQueued{false};
     const char* locationError="not captured";
+    SRWLOCK meleeTestLock=SRWLOCK_INIT;
+    unsigned meleeTestType=0;
+    bool meleeTestBusy=false,meleeTestValid=false;
+    uint32_t meleeTestModel=0;
+    uint64_t meleeTestStarted=0;
+    const char* meleeTestError="not requested";
+    std::string MeleeTestStatus()
+    {
+        AcquireSRWLockShared(&meleeTestLock);
+        const auto value="{\"ok\":true,\"pending\":"+std::string(meleeTestBusy ? "true":"false")+
+            ",\"valid\":"+(meleeTestValid ? "true":"false")+",\"weaponType\":"+std::to_string(meleeTestType)+
+            ",\"error\":\""+meleeTestError+"\"}";
+        ReleaseSRWLockShared(&meleeTestLock);return value;
+    }
+    std::string QueueMeleeTest(unsigned type)
+    {
+        AcquireSRWLockExclusive(&meleeTestLock);
+        if(meleeTestBusy) {ReleaseSRWLockExclusive(&meleeTestLock);return "{\"ok\":false,\"error\":\"equipment request pending\"}";}
+        meleeTestType=type;meleeTestModel=0;meleeTestStarted=GetTickCount64();
+        meleeTestBusy=true;meleeTestValid=false;meleeTestError="";
+        ReleaseSRWLockExclusive(&meleeTestLock);
+        return "{\"ok\":true,\"accepted\":true}";
+    }
+    void ProcessMeleeTest()
+    {
+        AcquireSRWLockExclusive(&meleeTestLock);
+        if(!meleeTestBusy) {ReleaseSRWLockExclusive(&meleeTestLock);return;}
+        Ped ped=0;
+        Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+        const char* error="";
+        if(!CTimer::ms_bUserPause || !CTimer::ms_bScriptPause || *CTimer::ms_bUserPause || *CTimer::ms_bScriptPause ||
+            !Natives::IsPlayerPlaying(Natives::GetPlayerId()) || Natives::GetMissionFlag() ||
+            (Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished()) ||
+            !ped || !Natives::DoesCharExist(ped) || Natives::IsCharDead(ped) || Natives::IsCharInAnyCar(ped))
+            error="requires living unpaused on-foot free roam";
+        else if(GetTickCount64()-meleeTestStarted>30000) error="weapon model load timed out";
+        else
+        {
+            if(!meleeTestModel)
+            {
+                Natives::GetWeapontypeModel(meleeTestType,&meleeTestModel);
+                if(!meleeTestModel || !Natives::IsModelInCdimage(meleeTestModel)) error="weapon model unavailable";
+                else Natives::RequestModel(meleeTestModel);
+            }
+            if(!*error && !Natives::HasModelLoaded(meleeTestModel))
+            {ReleaseSRWLockExclusive(&meleeTestLock);return;}
+            if(!*error)
+            {
+                // Fixed melee types only, no address/script execution or save.
+                // This replaces the native melee inventory slot for testing.
+                Natives::GiveWeaponToChar(ped,meleeTestType,1,false);
+                Natives::SetCurrentCharWeapon(ped,meleeTestType,true);
+                uint32_t selected=~0u;
+                if(!Natives::GetCurrentCharWeapon(ped,&selected) || selected!=meleeTestType) error="native equip readback failed";
+            }
+        }
+        if(meleeTestModel) Natives::MarkModelAsNoLongerNeeded(meleeTestModel);
+        meleeTestValid=!*error;meleeTestError=error;meleeTestBusy=false;
+        ReleaseSRWLockExclusive(&meleeTestLock);
+    }
 
     std::string LocationStatus()
     {
@@ -189,6 +250,10 @@ namespace
             response="{\"ok\":true,\"input\":"+OpenXRVR::InputStatus()+"}";
         }
         else if(command=="hand-status") response="{\"ok\":true,\"hands\":"+VRHands::Status()+"}";
+        else if(command=="combat-status") response="{\"ok\":true,\"combat\":"+VRHandPhysics::CombatStatus()+"}";
+        else if(command=="melee-test-status") response=MeleeTestStatus();
+        else if(command=="melee-test bat" || command=="melee-test cue" || command=="melee-test knife")
+            response=QueueMeleeTest(command=="melee-test bat" ? 1u:(command=="melee-test cue" ? 2u:3u));
         else if(command=="hud-capture") {VRHud::Capture();response="{\"ok\":true,\"accepted\":true}";}
         else if(command=="hud-status") response="{\"ok\":true,\"hud\":"+VRHud::Status()+"}";
         else if(command=="hand-calibrate left" || command=="hand-calibrate right")
@@ -426,6 +491,7 @@ void DevControl::Install()
     if (!ioEvent) { CloseHandle(pipe); pipe = INVALID_HANDLE_VALUE; return; }
     Connect();
     FusionFix::onGameProcessEvent() += ProcessLocation;
+    FusionFix::onGameProcessEvent() += ProcessMeleeTest;
     FusionFix::onEndScene() += []() { Pump(); };
     FusionFix::onShutdownEvent() += []()
     {

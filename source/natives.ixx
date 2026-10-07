@@ -96,8 +96,7 @@ public:
         return m_nArgCount;
     }
 
-    template<typename T>
-    inline T GetResult(int idx)
+    inline void CopyVectorResults()
     {
         while (m_nDataCount > 0)
         {
@@ -108,6 +107,12 @@ public:
             pVec3->fY = pVec4->fY;
             pVec3->fZ = pVec4->fZ;
         }
+    }
+
+    template<typename T>
+    inline T GetResult(int idx)
+    {
+        CopyVectorResults();
         auto returnValues = (intptr_t*)m_pReturn;
         return *reinterpret_cast<T*>(&returnValues[idx]);
     }
@@ -222,6 +227,10 @@ public:
             }
         }
 
+        // Native handlers may stage vector outputs in scrNativeCallContext.
+        // Flush them even for void natives (e.g. GET_MODEL_DIMENSIONS), before
+        // destroying the context; NativeContext's scalar getter does not do it.
+        cxt.CopyVectorResults();
         if constexpr (!std::is_void_v<R>)
         {
             return cxt.GetResult<R>();
@@ -3490,9 +3499,17 @@ public:
     static inline auto AttachCarToObject(Car car, Object obj, float a3, float a4, float a5, float a6, float a7, float a8, float a9) { return NativeInvoke::Invoke<130, std::to_underlying(NativeHashes::ATTACH_CAR_TO_OBJECT), void>(car, obj, a3, a4, a5, a6, a7, a8, a9); }
     static inline auto AttachCarToObjectPhysically() { return NativeInvoke::Invoke<131, std::to_underlying(NativeHashes::ATTACH_CAR_TO_OBJECT_PHYSICALLY), Any>(); }
     static inline auto AttachObjectToCar(Object obj, Vehicle v, uint32_t unknown0_0, float pX, float pY, float pZ, float rX, float rY, float rZ) { return NativeInvoke::Invoke<132, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_CAR), void>(obj, v, unknown0_0, pX, pY, pZ, rX, rY, rZ); }
-    static inline auto AttachObjectToCarPhysically(Object obj, Car car, Any a3, Any a4, Any a5, Any a6, Any a7, Any a8, Any a9, Any a10, Any a11, Any a12, Any a13, Any a14, bool flag) { return NativeInvoke::Invoke<133, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_CAR_PHYSICALLY), void>(obj, car, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, flag); }
+    static inline auto AttachObjectToCarPhysically(Object child, Car parent, int32_t parentBone, int32_t childBone, float parentX, float parentY, float parentZ, float childX, float childY, float childZ, float rotationX, float rotationY, float rotationZ, float breakImpulse, bool lockRotation) { return NativeInvoke::Invoke<133, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_CAR_PHYSICALLY), void>(child, parent, parentBone, childBone, parentX, parentY, parentZ, childX, childY, childZ, rotationX, rotationY, rotationZ, breakImpulse, lockRotation); }
     static inline auto AttachObjectToObject(Object obj0, Object obj1_attach_to, int a3, float x0, float y0, float z0, float x1, float y1, float z1) { return NativeInvoke::Invoke<134, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_OBJECT), void>(obj0, obj1_attach_to, a3, x0, y0, z0, x1, y1, z1); }
-    static inline auto AttachObjectToObjectPhysically() { return NativeInvoke::Invoke<135, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_OBJECT_PHYSICALLY), Any>(); }
+    // CE A005D0 -> A02AA0: 15 arguments. Native constraint retains the initial
+    // relative rotation when lockRotation is true. Strength is a break impulse,
+    // not a force motor; tracked hand force is capped separately.
+    static inline auto AttachObjectToObjectPhysically(Object child, Object parent, int32_t parentBone, int32_t childBone,
+        float parentX,float parentY,float parentZ,float childX,float childY,float childZ,
+        float rotationX,float rotationY,float rotationZ,float breakImpulse,bool lockRotation)
+    { return NativeInvoke::Invoke<135, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_OBJECT_PHYSICALLY), void>(
+        child,parent,parentBone,childBone,parentX,parentY,parentZ,childX,childY,childZ,
+        rotationX,rotationY,rotationZ,breakImpulse,lockRotation); }
     static inline auto AttachObjectToPed(Object obj, Ped c, uint32_t bone, float pX, float pY, float pZ, float rX, float rY, float rZ, uint32_t unknown1_0) { return NativeInvoke::Invoke<136, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_PED), void>(obj, c, bone, pX, pY, pZ, rX, rY, rZ, unknown1_0); }
     static inline auto AttachObjectToPedPhysically() { return NativeInvoke::Invoke<137, std::to_underlying(NativeHashes::ATTACH_OBJECT_TO_PED_PHYSICALLY), Any>(); }
     static inline auto AttachParachuteModelToPlayer(Ped ped, Object obj) { return NativeInvoke::Invoke<138, std::to_underlying(NativeHashes::ATTACH_PARACHUTE_MODEL_TO_PLAYER), void>(ped, obj); }

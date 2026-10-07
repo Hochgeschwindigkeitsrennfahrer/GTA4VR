@@ -50,6 +50,7 @@ export namespace OpenXRVR
         bool moveActive=false,moveEnabled=false,sprint=false,jump=false,interact=false;
         float move[2]{},fire=0,steer=0,accelerate=0,brake=0;
         bool fireActive=false,support=false,handbrake=false,exitVehicle=false;
+        bool grab[2]{},grabActive[2]{};
         bool cycle=false,nextWeapon=false,previousWeapon=false;
         float cycleDirection=0;
         bool pause=false,select[2]{},back=false;
@@ -166,7 +167,7 @@ namespace
     XrActionSet gameplayActions=XR_NULL_HANDLE,drivingActions=XR_NULL_HANDLE,menuActions=XR_NULL_HANDLE,systemActions=XR_NULL_HANDLE,phoneActions=XR_NULL_HANDLE;
     enum class Action {Move,MoveEnable,Sprint,Jump,Interact,Fire,Support,Cycle,CycleDirection,Next,Previous,
         Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
-        PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,Count};
+        PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
     OpenXRVR::PanelPointer panelPointer{};
@@ -485,6 +486,8 @@ namespace
             !game(Action::Interact,gameplayActions,"interact","Enter vehicle / interact",boolean,1,"/input/menu/click") ||
             !game(Action::Fire,gameplayActions,"fire","Fire equipped weapon",scalar,1,"/input/trigger/value") ||
             !game(Action::Support,gameplayActions,"support_weapon","Support weapon",boolean,0,"/input/squeeze/click") ||
+            !game(Action::GrabLeft,gameplayActions,"grab_left","Grab with left hand",boolean,0,"/input/squeeze/click") ||
+            !game(Action::GrabRight,gameplayActions,"grab_right","Grab with right hand",boolean,1,"/input/squeeze/click") ||
             !game(Action::Cycle,gameplayActions,"cycle_weapon","Activate weapon selection",boolean,1,"/input/trackpad/click") ||
             !game(Action::CycleDirection,gameplayActions,"weapon_direction","Weapon selection direction",vector,1,"/input/trackpad") ||
             !game(Action::Next,gameplayActions,"next_weapon","Next weapon",boolean,1,nullptr) ||
@@ -564,6 +567,8 @@ namespace
                 bool enableActive=false;sample.moveEnabled=getBool(Action::MoveEnable,&enableActive)||!enableActive;
                 sample.sprint=getBool(Action::Sprint);sample.interact=getBool(Action::Interact);
                 sample.fire=getFloat(Action::Fire,&sample.fireActive);sample.support=getBool(Action::Support);
+                sample.grab[0]=getBool(Action::GrabLeft,&sample.grabActive[0]);
+                sample.grab[1]=getBool(Action::GrabRight,&sample.grabActive[1]);
                 const auto direction=getVector(Action::CycleDirection);sample.cycleDirection=direction[0];
                 sample.cycle=getBool(Action::Cycle);sample.nextWeapon=getBool(Action::Next);sample.previousWeapon=getBool(Action::Previous);
                 // Vive's default shares click between center jump and side weapon selection.
@@ -1276,7 +1281,8 @@ std::string OpenXRVR::InputStatus()
     result+=phone;
     result.pop_back();result+=",\"phonePresses\":[";
     for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(input.phonePresses[i]);}
-    result+="]}";
+    result+="],\"grab\":["+std::string(input.grab[0] ? "true":"false")+","+(input.grab[1] ? "true":"false")+
+        "],\"grabActive\":["+(input.grabActive[0] ? "true":"false")+","+(input.grabActive[1] ? "true":"false")+"]}";
     return result;
 }
 

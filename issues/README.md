@@ -30,8 +30,8 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [014 — First-person headset camera and room-scale movement (closed)](closed/014-first-person-headset-camera.md)
 - [015 — OpenXR controller support with Vive Wands (closed)](closed/015-vive-wand-controller-support.md)
 - [016 — 6DOF hands, firearm aiming and shooting](closed/016-six-dof-hands-and-firearms.md)
-- [017 — 6DOF hand and knife combat](open/017-six-dof-melee-combat.md)
-- [018 — Grab and manipulate physics objects with 6DOF hands](open/018-six-dof-physics-object-grabbing.md)
+- [017 — 6DOF hand and melee-weapon combat (closed)](closed/017-six-dof-melee-combat.md)
+- [018 — Grab and manipulate physics objects with 6DOF hands (closed)](closed/018-six-dof-physics-object-grabbing.md)
 - [019 — VR vehicle interaction and driving](open/019-vr-vehicles.md)
 - [020 — VR minimap, subtitles and gameplay overlays (closed)](closed/020-vr-overlays-and-subtitles.md)
 - [021 — VR weapon wheel (canceled)](closed/021-vr-weapon-wheel.md)
@@ -47,3 +47,6 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [030 — Pause-menu VR settings and player-height calibration](open/030-pause-menu-vr-settings-and-height-calibration.md)
 
 - [031 — Expand VR UI coverage and validate lifecycle](open/031-ui-coverage-and-lifecycle.md)
+
+- [032 — Attribute VR physical interactions to the player](open/032-vr-interaction-player-attribution.md)
+- [033 — Melee feedback and compatibility follow-up](open/033-melee-feedback-and-compatibility.md)

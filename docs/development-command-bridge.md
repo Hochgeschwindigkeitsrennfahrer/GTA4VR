@@ -1,5 +1,22 @@
 # Local game command bridge
 
+`combat-status` reports the opt-in #017 tracked punch/knife gates, native damage
+readiness, per-hand fist/speed/hit observations and last native damage/target.
+Knife fields include fresh blade readiness, speed, threshold, damage and
+sweep/contact/hit counts. Knife diagnostics distinguish missed queries, rearm/
+cooldown suppression, tracking discontinuities, native damage rejection and
+non-living world contacts; these counters do not prove visible reaction acceptance.
+It is read-only and separate from the larger `hand-status` response. See
+[tracked melee](tracked-melee.md) for controls and current limitations.
+
+`melee-test bat`, `melee-test cue` and `melee-test knife` provide fixed development
+test equipment through the native model-loading/give/equip lifecycle on the
+simulation callback. They replace the player's melee inventory slot. Use
+`melee-test-status` to verify completed selection; command acceptance is only
+queueing. Requires living, unpaused on-foot free roam, no mission/cutscene, and
+times out after 30 seconds. No arbitrary weapon/address/script argument or save
+command is accepted. See [tracked melee](tracked-melee.md).
+
 `input-status` includes semantic gameplay/menu action samples and `pointer`
 (`active`, `hit`, normalized `uv`, `down`) alongside hand pose/finger observations.
 See [VR controller actions](vr-controller-actions.md) for bindings and menu input.
