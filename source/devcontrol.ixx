@@ -255,6 +255,8 @@ namespace
         else if(command=="combat-status") response="{\"ok\":true,\"combat\":"+VRHandPhysics::CombatStatus()+"}";
         else if(command=="melee-test-status") response=MeleeTestStatus();
         else if(command=="reload-status") response="{\"ok\":true,\"reload\":"+VRReloadRuntime::Status()+"}";
+        else if(command=="weapon-animation-test") response=VRReloadRuntime::TestFireAnimation() ?
+            "{\"ok\":true,\"accepted\":true}" : "{\"ok\":false,\"error\":\"physical reload module disabled\"}";
         else if(command=="reload-weapon-config") response=VRReloadRuntime::ReloadConfig() ?
             "{\"ok\":true,\"accepted\":true,\"profile\":\"equipped weapon; see reload-status\"}" :
             "{\"ok\":false,\"error\":\"physical reload module disabled\"}";

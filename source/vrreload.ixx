@@ -23,6 +23,7 @@ export namespace VRReloadRuntime
     bool HoldsMagazine();
     bool SlideGrip(void* ped,void* gun,VRMath::Matrix& relative);
     bool ReloadConfig();
+    bool TestFireAnimation();
     std::array<float,4> RecoilSettings(unsigned type);
     std::string Status();
 }
@@ -53,6 +54,9 @@ namespace
     std::atomic<unsigned> configRevision=0;
     std::atomic<bool> configValid=true;
     std::atomic<unsigned> emptyClicks=0,slidePullSounds=0,slideReleaseSounds=0;
+    std::atomic<unsigned> fireAnimations=0,fireAnimationMisses=0;
+    std::atomic<unsigned> fireAnimationError=0;
+    std::atomic<bool> fireAnimationTest=false;
     std::atomic<float> recoilKick=6.f,recoilSupportScale=.15f,recoilRecovery=.18f,recoilMaximum=75.f;
     struct Profile
     {
@@ -185,6 +189,35 @@ namespace
         auto* storage=pool->GetAt(handle);
         return storage && pool->m_nStorageSize==4 ? *reinterpret_cast<void**>(storage):storage;
     }
+    Object WeaponObjectHandle(void* entity)
+    {
+        auto* pool=CObject::GetObjectsPool();
+        if(!entity || !pool || !pool->m_aStorage || !pool->m_aFlags ||
+            pool->GetSize()<=0 || pool->GetSize()>65536 ||
+            pool->m_nStorageSize<4 || pool->m_nStorageSize>16384) return 0;
+        for(int slot=0;slot<pool->GetSize();++slot)
+        {
+            auto* storage=pool->GetSlot(slot);
+            if(!storage) continue;
+            auto* candidate=pool->m_nStorageSize==4 ? *reinterpret_cast<void**>(storage):storage;
+            if(candidate==entity) return pool->GetIndex(storage);
+        }
+        return 0;
+    }
+    void PlayFireAnimation()
+    {
+        const auto object=WeaponObjectHandle(gunEntity);
+        const unsigned type=currentType.load();
+        const char* dictionary=type==15 ? "gun@ak47":(type==9 ? "gun@deagle":"gun@handgun");
+        // Play only the weapon object's authored clip, never a ped fire task.
+        // Missing animation assets must not prevent an otherwise valid shot.
+        if(!object) {fireAnimationError=1;++fireAnimationMisses;return;}
+        if(!Natives::HaveAnimsLoaded(const_cast<char*>(dictionary)))
+        {Natives::RequestAnims(const_cast<char*>(dictionary));fireAnimationError=2;++fireAnimationMisses;return;}
+        if(Natives::PlayObjectAnim(object,const_cast<char*>("weapon_fire"),const_cast<char*>(dictionary),1000.f,false,false))
+            {fireAnimationError=0;++fireAnimations;}
+        else {fireAnimationError=3;++fireAnimationMisses;}
+    }
     void* Equipped(void* ped,void*& entity)
     {
         auto* manager=static_cast<char*>(ped)+0x2B0;
@@ -252,6 +285,9 @@ namespace
         for(unsigned b=0;b<boneCount;++b)
         {
             if(gun && b!=magazineBone && b!=slideBone) continue;
+            // Native weapon_fire owns the animated slide/bolt between shots.
+            // Manual rack takes ownership only during the physical interaction.
+            if(gun && b==slideBone && !racking) continue;
             auto desired=VRMath::Multiply(rest[b],VRMath::AffineXYZ(*root));
             if((mag && b!=magazineBone) || (gun && b==magazineBone && !inserted))
             {
@@ -447,6 +483,7 @@ namespace
         if(!OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) || input.phoneActive ||
             Natives::IsPauseMenuActive() || !input.gripPoseValid[0] || !input.gripPoseValid[1])
         {rightGrip=leftGrip=true;racking=false;slideDistance=0;guide={};return;}
+        if(fireAnimationTest.exchange(false) && !racking) PlayFireAnimation();
         auto* frame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!frame) return;
         const auto gun=VRMath::AffineXYZ(*frame);
@@ -575,6 +612,7 @@ void VRReloadRuntime::Fired(void*,void* weapon)
 {
     if(weapon!=guardedWeapon.load()) return;
     ammo.Fired();previousNativeTotal=ammo.NativeTotal();chamberReady=ammo.Ready();
+    PlayFireAnimation();
 }
 bool VRReloadRuntime::UsesLeftHand() {return leftBusy;}
 bool VRReloadRuntime::HoldsMagazine() {return guardedWeapon && reportedHeld.load()>0;}
@@ -587,6 +625,7 @@ bool VRReloadRuntime::SlideGrip(void* ped,void* gun,VRMath::Matrix& relative)
     return true;
 }
 bool VRReloadRuntime::ReloadConfig() {if(!enabled) return false;configPending=true;return true;}
+bool VRReloadRuntime::TestFireAnimation() {if(!enabled) return false;fireAnimationTest=true;return true;}
 std::array<float,4> VRReloadRuntime::RecoilSettings(unsigned type)
 {
     if(type!=9 && type!=15) return {};
@@ -603,6 +642,8 @@ std::string VRReloadRuntime::Status()
         ",\"emptyClicks\":"+std::to_string(emptyClicks.load())+
         ",\"slidePullSounds\":"+std::to_string(slidePullSounds.load())+",\"slideReleaseSounds\":"+std::to_string(slideReleaseSounds.load())+
         ",\"weaponType\":"+std::to_string(currentType.load())+
+        ",\"fireAnimations\":"+std::to_string(fireAnimations.load())+",\"fireAnimationMisses\":"+std::to_string(fireAnimationMisses.load())+
+        ",\"fireAnimationError\":"+std::to_string(fireAnimationError.load())+
         ",\"configFile\":\""+ProfileFile(currentType.load())+"\",\"clip\":"+std::to_string(reportedClip.load())+",\"reserve\":"+std::to_string(reportedReserve.load())+
         ",\"heldRounds\":"+std::to_string(reportedHeld.load())+",\"discarded\":"+std::to_string(reportedDiscarded.load())+
         ",\"poseUpdates\":"+std::to_string(poseUpdates.load())+",\"magazineUpdates\":"+std::to_string(magazineUpdates.load())+
