@@ -1,9 +1,24 @@
 #include "../../source/includes/vrreload.hpp"
+#include "../../source/includes/vrrecoil.hpp"
 #include <cstdio>
 #include <cstdlib>
 static void Check(bool condition) {if(!condition) std::abort();}
 int main()
 {
+    VRRecoil::Kick kick; kick.Shot(1000,6,.18f,18);
+    Check(std::abs(kick.degrees-6)<.00001f);
+    const auto kickPose=VRRecoil::Pose(VRMath::Identity(),VRMath::Identity(),kick.degrees);
+    Check(kickPose[0][2]>.1f && kickPose[3][2]>.03f); // muzzle and entire wrist rise
+    Check(kickPose[3][0]<0 && std::abs(kickPose[3][1])<.00001f);
+    auto frequent=kick;frequent.Sample(1050,.18f);frequent.Sample(1100,.18f);
+    Check(std::abs(frequent.degrees-kick.Sample(1100,.18f))<.00001f);
+    VRRecoil::Kick supported;supported.Shot(1000,6*.15f,.18f,18);
+    Check(std::abs(supported.degrees-.9f)<.00001f);
+    for(unsigned i=0;i<20;++i) kick.Shot(1100,6,.18f,18);
+    Check(kick.degrees==18 && kick.Sample(3100,.18f)<.001f);
+    for(unsigned i=0;i<20;++i) kick.Shot(3100,6,.18f,75);
+    Check(kick.degrees==75 && std::isfinite(kick.Sample(3200,.18f)));
+    Check(VRRecoil::Pose(VRMath::Identity(),VRMath::Identity(),0)==VRMath::Identity());
     auto hand=VRMath::Identity();hand[3]={-.04f,.10f,.15f,1};
     const VRMath::Vector rear{-.07953f,-.00101f,.04869f,1};
     const auto rack=VRReload::SlideHandPose(hand,rear);
@@ -52,5 +67,25 @@ int main()
             Check(gun.Owned()+gun.discarded+fired==29 && gun.Clip()<=17);
         }
     }
-    std::puts("pistol reload accounting passed");
+    // Independent rifle/pistol ownership survives a switch with the magazine
+    // absent. A held reserve magazine is returned only to its own weapon.
+    VRReload::Pistol rifle;rifle.Begin(30,90,30);
+    Check(rifle.Eject()==29 && rifle.Clip()==1 && !rifle.inserted);
+    Check(rifle.TakeMagazine() && rifle.held==29 && rifle.reserve==31);
+    rifle.ReturnHeld();const auto savedRifle=rifle;
+    gun.Begin(17,51,17);Check(gun.Fired() && gun.Clip()==16);
+    rifle=savedRifle;Check(!rifle.inserted && rifle.Clip()==1 && rifle.reserve==60);
+    // Vanilla may report a newly refilled30-round clip on reselect. Resume
+    // uses total61, restoring the saved single chambered round and no mag.
+    Check(rifle.Resume(61,30) && !rifle.inserted && rifle.Clip()==1 && rifle.reserve==60);
+    Check(rifle.Resume(71,30) && rifle.Clip()==1 && rifle.reserve==70); // pickup
+    Check(rifle.Resume(61,30) && rifle.reserve==60); // reserve removal
+    Check(!rifle.Resume(0,30) && !rifle.Resume(61,17));
+    Check(rifle.Fired() && !rifle.Ready());
+    Check(rifle.TakeMagazine() && rifle.held==30 && rifle.Insert() && !rifle.Ready());
+    rifle.Rack();Check(rifle.Ready() && rifle.Clip()==30 && rifle.reserve==30);
+    Check(rifle.Fired() && rifle.Fired() && rifle.Clip()==28);
+    Check(rifle.Resume(58,30) && rifle.Clip()==28 && rifle.reserve==30);
+    rifle.Begin(0,60,30);Check(rifle.Resume(60,30) && !rifle.Ready() && rifle.Clip()==0);
+    std::puts("pistol/rifle reload accounting passed");
 }

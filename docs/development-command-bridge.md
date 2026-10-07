@@ -1,5 +1,15 @@
 # Local game command bridge
 
+M4 development: `rifle-test m4` queues a bounded native type15 equipment request
+in living, unpaused on-foot free roam. It preserves owned ammunition, or grants
+60 rounds when first adding the rifle. `melee-test-status` reports its completion.
+It does not write a save. `reload-status` now reports `weaponType` and the selected
+`configFile`; `reload-weapon-config` reloads the equipped pistol/M4 profile.
+See [M4 notes](physical-m4-reloading.md) for its initial reload controls and limits.
+`pistol-status` also exposes M4 `recoilShots` and `recoilDegrees`. These count
+successful local shots and the current arm/weapon pitch offset; headset motion
+still needs a visual check. Recoil settings use the equipped `m4.ini` profile.
+
 `reload-status` reports #024's opt-in standard-pistol chamber/magazine/reserve,
 discarded rounds and gesture/pose counters. `pistol-status` reports the last native
 NPC bullet hit's shape/part, base/applied damage and immediate health snapshots;

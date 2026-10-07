@@ -23,6 +23,7 @@ export namespace VRReloadRuntime
     bool HoldsMagazine();
     bool SlideGrip(void* ped,void* gun,VRMath::Matrix& relative);
     bool ReloadConfig();
+    std::array<float,4> RecoilSettings(unsigned type);
     std::string Status();
 }
 namespace
@@ -37,6 +38,9 @@ namespace
     struct Sample {void* owner=nullptr;VRMath::Matrix transform{},wrist[2]{};uint64_t at=0;} sample;
     struct SlideHand {void* owner=nullptr;void* gun=nullptr;VRMath::Matrix local{},gripInverse{};uint64_t at=0;} slideHand;
     void* owner=nullptr;void* currentWeapon=nullptr;void* gunEntity=nullptr;
+    std::atomic<unsigned> currentType=7;
+    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[2];
+    const char* ProfileFile(unsigned type) {return type==15 ? "VRWeapons/m4.ini":"VRWeapons/pistol.ini";}
     std::atomic<void*> guardedWeapon=nullptr,visualGun=nullptr,visualMagazine=nullptr;
     std::atomic<bool> chamberReady=true,inserted=true,leftBusy=false;
     std::atomic<float> slideDistance=0;
@@ -48,13 +52,29 @@ namespace
     std::atomic<unsigned> configRevision=0;
     std::atomic<bool> configValid=true;
     std::atomic<unsigned> emptyClicks=0,slidePullSounds=0,slideReleaseSounds=0;
+    std::atomic<float> recoilKick=6.f,recoilSupportScale=.15f,recoilRecovery=.18f,recoilMaximum=75.f;
     struct Profile
     {
         float handRotation[3]{100,180,180},handOffset[3]{.075f,.05f,.04f};
         VRMath::Vector axis{.258819f,0,.965926f,0};
         VRMath::Vector tip{-.05f,-.002341f,.024f,1};
         float travel=.085f,snap=.045f,alignment=.5f;
+        float rackTravel=.045f,rackThreshold=.035f,rackRadius=.15f;
+        VRMath::Vector rackGripOffset{0,0,0,0};
+        float recoilKick=0,recoilSupportScale=.15f,recoilRecovery=.18f,recoilMaximum=75.f;
     } profile;
+    Profile Defaults(unsigned type)
+    {
+        Profile value;
+        if(type==15)
+        {
+            value.axis={0,0,1,0};value.tip={-.0421465f,-.023525f,.0169907f,1};
+            value.travel=.05f;value.rackTravel=.065f;value.rackThreshold=.05f;value.rackRadius=.10f;
+            value.rackGripOffset={-.06f,0,0,0};
+            value.recoilKick=6.f;
+        }
+        return value;
+    }
     bool refreshHeldPose=false;
     VRReload::Pistol ammo{};
     bool initialized=false,rightGrip=false,leftGrip=false,pulled=false;
@@ -86,7 +106,7 @@ namespace
 
     void LoadProfile()
     {
-        CIniReader ini("VRWeapons/pistol.ini");Profile next;
+        CIniReader ini(ProfileFile(currentType.load()));Profile next=Defaults(currentType.load());
         std::error_code error;
         if(!std::filesystem::is_regular_file(ini.GetIniPath(),error)) {configValid=false;return;}
         bool valid=true;
@@ -119,8 +139,22 @@ namespace
         next.travel=read("InsertionTravel",next.travel,.02f,.25f);
         next.snap=read("SnapRadius",next.snap,.005f,.15f);
         next.alignment=read("AlignmentCosine",next.alignment,0,1);
+        next.rackTravel=read("RackTravel",next.rackTravel,.01f,.15f);
+        next.rackThreshold=read("RackThreshold",next.rackThreshold,.005f,.15f);
+        next.rackRadius=read("RackGrabRadius",next.rackRadius,.02f,.20f);
+        const char* rackOffsets[]{"RackGripOffsetX","RackGripOffsetY","RackGripOffsetZ"};
+        for(unsigned a=0;a<3;++a)
+            next.rackGripOffset[a]=read(rackOffsets[a],next.rackGripOffset[a],-.25f,.25f);
+        if(next.rackThreshold>next.rackTravel) valid=false;
+        next.recoilKick=read("RecoilKickDegrees",next.recoilKick,0,20);
+        next.recoilSupportScale=read("RecoilSupportScale",next.recoilSupportScale,0,1);
+        next.recoilRecovery=read("RecoilRecoverySeconds",next.recoilRecovery,.03f,1.f);
+        next.recoilMaximum=read("RecoilMaxDegrees",next.recoilMaximum,0,90);
         configValid=valid;
-        if(valid) {profile=next;guide={};insertionProgress=0;refreshHeldPose=true;++configRevision;}
+        if(valid) {profile=next;guide={};insertionProgress=0;refreshHeldPose=true;
+            recoilKick=next.recoilKick;recoilSupportScale=next.recoilSupportScale;
+            recoilRecovery=next.recoilRecovery;recoilMaximum=next.recoilMaximum;
+            racking=false;slideDistance=0;++configRevision;}
     }
     VRMath::Matrix HeldMagazine(const VRMath::Matrix& gun,const Sample& view)
     {
@@ -156,7 +190,9 @@ namespace
         entity=*reinterpret_cast<void**>(manager+0x14);
         if(!entity || slot<0 || slot>10) return nullptr;
         auto* weapon=*reinterpret_cast<void**>(static_cast<char*>(entity)+0x25C);
-        return weapon && *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)==7 ? weapon:nullptr;
+        if(!weapon) return nullptr;
+        const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
+        return (type==7 || type==15) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
     }
     bool ResolveRig(void* entity)
     {
@@ -187,8 +223,8 @@ namespace
             else rest[b]=VRMath::AffineXYZ(locals[b]);
             resolved[b]=true;
             auto* name=*reinterpret_cast<const char**>(bones+b*0xE0);
-            if(name && !std::strcmp(name,"Mag")) magazineBone=b;
-            if(name && !std::strcmp(name,"Gun_Cock1")) slideBone=b;
+            if(name && !std::strcmp(name,currentType==15 ? "M4_Mag":"Mag")) magazineBone=b;
+            if(name && !std::strcmp(name,currentType==15 ? "M4_Gun_Cock1":"Gun_Cock1")) slideBone=b;
             if(name && !std::strcmp(name,"gun_grip")) primaryGripBone=b;
         }
         for(unsigned b=0;b<boneCount;++b) if(!resolved[b]) return false;
@@ -311,7 +347,7 @@ namespace
     }
     bool MakeMagazine(const VRMath::Matrix& root)
     {
-        DeleteMagazine();uint32_t model=0;Natives::GetWeapontypeModel(7,&model);
+        DeleteMagazine();uint32_t model=0;Natives::GetWeapontypeModel(currentType.load(),&model);
         if(!model || !Natives::HasModelLoaded(model)) return false;
         Natives::CreateObjectNoOffset(model,root[3][0],root[3][1],root[3][2],&magazineObject,true);
         magazineEntity=ObjectEntity(magazineObject);
@@ -327,8 +363,8 @@ namespace
     }
     void WriteAmmo(Ped ped)
     {
-        Natives::SetCharAmmo(ped,7,ammo.NativeTotal());
-        Natives::SetAmmoInClip(ped,7,ammo.Clip());
+        Natives::SetCharAmmo(ped,currentType.load(),ammo.NativeTotal());
+        Natives::SetAmmoInClip(ped,currentType.load(),ammo.Clip());
         previousNativeTotal=ammo.NativeTotal();
         chamberReady=ammo.Ready();inserted=ammo.inserted;
         reportedClip=ammo.Clip();reportedReserve=ammo.reserve;reportedHeld=ammo.held;reportedDiscarded=ammo.discarded;
@@ -346,6 +382,7 @@ namespace
             // Overlay focus loss is not session loss. Only a stopped session
             // hands ammunition and reloading back to the ordinary game.
             Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+            currentWeapon=nullptr; // Inventory may have changed during session loss.
             if(ped && Natives::DoesCharExist(ped) && !Natives::IsCharDead(ped))
             {ammo.ReturnHeld();WriteAmmo(ped);}
             guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;
@@ -355,23 +392,48 @@ namespace
         if(!enabled || !OpenXRVR::IsSessionRunning() || !view.owner || GetTickCount64()-view.at>250) return;
         Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
         if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharDead(ped))
-        {guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;leftBusy=false;initialized=false;DeleteMagazine();return;}
+        {guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;leftBusy=false;initialized=false;
+            savedAmmo[0]={};savedAmmo[1]={};DeleteMagazine();return;}
         if(owner!=view.owner)
-        {DeleteMagazine();initialized=false;owner=view.owner;guardedWeapon=nullptr;}
+        {DeleteMagazine();initialized=false;owner=view.owner;guardedWeapon=nullptr;savedAmmo[0]={};savedAmmo[1]={};}
         void* entity=nullptr;void* weapon=Equipped(view.owner,entity);
+        const unsigned type=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
+        if(initialized && (!weapon || type!=currentType))
+        {
+            // Return only the held reserve magazine to its original weapon.
+            // Preserve absent magazines/chambers across inventory switches.
+            // Do not dereference the previous CWeapon: selection can destroy it.
+            guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;
+            ammo.ReturnHeld();
+            if(Natives::HasCharGotWeapon(ped,currentType.load()))
+            {
+                Natives::SetCharAmmo(ped,currentType.load(),ammo.NativeTotal());
+                Natives::SetAmmoInClip(ped,currentType.load(),ammo.Clip());
+                savedAmmo[currentType==15 ? 1:0]={ammo,true};
+            }
+            initialized=false;racking=false;slideDistance=0;leftBusy=false;DeleteMagazine();
+        }
+        if(weapon && type!=currentType)
+        {currentType=type;definition=nullptr;profile=Defaults(type);LoadProfile();}
         if(!weapon || !ResolveRig(entity))
         {
             guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;racking=false;leftBusy=false;guide={};
-            if(ammo.holding) {ammo.ReturnHeld();Natives::SetCharAmmo(ped,7,ammo.NativeTotal());previousNativeTotal=ammo.NativeTotal();DeleteMagazine();}
             return;
         }
         currentWeapon=weapon;gunEntity=entity;
-        unsigned total=0,clip=0,capacity=0;Natives::GetAmmoInCharWeapon(ped,7,&total);
+        unsigned total=0,clip=0,capacity=0;Natives::GetAmmoInCharWeapon(ped,type,&total);
         if(!initialized)
         {
-            Natives::GetAmmoInClip(ped,7,&clip);Natives::GetMaxAmmoInClip(ped,7,&capacity);
+            Natives::GetAmmoInClip(ped,type,&clip);Natives::GetMaxAmmoInClip(ped,type,&capacity);
             if(capacity<2 || capacity>64 || total>100000) return;
-            ammo.Begin(clip,total,capacity);initialized=true;previousNativeTotal=total;
+            auto& saved=savedAmmo[type==15 ? 1:0];
+            if(saved.valid)
+            {
+                ammo=saved.ammo;
+                if(!ammo.Resume(total,capacity)) ammo.Begin(clip,total,capacity);
+            }
+            else ammo.Begin(clip,total,capacity);
+            initialized=true;previousNativeTotal=total;rightGrip=leftGrip=true;
         }
         else if(total>previousNativeTotal) ammo.reserve+=total-previousNativeTotal;
         else if(total<previousNativeTotal) ammo.reserve-=std::min(ammo.reserve,previousNativeTotal-total);
@@ -445,18 +507,26 @@ namespace
         }
         if(!ammo.holding && !racking && left && !leftGrip)
         {
-            const auto slide=VRMath::Transform(rest[slideBone][3],gun);
-            if(VRMath::Length3(VRMath::Difference3(view.wrist[0][3],slide))<.15f)
+            auto gripPoint=rest[slideBone][3];
+            if(type==15) for(unsigned a=0;a<3;++a) gripPoint[a]+=profile.rackGripOffset[a];
+            const auto slide=VRMath::Transform(gripPoint,gun);
+            if(VRMath::Length3(VRMath::Difference3(view.wrist[0][3],slide))<profile.rackRadius)
             {
                 racking=true;pulled=false;rackStart=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
                 rackHandLocal=VRReload::SlideHandPose(VRMath::Multiply(view.wrist[0],VRMath::InverseRigid(gun)),rest[slideBone][3]);
+                if(type==15)
+                {
+                    // M4 charging handle, rather than a palm over a pistol slide.
+                    for(unsigned a=0;a<3;++a)
+                        rackHandLocal[3][a]=gripPoint[a]-rackHandLocal[0][a]*.04f;
+                }
             }
         }
         if(racking)
         {
             const auto local=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
-            slideDistance=std::clamp(rackStart[0]-local[0],0.f,.045f);
-            if(slideDistance>=.035f && !pulled)
+            slideDistance=std::clamp(rackStart[0]-local[0],0.f,profile.rackTravel);
+            if(slideDistance>=profile.rackThreshold && !pulled)
             {pulled=true;PlayPistolSound("HANDGUN_RELOAD_COCK_PULL");++slidePullSounds;}
             if(!left)
             {
@@ -512,6 +582,12 @@ bool VRReloadRuntime::SlideGrip(void* ped,void* gun,VRMath::Matrix& relative)
     return true;
 }
 bool VRReloadRuntime::ReloadConfig() {if(!enabled) return false;configPending=true;return true;}
+std::array<float,4> VRReloadRuntime::RecoilSettings(unsigned type)
+{
+    if(type!=15) return {};
+    if(type!=currentType || !enabled) return {6.f,.15f,.18f,75.f};
+    return {recoilKick.load(),recoilSupportScale.load(),recoilRecovery.load(),recoilMaximum.load()};
+}
 std::string VRReloadRuntime::Status()
 {
     return "{\"enabled\":"+std::string(enabled ? "true":"false")+",\"active\":"+(guardedWeapon ? "true":"false")+
@@ -521,7 +597,8 @@ std::string VRReloadRuntime::Status()
         ",\"configPending\":"+(configPending ? "true":"false")+
         ",\"emptyClicks\":"+std::to_string(emptyClicks.load())+
         ",\"slidePullSounds\":"+std::to_string(slidePullSounds.load())+",\"slideReleaseSounds\":"+std::to_string(slideReleaseSounds.load())+
-        ",\"configFile\":\"VRWeapons/pistol.ini\",\"clip\":"+std::to_string(reportedClip.load())+",\"reserve\":"+std::to_string(reportedReserve.load())+
+        ",\"weaponType\":"+std::to_string(currentType.load())+
+        ",\"configFile\":\""+ProfileFile(currentType.load())+"\",\"clip\":"+std::to_string(reportedClip.load())+",\"reserve\":"+std::to_string(reportedReserve.load())+
         ",\"heldRounds\":"+std::to_string(reportedHeld.load())+",\"discarded\":"+std::to_string(reportedDiscarded.load())+
         ",\"poseUpdates\":"+std::to_string(poseUpdates.load())+",\"magazineUpdates\":"+std::to_string(magazineUpdates.load())+
         ",\"blockedReloads\":"+std::to_string(blockedReloads.load())+",\"blockedTaskReloads\":"+std::to_string(blockedTaskReloads.load())+

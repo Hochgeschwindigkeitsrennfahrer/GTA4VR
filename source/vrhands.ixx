@@ -3,6 +3,7 @@ module;
 #include "includes/vrmath.hpp"
 #include "includes/vrgrip.hpp"
 #include "includes/vrmelee.hpp"
+#include "includes/vrrecoil.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -57,6 +58,12 @@ namespace
     void* supportWeapon=nullptr;
     void* supportModel=nullptr;
     VRMath::Matrix supportRelative{};
+    VRMath::Matrix primaryGripInverse=VRMath::Identity();
+    SRWLOCK recoilLock=SRWLOCK_INIT;
+    VRRecoil::Kick recoil{};
+    void* recoilOwner=nullptr;void* recoilWeapon=nullptr;
+    std::atomic<float> recoilDegrees=0;
+    std::atomic<unsigned> recoilShots=0;
     float configuredHeight=1.75f,bodyBottom=0,bodyScale=1,bodyNativeHeight=0;
     float bodyHeadAllowance=.25f;
     float bodyHeightScale=1.f;
@@ -456,12 +463,28 @@ namespace
         return weapon;
     }
 
+    bool SupportedFirearm(unsigned type) {return type==7 || type==15;}
+
     char __fastcall FireWeapon(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
         const VRMath::Vector* origin,const VRMath::Vector* target,uint32_t force,uint32_t a,uint32_t b,uint32_t c,float damage)
     {
         if(!VRReloadRuntime::CanFire(shooter,weapon)) return 0;
         const auto fired=weaponFireHook.unsafe_fastcall<char>(weapon,edx,shooter,frame,origin,target,force,a,b,c,damage);
-        if(fired) VRReloadRuntime::Fired(shooter,weapon);
+        if(fired)
+        {
+            VRReloadRuntime::Fired(shooter,weapon);
+            if(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==15 && VRHands::Active(shooter) &&
+                OpenXRVR::HasFocusedViews())
+            {
+                const auto settings=VRReloadRuntime::RecoilSettings(15);
+                AcquireSRWLockExclusive(&recoilLock);
+                if(recoilOwner!=shooter || recoilWeapon!=weapon) recoil={};
+                recoilOwner=shooter;recoilWeapon=weapon;
+                recoil.Shot(GetTickCount64(),settings[0]*(supportGripping ? settings[1]:1.f),settings[2],settings[3]);
+                recoilDegrees=recoil.degrees;++recoilShots;
+                ReleaseSRWLockExclusive(&recoilLock);
+            }
+        }
         return fired;
     }
 
@@ -469,7 +492,7 @@ namespace
     {
         void* local=nullptr;AcquireSRWLockShared(&targetLock);local=targetOwner;ReleaseSRWLockShared(&targetLock);
         const bool observed=shooter && shooter==local &&
-            *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==7;
+            SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18));
         void* victim=nullptr;
         if(observed && hit)
         {
@@ -499,7 +522,7 @@ namespace
         // Carry VR aiming eligibility through the ordinary native branch;
         // do not write the player's aiming flags or multiply base damage.
         auto* event=reinterpret_cast<unsigned char*>(regs.edi);
-        if(!event || *reinterpret_cast<unsigned*>(event+0xC)!=7 || !OpenXRVR::HasFocusedViews()) return;
+        if(!event || !SupportedFirearm(*reinterpret_cast<unsigned*>(event+0xC)) || !OpenXRVR::HasFocusedViews()) return;
         auto* shooter=*reinterpret_cast<void**>(event);
         if(!VRHands::Active(shooter)) return;
         ++aimedHeadshotChecks;
@@ -519,7 +542,7 @@ namespace
         if(shooter && shooter==owner && at && GetTickCount64()-at<=100 &&
             OpenXRVR::HasFocusedViews() && OpenXRVR::GetControllerInput(input) && input.gripPoseValid[1] &&
             EquippedWeapon(shooter,entity)==weapon &&
-            *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)==7 && origin && target && muzzleLookup && weaponRange)
+            SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)) && origin && target && muzzleLookup && weaponRange)
         {
             auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
             if(gun)
@@ -550,21 +573,27 @@ namespace
 
     void ProcessPistolTrigger()
     {
-        // Semiautomatic: one request per squeeze, rearm on release. No pad
+        // Pistol: one request per squeeze. M4: hold; native Fire limits cadence. No pad
         // injection or aiming task; native Fire owns readiness/ammo/cadence.
         OpenXRVR::ControllerInput input{};
         if(!weaponFire || !OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) ||
             !input.gripPoseValid[1] || !input.fireActive) {triggerLatched=false; return;}
         if(input.fire<.3f) {triggerLatched=false; return;}
-        if(input.fire<.7f || triggerLatched) return;
-        triggerLatched=true;
+        if(input.fire<.7f) return;
         void* owner=nullptr; uint64_t at=0;
         AcquireSRWLockShared(&targetLock); owner=targetOwner; at=targetAt; ReleaseSRWLockShared(&targetLock);
         if(!owner || !at || GetTickCount64()-at>100) return;
         void* entity=nullptr;
         void* weapon=EquippedWeapon(owner,entity);
-        if(!weapon || *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)!=7) return;
-        if(!VRReloadRuntime::CanFire(owner,weapon)) {VRReloadRuntime::EmptyTrigger(owner,weapon);return;}
+        if(!weapon || !SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18))) return;
+        const bool first=!triggerLatched;
+        const bool automatic=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==15;
+        if(!first && !automatic) return;
+        triggerLatched=true;
+        if(input.phoneActive || Natives::IsPauseMenuActive()) return;
+        Ped player=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&player);
+        if(!player || Natives::IsCharDead(player) || Natives::IsCharInAnyCar(player)) return;
+        if(!VRReloadRuntime::CanFire(owner,weapon)) {if(first) VRReloadRuntime::EmptyTrigger(owner,weapon);return;}
         auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!gun) return;
         alignas(16) VRMath::Vector muzzle{0,0,0,1},end{0,0,0,1};
@@ -605,7 +634,7 @@ namespace
         if(!player || !Natives::DoesCharExist(player) || Natives::IsCharDead(player) ||
             Natives::IsCharInAnyCar(player)) {reset();return;}
         void* entity=nullptr;void* weapon=EquippedWeapon(owner,entity);
-        if(!weapon || *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)!=7) {reset();return;}
+        if(!weapon || !SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18))) {reset();return;}
         auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!gun) {reset();return;}
         alignas(16) VRMath::Vector muzzle{0,0,0,1},end{0,0,0,1};
@@ -811,8 +840,8 @@ namespace
             if(std::strcmp(name,"gun_grip2")==0) secondary=bone;
         }
         if(primary<0 || secondary<0) return false;
-        supportRelative=VRMath::Multiply(VRMath::AffineXYZ(locals[secondary]),
-            VRMath::InverseRigid(VRMath::AffineXYZ(locals[primary])));
+        primaryGripInverse=VRMath::InverseRigid(VRMath::AffineXYZ(locals[primary]));
+        supportRelative=VRMath::Multiply(VRMath::AffineXYZ(locals[secondary]),primaryGripInverse);
         for(const auto& row:supportRelative) for(float value:row)
             if(!std::isfinite(value)) return false;
         supportReady=true;
@@ -942,7 +971,7 @@ namespace
         if(supportOwner!=owner || supportWeapon!=held) supportGripping=false;
         supportOwner=owner; supportWeapon=held;
         if(supportGripEnabled && holdingWeapon && input.gripPoseValid[0] && input.gripPoseValid[1] &&
-            *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)==7)
+            SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)))
         {
             const auto weaponModelIndex=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
             if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex]))
@@ -963,6 +992,24 @@ namespace
             }
         }
         supportGripping=supporting;
+        float kick=0;
+        const bool rifle=weapon && *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==15;
+        const auto recoilSettings=VRReloadRuntime::RecoilSettings(15);
+        AcquireSRWLockExclusive(&recoilLock);
+        if(!rifle || recoilOwner!=owner || recoilWeapon!=weapon) {recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;}
+        else kick=recoil.Sample(GetTickCount64(),recoilSettings[2]);
+        recoilDegrees=kick;
+        ReleaseSRWLockExclusive(&recoilLock);
+        if(kick>.001f && input.gripPoseValid[1])
+        {
+            const auto weaponModelIndex=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
+            if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex]))
+            {
+                const auto gun=VRMath::Multiply(primaryGripInverse,targets[1]);
+                targets[1]=VRRecoil::Pose(targets[1],gun,kick);
+                if(supporting) targets[0]=VRMath::Multiply(supportRelative,targets[1]);
+            }
+        }
         physicsRig.supporting[0]=supporting;
         for(unsigned hand=0;hand<2;++hand)
         {
@@ -1142,6 +1189,12 @@ void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* own
     targetAt=active ? GetTickCount64() : 0;
     if(!active) supportGripping=false;
     ReleaseSRWLockExclusive(&targetLock);
+    if(!active)
+    {
+        AcquireSRWLockExclusive(&recoilLock);
+        recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;recoilDegrees=0;
+        ReleaseSRWLockExclusive(&recoilLock);
+    }
 }
 
 bool VRHands::GetWrist(unsigned hand,VRMath::Matrix& world)
@@ -1400,6 +1453,7 @@ std::string VRHands::PistolStatus()
         ",\"aimQueries\":"+std::to_string(aimQueries.load())+",\"aimEvents\":"+std::to_string(aimEvents.load())+
         ",\"aimVehicleEvents\":"+std::to_string(aimVehicleEvents.load())+
         ",\"magazineGrip\":"+(VRReloadRuntime::HoldsMagazine() ? "true":"false")+
+        ",\"recoilShots\":"+std::to_string(recoilShots.load())+",\"recoilDegrees\":"+std::to_string(recoilDegrees.load())+
         ",\"hits\":"+std::to_string(bulletHits.load())+",\"part\":"+std::to_string(bulletPart.load())+
         ",\"shape\":"+std::to_string(bulletShape.load())+",\"baseDamage\":"+std::to_string(bulletDamage.load())+
         ",\"appliedDamage\":"+std::to_string(bulletApplied.load())+",\"healthBefore\":"+std::to_string(bulletHealthBefore.load())+

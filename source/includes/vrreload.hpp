@@ -52,6 +52,13 @@ namespace VRReload
         unsigned Clip() const {return magazine+(chamber ? 1u:0u);}
         unsigned NativeTotal() const {return Clip()+reserve;}
         unsigned Owned() const {return NativeTotal()+held;}
+        bool Resume(unsigned total,unsigned clipCapacity)
+        {
+            // Selection can recreate/refill the native clip without spending
+            // total ammo. Our saved chamber/magazine remain authoritative.
+            if(capacity!=clipCapacity || total<Clip() || holding) return false;
+            reserve=total-Clip();return true;
+        }
         bool Ready() const {return chamber;}
         unsigned Eject()
         {
