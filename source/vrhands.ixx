@@ -463,7 +463,7 @@ namespace
         return weapon;
     }
 
-    bool SupportedFirearm(unsigned type) {return type==7 || type==9 || type==15;}
+    bool SupportedFirearm(unsigned type) {return type==7 || type==9 || type==13 || type==15;}
 
     char __fastcall FireWeapon(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
         const VRMath::Vector* origin,const VRMath::Vector* target,uint32_t force,uint32_t a,uint32_t b,uint32_t c,float damage)
@@ -474,7 +474,7 @@ namespace
         {
             VRReloadRuntime::Fired(shooter,weapon);
             const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-            if((type==9 || type==15) && VRHands::Active(shooter) &&
+            if((type==9 || type==13 || type==15) && VRHands::Active(shooter) &&
                 OpenXRVR::HasFocusedViews())
             {
                 const auto settings=VRReloadRuntime::RecoilSettings(type);
@@ -588,7 +588,8 @@ namespace
         void* weapon=EquippedWeapon(owner,entity);
         if(!weapon || !SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18))) return;
         const bool first=!triggerLatched;
-        const bool automatic=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==15;
+        const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
+        const bool automatic=type==13 || type==15;
         if(!first && !automatic) return;
         triggerLatched=true;
         if(input.phoneActive || Natives::IsPauseMenuActive()) return;
@@ -995,7 +996,7 @@ namespace
         supportGripping=supporting;
         float kick=0;
         const unsigned recoilType=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
-        const bool recoilWeaponSupported=recoilType==9 || recoilType==15;
+        const bool recoilWeaponSupported=recoilType==9 || recoilType==13 || recoilType==15;
         const auto recoilSettings=VRReloadRuntime::RecoilSettings(recoilType);
         AcquireSRWLockExclusive(&recoilLock);
         if(!recoilWeaponSupported || recoilOwner!=owner || recoilWeapon!=weapon) {recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;}
