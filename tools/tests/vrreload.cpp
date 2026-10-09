@@ -133,5 +133,17 @@ int main()
     shotgun.Begin(10,24,10);shotgun.tube=true;Check(!shotgun.TakeMagazine());
     Check(shotgun.Fired() && shotgun.TakeMagazine() && shotgun.Insert() && shotgun.Clip()==10);
     Check(shotgun.Resume(23,10) && shotgun.tube && shotgun.Clip()==10);
-    std::puts("pistol/rifle/rocket/shotgun reload accounting passed");
+    VRReload::Pistol pump;pump.Begin(8,24,8);pump.tube=pump.pump=true;
+    for(unsigned remaining=8;remaining>0;--remaining)
+    {
+        Check(pump.Ready() && pump.Clip()==remaining);
+        Check(pump.Fired() && !pump.Ready() && pump.Clip()==remaining-1);
+        Check(!pump.Fired()); // No automatic chamber feed between pump cycles.
+        Check(pump.Resume(24-(9-remaining),8) && !pump.Ready() && pump.pump);
+        pump.Rack();Check(pump.Clip()==remaining-1 && pump.Ready()==(remaining>1));
+    }
+    Check(pump.Owned()==16 && pump.discarded==0);
+    Check(pump.TakeMagazine() && pump.Insert() && !pump.Ready());
+    pump.Rack();Check(pump.Ready() && pump.Clip()==1 && pump.Owned()==16);
+    std::puts("pistol/rifle/rocket/shotgun/pump reload accounting passed");
 }

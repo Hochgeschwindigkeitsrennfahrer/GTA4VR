@@ -55,7 +55,7 @@ namespace VRReload
     struct Pistol
     {
         unsigned capacity=0,magazine=0,reserve=0,held=0,discarded=0;
-        bool inserted=true,chamber=false,holding=false,tube=false;
+        bool inserted=true,chamber=false,holding=false,tube=false,pump=false;
         void Begin(unsigned clip,unsigned total,unsigned clipCapacity)
         {
             *this={};capacity=clipCapacity;
@@ -114,6 +114,7 @@ namespace VRReload
         {
             if(!Ready()) return false;
             if(capacity==1) {chamber=false;inserted=false;return true;}
+            if(pump) {chamber=false;return true;}
             chamber=inserted && magazine>0;
             if(chamber) --magazine;
             return true;

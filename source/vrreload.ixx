@@ -20,6 +20,7 @@ export namespace VRReloadRuntime
     void EmptyTrigger(void* owner,void* weapon);
     void Fired(void* owner,void* weapon);
     bool UsesLeftHand();
+    bool PumpHeld();
     bool HoldsMagazine();
     bool SlideGrip(void* ped,void* gun,VRMath::Matrix& relative);
     bool ReloadConfig();
@@ -50,12 +51,13 @@ namespace
     struct SlideHand {void* owner=nullptr;void* gun=nullptr;VRMath::Matrix local{},gripInverse{};uint64_t at=0;} slideHand;
     void* owner=nullptr;void* currentWeapon=nullptr;void* gunEntity=nullptr;
     std::atomic<unsigned> currentType=7;
-    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[8];
-    unsigned AmmoIndex(unsigned type) {return type==12 ? 7u:(type==11 ? 6u:(type==18 ? 5u:(type==16 ? 4u:(type==15 ? 1u:(type==9 ? 2u:(type==13 ? 3u:0u))))));}
-    const char* ProfileFile(unsigned type) {return type==12 ? "VRWeapons/micro-smg.ini":(type==11 ? "VRWeapons/combat-shotgun.ini":(type==18 ? "VRWeapons/rpg.ini":(type==16 ? "VRWeapons/psg1.ini":(type==15 ? "VRWeapons/m4.ini":(type==9 ? "VRWeapons/deagle.ini":(type==13 ? "VRWeapons/smg.ini":"VRWeapons/pistol.ini"))))));}
+    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[9];
+    unsigned AmmoIndex(unsigned type) {return type==10 ? 8u:(type==12 ? 7u:(type==11 ? 6u:(type==18 ? 5u:(type==16 ? 4u:(type==15 ? 1u:(type==9 ? 2u:(type==13 ? 3u:0u)))))));}
+    const char* ProfileFile(unsigned type) {return type==10 ? "VRWeapons/pump-shotgun.ini":(type==12 ? "VRWeapons/micro-smg.ini":(type==11 ? "VRWeapons/combat-shotgun.ini":(type==18 ? "VRWeapons/rpg.ini":(type==16 ? "VRWeapons/psg1.ini":(type==15 ? "VRWeapons/m4.ini":(type==9 ? "VRWeapons/deagle.ini":(type==13 ? "VRWeapons/smg.ini":"VRWeapons/pistol.ini")))))));}
     std::atomic<void*> guardedWeapon=nullptr,visualGun=nullptr,visualMagazine=nullptr;
     std::atomic<void*> scopeGun=nullptr;
     std::atomic<bool> chamberReady=true,inserted=true,leftBusy=false;
+    std::atomic<bool> pumpOpen=false;
     std::atomic<float> slideDistance=0;
     std::atomic<unsigned> poseUpdates=0,magazineUpdates=0,blockedReloads=0,blockedTaskReloads=0,ejections=0,insertions=0,racks=0;
     std::atomic<float> insertionDistance=-1;
@@ -79,6 +81,7 @@ namespace
         VRMath::Vector tip{-.05f,-.002341f,.024f,1};
         float travel=.085f,snap=.045f,alignment=.5f;
         float rackTravel=.045f,rackThreshold=.035f,rackRadius=.15f;
+        float rackReturnThreshold=.015f;
         VRMath::Vector rackGripOffset{0,0,0,0};
         float recoilKick=0,recoilSupportScale=.15f,recoilRecovery=.18f,recoilMaximum=75.f;
         float supportRotation[3]{},supportOffset[3]{};
@@ -120,6 +123,15 @@ namespace
             value.recoilKick=8.f;value.recoilMaximum=40.f;
         }
         if(type==9) value.recoilKick=8.f;
+        if(type==10)
+        {
+            value.axis={1,0,0,0};value.tip={-.06798325f,-.00303943f,.02658558f,1};
+            value.shellPort={-.20107155f,-.00063685f,.01339588f,1};
+            value.travel=.04f;value.snap=.08f;value.insertionRotation[1]=-20.f;
+            value.handOffset[1]=.02f;value.handOffset[2]=0;
+            value.rackTravel=.13f;value.rackThreshold=.09f;value.rackRadius=.16f;
+            value.recoilKick=10.f;value.recoilMaximum=45.f;
+        }
         if(type==12)
         {
             value.handRotation[2]=145.f;value.snap=.06f;
@@ -220,6 +232,7 @@ namespace
         next.alignment=read("AlignmentCosine",next.alignment);
         next.rackTravel=read("RackTravel",next.rackTravel);
         next.rackThreshold=read("RackThreshold",next.rackThreshold);
+        next.rackReturnThreshold=read("RackReturnThreshold",next.rackReturnThreshold);
         next.rackRadius=read("RackGrabRadius",next.rackRadius);
         const char* rackOffsets[]{"RackGripOffsetX","RackGripOffsetY","RackGripOffsetZ"};
         for(unsigned a=0;a<3;++a)
@@ -298,7 +311,7 @@ namespace
     {
         const auto object=WeaponObjectHandle(gunEntity);
         const unsigned type=currentType.load();
-        const char* dictionary=type==11 ? "gun@baretta":(type==16 ? "gun@rifle":(type==15 ? "gun@ak47":(type==9 ? "gun@deagle":(type==12 ? "gun@uzi":(type==13 ? "gun@mp5k":"gun@handgun")))));
+        const char* dictionary=type==10 ? "gun@shotgun":(type==11 ? "gun@baretta":(type==16 ? "gun@rifle":(type==15 ? "gun@ak47":(type==9 ? "gun@deagle":(type==12 ? "gun@uzi":(type==13 ? "gun@mp5k":"gun@handgun"))))));
         // Play only the weapon object's authored clip, never a ped fire task.
         // Missing animation assets must not prevent an otherwise valid shot.
         if(!object) {fireAnimationError=1;++fireAnimationMisses;return;}
@@ -317,7 +330,7 @@ namespace
         auto* weapon=*reinterpret_cast<void**>(static_cast<char*>(entity)+0x25C);
         if(!weapon) return nullptr;
         const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-        return (type==7 || type==9 || type==11 || type==12 || type==13 || type==15 || type==16 || type==18) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
+        return (type==7 || type==9 || type==10 || type==11 || type==12 || type==13 || type==15 || type==16 || type==18) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
     }
     bool ResolveRig(void* entity)
     {
@@ -348,14 +361,14 @@ namespace
             else rest[b]=VRMath::AffineXYZ(locals[b]);
             resolved[b]=true;
             auto* name=*reinterpret_cast<const char**>(bones+b*0xE0);
-            if(name && !std::strcmp(name,currentType==11 ? "Gun_Shell1":(currentType==18 ? "gun_rocket":(currentType==16 ? "PSG1_Mag":(currentType==15 ? "M4_Mag":((currentType==12 || currentType==13) ? "mag":"Mag")))))) magazineBone=b;
+            if(name && !std::strcmp(name,(currentType==10 || currentType==11) ? "Gun_Shell1":(currentType==18 ? "gun_rocket":(currentType==16 ? "PSG1_Mag":(currentType==15 ? "M4_Mag":((currentType==12 || currentType==13) ? "mag":"Mag")))))) magazineBone=b;
             // Animated combat pistol uses Cock1 for the hammer; Breach is
             // the slide. The Glock and M4 retain their accepted rack bones.
-            const char* rackBone=currentType==11 ? "Gun_Breach":(currentType==16 ? "PSG1_Gun_Cock1":(currentType==15 ? "M4_Gun_Cock1":(currentType==9 ? "Gun_Breach":"Gun_Cock1")));
+            const char* rackBone=currentType==10 ? "gun_grip2":(currentType==11 ? "Gun_Breach":(currentType==16 ? "PSG1_Gun_Cock1":(currentType==15 ? "M4_Gun_Cock1":(currentType==9 ? "Gun_Breach":"Gun_Cock1"))));
             if(name && !std::strcmp(name,rackBone)) slideBone=b;
             if(currentType==12 && name && !std::strcmp(name,"Gun_Breach")) rackChildBone=b;
             if(name && !std::strcmp(name,"gun_grip")) primaryGripBone=b;
-            if(currentType==11 && name && !std::strcmp(name,"Gun_Shell2")) shellSecondBone=b;
+            if((currentType==10 || currentType==11) && name && !std::strcmp(name,"Gun_Shell2")) shellSecondBone=b;
         }
         for(unsigned b=0;b<boneCount;++b) if(!resolved[b]) return false;
         if(currentType==18 && magazineBone<boneCount) rest[magazineBone][3]=profile.tip;
@@ -382,12 +395,12 @@ namespace
         for(unsigned b=0;b<boneCount;++b)
         {
             const bool rackPart=b==slideBone || (currentType==12 && b==rackChildBone);
-            if(gun && b!=magazineBone && !rackPart && !(currentType==11 && b==shellSecondBone)) continue;
+            if(gun && b!=magazineBone && !rackPart && !((currentType==10 || currentType==11) && b==shellSecondBone)) continue;
             // Native weapon_fire owns the animated slide/bolt between shots.
             // Manual rack takes ownership only during the physical interaction.
             if(gun && rackPart && !racking) continue;
             auto desired=VRMath::Multiply(rest[b],VRMath::AffineXYZ(*root));
-            if((mag && b!=magazineBone) || (gun && b==magazineBone && (!inserted || currentType==11)) || (gun && currentType==11 && b==shellSecondBone))
+            if((mag && b!=magazineBone) || (gun && b==magazineBone && (!inserted || currentType==10 || currentType==11)) || (gun && (currentType==10 || currentType==11) && b==shellSecondBone))
             {
                 // Collapse unwanted geometry in this instance's skin palette.
                 for(unsigned row=0;row<3;++row) for(unsigned a=0;a<3;++a) desired[row][a]=0;
@@ -590,7 +603,7 @@ namespace
                 if(!ammo.Resume(total,capacity)) ammo.Begin(clip,total,capacity);
             }
             else ammo.Begin(clip,total,capacity);
-            ammo.tube=type==11;
+            ammo.tube=type==10 || type==11;ammo.pump=type==10;
             initialized=true;previousNativeTotal=total;rightGrip=leftGrip=true;
         }
         else if(total>previousNativeTotal) ammo.reserve+=total-previousNativeTotal;
@@ -627,7 +640,7 @@ namespace
         }
         const bool right=input.grabActive[1] && input.grab[1];
         const bool left=input.grabActive[0] && input.grab[0];
-        if(type!=18 && type!=11 && right && !rightGrip && ammo.inserted)
+        if(type!=18 && type!=10 && type!=11 && right && !rightGrip && ammo.inserted)
         {
             ammo.Eject();++ejections;
             if(!ammo.holding && MakeMagazine(gun)) {dropped=true;droppedRoot=gun;dropVelocity=0;dropAt=GetTickCount64();}
@@ -656,19 +669,19 @@ namespace
             // magazine's center to a sphere around the pistol's whole grip.
             const auto insertionTip=InsertionTip();
             const auto tip=VRMath::Transform(insertionTip,root);
-            auto well=VRMath::Transform(type==11 ? profile.shellPort:insertionTip,gun);
+            auto well=VRMath::Transform((type==10 || type==11) ? profile.shellPort:insertionTip,gun);
             const auto axis=VRMath::Transform(profile.axis,gun);
-            if(type!=11) for(unsigned a=0;a<3;++a) well[a]-=axis[a]*profile.travel;
+            if(type!=10 && type!=11) for(unsigned a=0;a<3;++a) well[a]-=axis[a]*profile.travel;
             const float distance=VRMath::Length3(VRMath::Difference3(tip,well));
             insertionDistance=distance;
             const auto local=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
             const auto heldAxis=VRMath::Transform(profile.axis,root);
             const auto insertionRotation=RotationXYZ(profile.insertionRotation);
-            const auto desiredAxis=type==11 ? VRMath::Transform(profile.axis,VRMath::Multiply(insertionRotation,gun)):axis;
+            const auto desiredAxis=(type==10 || type==11) ? VRMath::Transform(profile.axis,VRMath::Multiply(insertionRotation,gun)):axis;
             const bool aligned=VRMath::Dot3(heldAxis,desiredAxis)>profile.alignment &&
-                (type==18 || type==11 || VRMath::Dot3(root[1],gun[1])>0.f);
+                (type==18 || type==10 || type==11 || VRMath::Dot3(root[1],gun[1])>0.f);
             insertionAligned=aligned;
-            if((!ammo.inserted || (type==11 && ammo.Clip()<ammo.capacity)) && !guide.active && left && distance<profile.snap && aligned)
+            if((!ammo.inserted || ((type==10 || type==11) && ammo.Clip()<ammo.capacity)) && !guide.active && left && distance<profile.snap && aligned)
             {guide.Begin();guideStart=local;}
             if(guide.active)
             {
@@ -679,7 +692,7 @@ namespace
                 if(guide.active)
                 {
                     root=gun;
-                    if(type==11)
+                    if(type==10 || type==11)
                     {
                         root=VRReload::ShellInsertionPose(gun,insertionRotation,insertionTip,
                             profile.shellPort,profile.axis,guide.progress);
@@ -698,13 +711,13 @@ namespace
         if(type!=18 && !ammo.holding && !racking && left && !leftGrip)
         {
             auto gripPoint=rest[slideBone][3];
-            if(type==11 || type==12 || type==13 || type==15 || type==16) for(unsigned a=0;a<3;++a) gripPoint[a]+=profile.rackGripOffset[a];
+            if(type==10 || type==11 || type==12 || type==13 || type==15 || type==16) for(unsigned a=0;a<3;++a) gripPoint[a]+=profile.rackGripOffset[a];
             const auto slide=VRMath::Transform(gripPoint,gun);
             if(VRMath::Length3(VRMath::Difference3(view.wrist[0][3],slide))<profile.rackRadius)
             {
-                racking=true;pulled=false;rackStart=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
+                racking=true;pulled=false;pumpOpen=false;rackStart=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
                 rackHandLocal=VRReload::SlideHandPose(VRMath::Multiply(view.wrist[0],VRMath::InverseRigid(gun)),rest[slideBone][3]);
-                if(type==11 || type==12 || type==13 || type==15 || type==16)
+                if(type==10 || type==11 || type==12 || type==13 || type==15 || type==16)
                 {
                     // Charging handle, rather than a palm over a pistol slide.
                     for(unsigned a=0;a<3;++a)
@@ -718,9 +731,18 @@ namespace
             slideDistance=std::clamp(rackStart[0]-local[0],0.f,profile.rackTravel);
             if(slideDistance>=profile.rackThreshold && !pulled)
             {pulled=true;PlayPistolSound("HANDGUN_RELOAD_COCK_PULL");++slidePullSounds;}
+            if(type==10)
+            {
+                pumpOpen=slideDistance>profile.rackReturnThreshold || pulled;
+                if(left && pulled && slideDistance<=profile.rackReturnThreshold)
+                {
+                    ammo.Rack();++racks;pulled=false;pumpOpen=false;
+                    PlayPistolSound("HANDGUN_RELOAD_COCK_RELEASE");++slideReleaseSounds;
+                }
+            }
             if(!left)
             {
-                if(pulled)
+                if(pulled && type!=10)
                 {ammo.Rack();++racks;PlayPistolSound("HANDGUN_RELOAD_COCK_RELEASE");++slideReleaseSounds;}
                 racking=false;slideDistance=0;
             }
@@ -747,10 +769,10 @@ void VRReloadRuntime::Publish(void* ped,const VRMath::Matrix& transform,const VR
     sample.wrist[0]=wrists[0];sample.wrist[1]=wrists[1];sample.at=GetTickCount64();ReleaseSRWLockExclusive(&poseLock);
 }
 bool VRReloadRuntime::CanFire(void*,void* weapon)
-{return weapon!=guardedWeapon.load() || (chamberReady && !racking);}
+{return weapon!=guardedWeapon.load() || (chamberReady && (!racking || (currentType==10 && !pumpOpen)));}
 void VRReloadRuntime::EmptyTrigger(void* ped,void* weapon)
 {
-    if(ped!=owner || weapon!=guardedWeapon.load() || chamberReady || racking || !gunEntity) return;
+    if(ped!=owner || weapon!=guardedWeapon.load() || chamberReady || (racking && currentType!=10) || !gunEntity) return;
     // Native weapon-bank click identified in sounds.dat15. This is audio
     // only: never invoke Fire with an empty clip or start a reload task.
     PlayPistolSound("GENERAL_GUNS_AK47_DRY_CLICK");
@@ -763,6 +785,7 @@ void VRReloadRuntime::Fired(void*,void* weapon)
     if(currentType!=18) PlayFireAnimation();
 }
 bool VRReloadRuntime::UsesLeftHand() {return leftBusy;}
+bool VRReloadRuntime::PumpHeld() {return guardedWeapon && currentType==10 && racking;}
 bool VRReloadRuntime::HoldsMagazine() {return guardedWeapon && reportedHeld.load()>0;}
 bool VRReloadRuntime::SlideGrip(void* ped,void* gun,VRMath::Matrix& relative)
 {
@@ -824,7 +847,7 @@ bool VRReloadRuntime::HideNativeRocket(const void* entity)
 
 std::array<float,4> VRReloadRuntime::RecoilSettings(unsigned type)
 {
-    if(type!=9 && type!=11 && type!=12 && type!=13 && type!=15 && type!=16) return {};
+    if(type!=9 && type!=10 && type!=11 && type!=12 && type!=13 && type!=15 && type!=16) return {};
     if(type!=currentType || !enabled) {const auto defaults=Defaults(type);return {defaults.recoilKick,defaults.recoilSupportScale,defaults.recoilRecovery,defaults.recoilMaximum};}
     return {recoilKick.load(),recoilSupportScale.load(),recoilRecovery.load(),recoilMaximum.load()};
 }
