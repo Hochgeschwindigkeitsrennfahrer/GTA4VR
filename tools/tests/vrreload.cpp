@@ -5,6 +5,17 @@
 static void Check(bool condition) {if(!condition) std::abort();}
 int main()
 {
+    // A rotated shell must keep its tip on the port, even with a turned gun.
+    const float shellQ[]{0,0,.70710678f,.70710678f},shellPosition[]{2,3,4};
+    const float origin[]{0,0,0};
+    const auto shellGun=VRMath::Pose(shellPosition,shellQ);
+    const auto shellRotation=VRMath::Pose(origin,shellQ);
+    const VRMath::Vector shellTip{.27f,.01f,.04f,1},shellPort{.13f,0,.03f,1},shellAxis{1,0,0,0};
+    const auto shellPose=VRReload::ShellInsertionPose(shellGun,shellRotation,shellTip,shellPort,shellAxis,.04f);
+    const auto seatedTip=VRMath::Transform(shellTip,shellPose);
+    const auto port=VRMath::Transform(shellPort,shellGun),axis=VRMath::Transform(shellAxis,shellGun);
+    for(unsigned a=0;a<3;++a) Check(std::abs(seatedTip[a]-port[a]-axis[a]*.04f)<.00001f);
+    Check(std::abs(VRMath::Dot3(shellPose[0],shellGun[0]))<.00001f);
     VRReload::Pistol rocket;
     rocket.Begin(1,4,1);
     Check(rocket.Ready() && rocket.inserted && rocket.Clip()==1 && rocket.reserve==3);
@@ -109,5 +120,18 @@ int main()
     Check(combat.Eject()==7 && combat.Clip()==1);
     Check(combat.TakeMagazine() && combat.held==8 && combat.Insert() && combat.Clip()==9);
     Check(combat.Fired() && combat.Clip()==8 && rifle.Clip()==0 && gun.Clip()==16);
-    std::puts("pistol/rifle/combat pistol reload accounting passed");
+    VRReload::Pistol shotgun;shotgun.Begin(0,24,10);shotgun.tube=true;
+    Check(shotgun.TakeMagazine() && shotgun.held==1 && shotgun.reserve==23);
+    Check(shotgun.Insert() && shotgun.Clip()==1 && !shotgun.Ready());
+    shotgun.Rack();Check(shotgun.Ready() && shotgun.Clip()==1);
+    Check(shotgun.TakeMagazine() && shotgun.Insert() && shotgun.Clip()==2);
+    Check(shotgun.Eject()==0 && shotgun.Clip()==2);
+    Check(shotgun.Fired() && shotgun.Ready() && shotgun.Clip()==1);
+    Check(shotgun.Fired() && !shotgun.Ready() && shotgun.Clip()==0);
+    Check(shotgun.TakeMagazine());shotgun.DropHeld();Check(shotgun.discarded==1);
+    Check(shotgun.TakeMagazine());shotgun.ReturnHeld();Check(shotgun.Owned()+shotgun.discarded+2==24);
+    shotgun.Begin(10,24,10);shotgun.tube=true;Check(!shotgun.TakeMagazine());
+    Check(shotgun.Fired() && shotgun.TakeMagazine() && shotgun.Insert() && shotgun.Clip()==10);
+    Check(shotgun.Resume(23,10) && shotgun.tube && shotgun.Clip()==10);
+    std::puts("pistol/rifle/rocket/shotgun reload accounting passed");
 }

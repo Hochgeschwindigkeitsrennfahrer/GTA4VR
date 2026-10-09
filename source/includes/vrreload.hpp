@@ -8,6 +8,20 @@
 // clip combines chamber + magazine; reserve is total minus that clip.
 namespace VRReload
 {
+    // Rotate around the configured shell tip, keeping it seated at the port.
+    // Orientation and insertion travel are independently configurable.
+    inline VRMath::Matrix ShellInsertionPose(const VRMath::Matrix& gun,
+        const VRMath::Matrix& rotation,const VRMath::Vector& tip,
+        const VRMath::Vector& port,const VRMath::Vector& axis,float progress)
+    {
+        auto root=VRMath::Multiply(rotation,gun);
+        const auto worldTip=VRMath::Transform(tip,root);
+        const auto worldPort=VRMath::Transform(port,gun);
+        const auto worldAxis=VRMath::Transform(axis,gun);
+        for(unsigned a=0;a<3;++a)
+            root[3][a]+=worldPort[a]+worldAxis[a]*progress-worldTip[a];
+        return root;
+    }
     // Seat the palm on this pistol slide while retaining the initial grip's
     // orientation and nearby longitudinal point. Wrist is behind the palm.
     inline VRMath::Matrix SlideHandPose(const VRMath::Matrix& hand,const VRMath::Vector& rear)
@@ -32,7 +46,7 @@ namespace VRReload
         bool Update(float axial,float lateral,float travel=Travel)
         {
             if(!active) return false;
-            if(!std::isfinite(axial+lateral+travel) || travel<.02f || travel>.25f || axial<-.12f || lateral>.18f)
+            if(!std::isfinite(axial+lateral+travel) || travel<=0.f || axial<-.12f || lateral>.18f)
             {*this={};return false;}
             progress=std::clamp(axial,0.f,travel);
             return progress>=travel;
@@ -41,7 +55,7 @@ namespace VRReload
     struct Pistol
     {
         unsigned capacity=0,magazine=0,reserve=0,held=0,discarded=0;
-        bool inserted=true,chamber=false,holding=false;
+        bool inserted=true,chamber=false,holding=false,tube=false;
         void Begin(unsigned clip,unsigned total,unsigned clipCapacity)
         {
             *this={};capacity=clipCapacity;
@@ -62,7 +76,7 @@ namespace VRReload
         bool Ready() const {return chamber;}
         unsigned Eject()
         {
-            if(!inserted) return 0;
+            if(tube || !inserted) return 0;
             if(capacity==1)
             {const unsigned lost=chamber ? 1u:0u;discarded+=lost;chamber=false;inserted=false;return lost;}
             const auto lost=magazine;discarded+=lost;magazine=0;inserted=false;
@@ -70,14 +84,17 @@ namespace VRReload
         }
         bool TakeMagazine()
         {
-            if(holding || !capacity || !reserve || (capacity==1 && chamber)) return false;
+            if(holding || !capacity || !reserve || (capacity==1 && chamber) || (tube && Clip()>=capacity)) return false;
             // Native clip capacity includes the chamber; retain that limit.
-            held=std::min(reserve,capacity-(chamber ? 1u:0u));
+            held=tube ? 1u:std::min(reserve,capacity-(chamber ? 1u:0u));
             reserve-=held;holding=true;return true;
         }
         bool Insert()
         {
-            if(inserted || !holding) return false;
+            if(!holding) return false;
+            if(tube)
+            {if(Clip()>=capacity || held!=1) return false; ++magazine;held=0;holding=false;inserted=true;return true;}
+            if(inserted) return false;
             if(capacity==1)
             {chamber=held==1;held=0;holding=false;inserted=chamber;return chamber;}
             magazine=held;held=0;holding=false;inserted=true;return true;
