@@ -472,7 +472,7 @@ namespace
     }
 
     bool SupportedFirearm(unsigned type)
-    {return type==7 || type==9 || type==10 || type==11 || type==12 || type==13 || type==15 || type==18 || (type==16 && sniperSpread && delayedRay);}
+    {return type==7 || type==9 || type==10 || type==11 || type==12 || type==13 || type==14 || type==15 || type==18 || (type==16 && sniperSpread && delayedRay);}
 
     void __stdcall TrackedSniperSpread(void* shooter,const VRMath::Vector* origin,VRMath::Vector* target)
     {
@@ -510,7 +510,7 @@ namespace
         {
             VRReloadRuntime::Fired(shooter,weapon);
             const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-            if((type==9 || type==10 || type==11 || type==12 || type==13 || type==15 || type==16) && VRHands::Active(shooter) &&
+            if((type==9 || type==10 || type==11 || type==12 || type==13 || type==14 || type==15 || type==16) && VRHands::Active(shooter) &&
                 OpenXRVR::HasFocusedViews())
             {
                 const auto settings=VRReloadRuntime::RecoilSettings(type);
@@ -626,7 +626,7 @@ namespace
         if(!weapon || !SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18))) return;
         const bool first=!triggerLatched;
         const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-        const bool automatic=type==12 || type==13 || type==15;
+        const bool automatic=type==12 || type==13 || type==14 || type==15;
         if(!first && !automatic) return;
         triggerLatched=true;
         if(input.phoneActive || Natives::IsPauseMenuActive()) return;
@@ -1051,7 +1051,7 @@ namespace
         supportGripping=supporting || VRReloadRuntime::PumpHeld();
         float kick=0;
         const unsigned recoilType=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
-        const bool recoilWeaponSupported=recoilType==9 || recoilType==10 || recoilType==11 || recoilType==12 || recoilType==13 || recoilType==15 || recoilType==16;
+        const bool recoilWeaponSupported=recoilType==9 || recoilType==10 || recoilType==11 || recoilType==12 || recoilType==13 || recoilType==14 || recoilType==15 || recoilType==16;
         const auto recoilSettings=VRReloadRuntime::RecoilSettings(recoilType);
         AcquireSRWLockExclusive(&recoilLock);
         if(!recoilWeaponSupported || recoilOwner!=owner || recoilWeapon!=weapon) {recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;}

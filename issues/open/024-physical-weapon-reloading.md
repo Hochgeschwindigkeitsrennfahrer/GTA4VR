@@ -328,3 +328,19 @@ At the user's request, this existing issue owns all remaining firearm work from 
 - Optimized x86 tests passed eight-shot exhaustion with mandatory rack, rejection of repeat shots before rack, selection resume retaining unchambered pump state, and shell refill/conservation. Release673D8F89A138F706DFED65EA45EE6D610F9EE6898A56096CE3809343170DD3FD built successfully (existing modupdater PDB warnings), backed up/deployed in build/issue024-pump-shotgun-20261009-162634 after verified quit. Existing user tuning retained, no teleport/save changes. PID18376 FOCUSED continuous DXVK-Vulkan, native type10 equipment readback, active/assetReady/configValid, clip8/reserve72. Ghidra B16370 VR024_PUMP_SHOTGUN bookmark previewed, read back and saved. Headset pump/loading/visual acceptance requested, pending.
 
 - User confirms pump firing, repeated back/forward cycling and shoulder shell loading all work. Imported exact installed pump-shotgun.ini, including InsertionRotationY=-20 degrees, and synchronized fallback default. Accepted Release673D8F89 remains running unchanged; #024 stays open for remaining weapons/coverage.
+
+### 2026-10-09 — AK-47 bringup
+
+- Pump shotgun and accepted tuning committed09fde3b. Starting native type14 AK-47: automatic native tracked-muzzle firing, support/one-handed recoil, separate magazine/charging profile and saved ammunition. External Animated Weapons w_ak47 reference contains Mag and Gun_Breach under AK_stuff; parent-composed magazine pivot approximately(-0.0711513,-0.0113021,0.0185908)m. Live rig readback and headset acceptance pending; no proprietary assets committed.
+
+- AK-47 ReleaseB822E8BE8709CE6C6B3F2F4C57E98E0205C775499D02D679F7B93CFE7934A24C built successfully with existing modupdater PDB warnings; optimized ammo tests passed. Verified game exit, backed up ASI/global INI/pump profile in build/issue024-ak47-20261009-163933, installed only missing ak47.ini and deployed ASI. Existing user profiles retained. Normal relaunch without teleport/save changes; live rig and manual acceptance pending.
+
+- PID28460 responsive FOCUSED continuous stereo; bounded live readback base00E50000 confirms type14/W_AK47, Mag6/Gun_Breach9/AK_stuff5 and matching reference translations. Physical reload active/assetReady/configValid, six shot animations/no misses, one ejection and one insertion; clip30/reserve202 at readback. Fresh Sky image shows intact apartment/weapon/arms. Ghidra B16370 AK rig bookmark previewed/read back/saved; updated live evidence pending save. Manual ergonomics and bolt cycle requested; no automatic teleport.
+
+- User confirms AK-47 automatic fire, support grip, magazine ejection/insertion and charging after empty reload all work on2026-10-09. Live Ghidra annotation read back and saved. Accepted ReleaseB822E8BE remains running; #024 remains open for other weapons and episode/fallback coverage.
+
+- Exposed existing SupportHandRotationX/Y/Z=0 keys in the AK-47 source/installed profiles for runtime palm tuning. Backed up installed profile and appended only missing keys, preserving user magazine/insertion/charging edits. Existing runtime support needs no rebuild.
+
+- Added existing runtime SupportHandOffsetX/Y/Z=0 settings to AK-47 source/installed profiles. Backed up installed INI and appended missing keys only, preserving current user tuning including support rotationX180degrees. No rebuild required.
+
+- User accepts AK-47 and requests saving tuning/commit. Imported exact installed ak47.ini: magazine rotation180/120/180degrees, hand offset0.075/0.02/0.04m, insertion travel0.02m, rack offset0/0.06/0.01m, support rotation0/45/0degrees and offset0/-0.04/0m. Source fallback defaults synchronized. Last accepted ReleaseB822E8BE runs the user's profile; #024 remains open. Next requested weapon is native type17 bolt-action sniper, explicitly not combat sniper/type16.
