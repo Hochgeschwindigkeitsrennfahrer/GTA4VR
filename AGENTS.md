@@ -13,6 +13,7 @@ Track work in `issues/open/` and `issues/closed/` using `issues/README.md`. Star
 - Separate game simulation, per-eye scene rendering, and headset submission. Do not call a duplicated frame VR merely because the headset displays it.
 - Validate camera matrices, render order, depth, frame timing, and D3D9-to-OpenXR interop experimentally before committing to an architecture.
 - Keep upstream fixes easy to merge. Avoid unrelated refactors and changes to installer behavior until needed by a milestone.
+- For user-editable VR tuning, validate syntax/types and finite numeric values without arbitrary min/max limits. Retain only structural checks needed for valid operations (for example, a nonzero axis for normalization). Do not reject a whole profile merely because a tuning value exceeds a guessed useful range.
 
 ## Repository workflow
 

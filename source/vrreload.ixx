@@ -25,16 +25,22 @@ export namespace VRReloadRuntime
     bool ReloadConfig();
     bool TestFireAnimation();
     std::array<float,4> RecoilSettings(unsigned type);
+    std::array<float,3> SupportRotation(unsigned type);
+    std::array<float,3> SupportOffset(unsigned type);
     unsigned ConfigRevision();
     bool GetRenderedSniperPose(VRMath::Matrix& world);
     bool IsScopeGun(const void* entity);
     bool IsScopeOccluder(const void* entity);
+    bool HideNativeRocket(const void* entity);
+    void PrepareObjectRender(void* entity);
     std::string Status();
 }
 namespace
 {
     bool enabled=false;
     SafetyHookInline poseHook{},worldPoseHook{},reloadHook{},completionHook{},decisionHook{},taskHook{};
+    std::atomic<void*> nativeRocketVisual=nullptr;
+    std::atomic<unsigned> nativeRocketSkips=0,rocketRenderUpdates=0;
     using AllocatePose=void (__thiscall*)(void*);
     AllocatePose allocatePose=nullptr;
     using FinishReloadTask=void (__thiscall*)(void*,void*);
@@ -44,15 +50,17 @@ namespace
     struct SlideHand {void* owner=nullptr;void* gun=nullptr;VRMath::Matrix local{},gripInverse{};uint64_t at=0;} slideHand;
     void* owner=nullptr;void* currentWeapon=nullptr;void* gunEntity=nullptr;
     std::atomic<unsigned> currentType=7;
-    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[5];
-    unsigned AmmoIndex(unsigned type) {return type==16 ? 4u:(type==15 ? 1u:(type==9 ? 2u:(type==13 ? 3u:0u)));}
-    const char* ProfileFile(unsigned type) {return type==16 ? "VRWeapons/psg1.ini":(type==15 ? "VRWeapons/m4.ini":(type==9 ? "VRWeapons/deagle.ini":(type==13 ? "VRWeapons/smg.ini":"VRWeapons/pistol.ini")));}
+    struct SavedAmmo {VRReload::Pistol ammo{};bool valid=false;} savedAmmo[6];
+    unsigned AmmoIndex(unsigned type) {return type==18 ? 5u:(type==16 ? 4u:(type==15 ? 1u:(type==9 ? 2u:(type==13 ? 3u:0u))));}
+    const char* ProfileFile(unsigned type) {return type==18 ? "VRWeapons/rpg.ini":(type==16 ? "VRWeapons/psg1.ini":(type==15 ? "VRWeapons/m4.ini":(type==9 ? "VRWeapons/deagle.ini":(type==13 ? "VRWeapons/smg.ini":"VRWeapons/pistol.ini"))));}
     std::atomic<void*> guardedWeapon=nullptr,visualGun=nullptr,visualMagazine=nullptr;
     std::atomic<void*> scopeGun=nullptr;
     std::atomic<bool> chamberReady=true,inserted=true,leftBusy=false;
     std::atomic<float> slideDistance=0;
     std::atomic<unsigned> poseUpdates=0,magazineUpdates=0,blockedReloads=0,blockedTaskReloads=0,ejections=0,insertions=0,racks=0;
     std::atomic<float> insertionDistance=-1;
+    std::atomic<bool> insertionAligned=false;
+    VRMath::Vector rocketTail{0,0,0,0};
     std::atomic<float> insertionProgress=0;
     std::atomic<uint32_t> magazineRoom=0;
     std::atomic<bool> configPending=false;
@@ -72,10 +80,23 @@ namespace
         float rackTravel=.045f,rackThreshold=.035f,rackRadius=.15f;
         VRMath::Vector rackGripOffset{0,0,0,0};
         float recoilKick=0,recoilSupportScale=.15f,recoilRecovery=.18f,recoilMaximum=75.f;
+        float supportRotation[3]{},supportOffset[3]{};
+        VRMath::Vector rocketEntrance{.318807f,.015501f,.062882f,1};
+        float rocketLoadedDepth=.03f;
     } profile;
     Profile Defaults(unsigned type)
     {
         Profile value;
+        if(type==18)
+        {
+            value.axis={-1,0,0,0};value.tip={.54f,0,.055f,1};value.travel=.15f;
+            value.handRotation[0]=0;value.handRotation[1]=90;value.handRotation[2]=0;
+            value.handOffset[0]=.08f;value.handOffset[1]=.05f;value.handOffset[2]=-.12f;
+            value.snap=.06f;
+            value.supportRotation[0]=180;value.supportRotation[2]=180;
+            value.rocketLoadedDepth=.09f;
+            value.supportOffset[0]=-.05f;
+        }
         if(type==16)
         {
             value.axis={0,0,1,0};value.travel=.05f;
@@ -136,14 +157,14 @@ namespace
         std::error_code error;
         if(!std::filesystem::is_regular_file(ini.GetIniPath(),error)) {configValid=false;return;}
         bool valid=true;
-        auto read=[&](const char* key,float fallback,float minimum,float maximum)
+        auto read=[&](const char* key,float fallback)
         {
             const auto value=ini.ReadString("Reload",key,std::to_string(fallback));
             try
             {
                 size_t end=0;const float parsed=std::stof(value,&end);
                 if(value.find_first_not_of(" \t\r\n",end)!=std::string::npos ||
-                    !std::isfinite(parsed) || parsed<minimum || parsed>maximum) {valid=false;return fallback;}
+                    !std::isfinite(parsed)) {valid=false;return fallback;}
                 return parsed;
             }
             catch(...) {valid=false;return fallback;}
@@ -154,33 +175,52 @@ namespace
         const char* tips[]{"MagazineTipX","MagazineTipY","MagazineTipZ"};
         for(unsigned a=0;a<3;++a)
         {
-            next.handRotation[a]=read(rotations[a],next.handRotation[a],-180,180);
-            next.handOffset[a]=read(offsets[a],next.handOffset[a],-.5f,.5f);
-            next.axis[a]=read(axes[a],next.axis[a],-1,1);
-            next.tip[a]=read(tips[a],next.tip[a],-.5f,.5f);
+            next.handRotation[a]=read(rotations[a],next.handRotation[a]);
+            next.handOffset[a]=read(offsets[a],next.handOffset[a]);
+            next.axis[a]=read(axes[a],next.axis[a]);
+            next.tip[a]=read(tips[a],next.tip[a]);
         }
+        const char* supportRotations[]{"SupportHandRotationX","SupportHandRotationY","SupportHandRotationZ"};
+        for(unsigned a=0;a<3;++a) next.supportRotation[a]=read(supportRotations[a],next.supportRotation[a]);
+        const char* supportOffsets[]{"SupportHandOffsetX","SupportHandOffsetY","SupportHandOffsetZ"};
+        for(unsigned a=0;a<3;++a) next.supportOffset[a]=read(supportOffsets[a],next.supportOffset[a]);
+        next.rocketLoadedDepth=read("RocketLoadedDepth",next.rocketLoadedDepth);
+        const char* entranceKeys[]{"RocketEntranceX","RocketEntranceY","RocketEntranceZ"};
+        for(unsigned a=0;a<3;++a) next.rocketEntrance[a]=read(entranceKeys[a],next.rocketEntrance[a]);
         const float length=VRMath::Length3(next.axis);
-        if(length<.1f) valid=false;
+        if(!std::isfinite(length) || length<1.e-6f) valid=false;
         else for(unsigned a=0;a<3;++a) next.axis[a]/=length;
-        next.travel=read("InsertionTravel",next.travel,.02f,.25f);
-        next.snap=read("SnapRadius",next.snap,.005f,.15f);
-        next.alignment=read("AlignmentCosine",next.alignment,0,1);
-        next.rackTravel=read("RackTravel",next.rackTravel,.01f,.15f);
-        next.rackThreshold=read("RackThreshold",next.rackThreshold,.005f,.15f);
-        next.rackRadius=read("RackGrabRadius",next.rackRadius,.02f,.20f);
+        next.travel=read("InsertionTravel",next.travel);
+        next.snap=read("SnapRadius",next.snap);
+        next.alignment=read("AlignmentCosine",next.alignment);
+        next.rackTravel=read("RackTravel",next.rackTravel);
+        next.rackThreshold=read("RackThreshold",next.rackThreshold);
+        next.rackRadius=read("RackGrabRadius",next.rackRadius);
         const char* rackOffsets[]{"RackGripOffsetX","RackGripOffsetY","RackGripOffsetZ"};
         for(unsigned a=0;a<3;++a)
-            next.rackGripOffset[a]=read(rackOffsets[a],next.rackGripOffset[a],-.25f,.25f);
-        if(next.rackThreshold>next.rackTravel) valid=false;
-        next.recoilKick=read("RecoilKickDegrees",next.recoilKick,0,20);
-        next.recoilSupportScale=read("RecoilSupportScale",next.recoilSupportScale,0,1);
-        next.recoilRecovery=read("RecoilRecoverySeconds",next.recoilRecovery,.03f,1.f);
-        next.recoilMaximum=read("RecoilMaxDegrees",next.recoilMaximum,0,90);
+            next.rackGripOffset[a]=read(rackOffsets[a],next.rackGripOffset[a]);
+        next.recoilKick=read("RecoilKickDegrees",next.recoilKick);
+        next.recoilSupportScale=read("RecoilSupportScale",next.recoilSupportScale);
+        next.recoilRecovery=read("RecoilRecoverySeconds",next.recoilRecovery);
+        next.recoilMaximum=read("RecoilMaxDegrees",next.recoilMaximum);
         configValid=valid;
         if(valid) {profile=next;guide={};insertionProgress=0;refreshHeldPose=true;
             recoilKick=next.recoilKick;recoilSupportScale=next.recoilSupportScale;
             recoilRecovery=next.recoilRecovery;recoilMaximum=next.recoilMaximum;
             racking=false;slideDistance=0;++configRevision;}
+    }
+    VRMath::Vector RocketSeat(float extraDepth=0)
+    {
+        auto point=profile.rocketEntrance;
+        for(unsigned a=0;a<3;++a) point[a]+=profile.axis[a]*(profile.travel+extraDepth)-rocketTail[a];
+        return point;
+    }
+    VRMath::Vector InsertionTip()
+    {
+        if(currentType!=18) return profile.tip;
+        auto point=RocketSeat();
+        for(unsigned a=0;a<3;++a) point[a]+=rocketTail[a];
+        return point;
     }
     VRMath::Matrix HeldMagazine(const VRMath::Matrix& gun,const Sample& view)
     {
@@ -193,7 +233,7 @@ namespace
         }
         auto root=VRMath::Multiply(rotation,VRMath::Multiply(
             VRMath::Multiply(gun,VRMath::InverseRigid(view.wrist[1])),view.wrist[0]));
-        const auto center=VRMath::Transform(rest[magazineBone][3],root);
+        const auto center=VRMath::Transform(currentType==18 ? RocketSeat():rest[magazineBone][3],root);
         for(unsigned a=0;a<3;++a)
         {
             float offset=0;for(unsigned row=0;row<3;++row) offset+=view.wrist[0][row][a]*profile.handOffset[row];
@@ -247,7 +287,7 @@ namespace
         auto* weapon=*reinterpret_cast<void**>(static_cast<char*>(entity)+0x25C);
         if(!weapon) return nullptr;
         const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-        return (type==7 || type==9 || type==13 || type==15 || type==16) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
+        return (type==7 || type==9 || type==13 || type==15 || type==16 || type==18) && type==*reinterpret_cast<unsigned*>(manager+12*(slot+3)) ? weapon:nullptr;
     }
     bool ResolveRig(void* entity)
     {
@@ -255,7 +295,7 @@ namespace
         auto* drawable=draw ? *reinterpret_cast<void**>(draw):nullptr;
         auto* def=drawable ? *reinterpret_cast<void**>(static_cast<char*>(drawable)+0xC):nullptr;
         if(!def) return false;
-        if(def==definition) return magazineBone<boneCount && slideBone<boneCount;
+        if(def==definition) return magazineBone<boneCount && (currentType==18 || slideBone<boneCount);
         definition=def;magazineBone=slideBone=primaryGripBone=~0u;
         boneCount=*reinterpret_cast<unsigned short*>(static_cast<char*>(def)+0x14);
         if(!boneCount || boneCount>32) return false;
@@ -278,7 +318,7 @@ namespace
             else rest[b]=VRMath::AffineXYZ(locals[b]);
             resolved[b]=true;
             auto* name=*reinterpret_cast<const char**>(bones+b*0xE0);
-            if(name && !std::strcmp(name,currentType==16 ? "PSG1_Mag":(currentType==15 ? "M4_Mag":(currentType==13 ? "mag":"Mag")))) magazineBone=b;
+            if(name && !std::strcmp(name,currentType==18 ? "gun_rocket":(currentType==16 ? "PSG1_Mag":(currentType==15 ? "M4_Mag":(currentType==13 ? "mag":"Mag"))))) magazineBone=b;
             // Animated combat pistol uses Cock1 for the hammer; Breach is
             // the slide. The Glock and M4 retain their accepted rack bones.
             const char* rackBone=currentType==16 ? "PSG1_Gun_Cock1":(currentType==15 ? "M4_Gun_Cock1":(currentType==9 ? "Gun_Breach":"Gun_Cock1"));
@@ -286,11 +326,16 @@ namespace
             if(name && !std::strcmp(name,"gun_grip")) primaryGripBone=b;
         }
         for(unsigned b=0;b<boneCount;++b) if(!resolved[b]) return false;
-        return magazineBone<boneCount && slideBone<boneCount;
+        if(currentType==18 && magazineBone<boneCount) rest[magazineBone][3]=profile.tip;
+        return magazineBone<boneCount && (currentType==18 || slideBone<boneCount);
     }
     void __fastcall UpdatePose(void* entity,void*)
     {
         poseHook.thiscall<void>(entity);
+        if(currentType==18)
+        {
+            return;
+        }
         const bool gun=entity==visualGun.load();
         const bool mag=entity==visualMagazine.load();
         if((!gun && !mag) || !definition || boneCount>32) return;
@@ -323,6 +368,7 @@ namespace
     }
     void ApplyMagazinePose(void* skeleton)
     {
+        if(currentType==18) return;
         auto* entity=visualMagazine.load();
         if(!entity || *reinterpret_cast<void**>(static_cast<char*>(entity)+0x100)!=skeleton || !definition ||
             *reinterpret_cast<void**>(static_cast<char*>(skeleton)+4)!=definition ||
@@ -402,23 +448,40 @@ namespace
         Natives::SetObjectCoordinates(magazineObject,root[3][0],root[3][1],root[3][2]);
         auto* frame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(magazineEntity)+0x20);
         if(!frame) return;
-        *frame=root;
+        if(currentType==18)
+        {
+            // Native ROCKET asset is rotated -90 degrees about Z in weaponInfo.
+            const float position[3]{},q[4]{0,0,-.70710678f,.70710678f};
+            auto rocket=VRMath::Multiply(VRMath::Pose(position,q),root);
+            rocket[3]=VRMath::Transform(RocketSeat(ammo.Ready() && !ammo.holding ? profile.rocketLoadedDepth:0.f),root);*frame=rocket;
+        }
+        else *frame=root;
         auto* skeleton=*reinterpret_cast<void**>(static_cast<char*>(magazineEntity)+0x100);
         if(skeleton) CalculateWorldPose(skeleton,nullptr);
     }
     bool MakeMagazine(const VRMath::Matrix& root)
     {
-        DeleteMagazine();uint32_t model=0;Natives::GetWeapontypeModel(currentType.load(),&model);
-        if(!model || !Natives::HasModelLoaded(model)) return false;
+        DeleteMagazine();uint32_t model=0;Natives::GetWeapontypeModel(currentType==18 ? 6u:currentType.load(),&model);
+        if(!model) return false;
+        if(!Natives::HasModelLoaded(model)) {Natives::RequestModel(model);return false;}
+        if(currentType==18)
+        {
+            Vector3 minimum{},maximum{};Natives::GetModelDimensions(model,&minimum,&maximum);
+            // Native projectile +Y becomes launcher +X after its -90deg Z
+            // rotation. Its rear end, not its origin or nose, enters the tube.
+            rocketTail={minimum.fY,-(minimum.fX+maximum.fX)*.5f,(minimum.fZ+maximum.fZ)*.5f,0};
+            if(!std::isfinite(rocketTail[0]+rocketTail[1]+rocketTail[2]) ||
+                VRMath::Length3(rocketTail)>2.f) return false;
+        }
         Natives::CreateObjectNoOffset(model,root[3][0],root[3][1],root[3][2],&magazineObject,true);
         magazineEntity=ObjectEntity(magazineObject);
         if(!magazineEntity) {DeleteMagazine();return false;}
         Natives::SetObjectCollision(magazineObject,false);
         Natives::SetObjectDynamic(magazineObject,false);
         Natives::FreezeObjectPosition(magazineObject,true);
-        if(!*reinterpret_cast<void**>(static_cast<char*>(magazineEntity)+0x100)) allocatePose(magazineEntity);
+        if(currentType!=18 && !*reinterpret_cast<void**>(static_cast<char*>(magazineEntity)+0x100)) allocatePose(magazineEntity);
         auto* frame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(magazineEntity)+0x20);
-        if(!frame || !*reinterpret_cast<void**>(static_cast<char*>(magazineEntity)+0x100)) {DeleteMagazine();return false;}
+        if(!frame || (currentType!=18 && !*reinterpret_cast<void**>(static_cast<char*>(magazineEntity)+0x100))) {DeleteMagazine();return false;}
         visualMagazine=magazineEntity;MoveMagazine(root);
         return true;
     }
@@ -446,14 +509,14 @@ namespace
             currentWeapon=nullptr; // Inventory may have changed during session loss.
             if(ped && Natives::DoesCharExist(ped) && !Natives::IsCharDead(ped))
             {ammo.ReturnHeld();WriteAmmo(ped);}
-            guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;
+            guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;
             initialized=false;racking=false;slideDistance=0;leftBusy=false;DeleteMagazine();
         }
         Sample view;AcquireSRWLockShared(&poseLock);view=sample;ReleaseSRWLockShared(&poseLock);
         if(!enabled || !OpenXRVR::IsSessionRunning() || !view.owner || GetTickCount64()-view.at>250) return;
         Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
         if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharDead(ped))
-        {guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;leftBusy=false;initialized=false;
+        {guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;leftBusy=false;initialized=false;
             for(auto& saved:savedAmmo) saved={};DeleteMagazine();return;}
         if(owner!=view.owner)
         {DeleteMagazine();initialized=false;owner=view.owner;guardedWeapon=nullptr;for(auto& saved:savedAmmo) saved={};}
@@ -464,7 +527,7 @@ namespace
             // Return only the held reserve magazine to its original weapon.
             // Preserve absent magazines/chambers across inventory switches.
             // Do not dereference the previous CWeapon: selection can destroy it.
-            guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;
+            guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;
             ammo.ReturnHeld();
             if(Natives::HasCharGotWeapon(ped,currentType.load()))
             {
@@ -478,7 +541,7 @@ namespace
         {currentType=type;definition=nullptr;profile=Defaults(type);LoadProfile();}
         if(!weapon || !ResolveRig(entity))
         {
-            guardedWeapon=nullptr;visualGun=nullptr;currentWeapon=nullptr;racking=false;leftBusy=false;guide={};
+            guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;racking=false;leftBusy=false;guide={};
             return;
         }
         currentWeapon=weapon;gunEntity=entity;
@@ -486,7 +549,7 @@ namespace
         if(!initialized)
         {
             Natives::GetAmmoInClip(ped,type,&clip);Natives::GetMaxAmmoInClip(ped,type,&capacity);
-            if(capacity<2 || capacity>64 || total>100000) return;
+            if(capacity<(type==18 ? 1u:2u) || capacity>64 || total>100000) return;
             auto& saved=savedAmmo[AmmoIndex(type)];
             if(saved.valid)
             {
@@ -499,6 +562,18 @@ namespace
         else if(total>previousNativeTotal) ammo.reserve+=total-previousNativeTotal;
         else if(total<previousNativeTotal) ammo.reserve-=std::min(ammo.reserve,previousNativeTotal-total);
         guardedWeapon=weapon;visualGun=entity;WriteAmmo(ped);
+        nativeRocketVisual=nullptr;
+        if(type==18)
+        {
+            // CE weapon manager+1C owns a separate native held projectile.
+            // Live type18 readback: this object is model type6, parent is the
+            // player ped and +25C has no CWeapon. Keep it alive for native
+            // lifecycle; the physical reload adapter owns its replacement.
+            auto* rocket=*reinterpret_cast<void**>(static_cast<char*>(view.owner)+0x2B0+0x1C);
+            if(rocket && rocket!=entity &&
+                *reinterpret_cast<void**>(static_cast<char*>(rocket)+0x1BC)==view.owner &&
+                !*reinterpret_cast<void**>(static_cast<char*>(rocket)+0x25C)) nativeRocketVisual=rocket;
+        }
         OpenXRVR::ControllerInput input{};
         if(!OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) || input.phoneActive ||
             Natives::IsPauseMenuActive() || !input.gripPoseValid[0] || !input.gripPoseValid[1])
@@ -507,16 +582,25 @@ namespace
         auto* frame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!frame) return;
         const auto gun=VRMath::AffineXYZ(*frame);
+        if(type==18)
+        {
+            // Load the projectile asset before a shoulder press, and show the
+            // loaded round without relying on the suppressed native reload task.
+            uint32_t model=0;Natives::GetWeapontypeModel(6,&model);
+            if(model && !Natives::HasModelLoaded(model)) Natives::RequestModel(model);
+            if(ammo.Ready()) {if(!magazineEntity) MakeMagazine(gun);if(magazineEntity) MoveMagazine(gun);}
+            else if(magazineEntity && !ammo.holding && !dropped) DeleteMagazine();
+        }
         const bool right=input.grabActive[1] && input.grab[1];
         const bool left=input.grabActive[0] && input.grab[0];
-        if(right && !rightGrip && ammo.inserted)
+        if(type!=18 && right && !rightGrip && ammo.inserted)
         {
             ammo.Eject();++ejections;
             if(!ammo.holding && MakeMagazine(gun)) {dropped=true;droppedRoot=gun;dropVelocity=0;dropAt=GetTickCount64();}
         }
         // Shoulder is defined relative to the live HMD, not startup height.
         OpenXRVR::EyeView eyes[2]{};long long display=0;
-        if(left && !leftGrip && !ammo.holding && !racking && OpenXRVR::GetEyeViews(eyes,display))
+        if(left && !leftGrip && !ammo.holding && !racking && !(type==18 && ammo.Ready()) && OpenXRVR::GetEyeViews(eyes,display))
         {
             const VRMath::Vector head{(eyes[0].position[0]+eyes[1].position[0])*.5f,
                 (eyes[0].position[1]+eyes[1].position[1])*.5f,(eyes[0].position[2]+eyes[1].position[2])*.5f,1};
@@ -536,15 +620,18 @@ namespace
             auto root=VRGrip::Target(magazineOffset,view.wrist[0]);
             // The leading end meets the bottom opening; do not snap the
             // magazine's center to a sphere around the pistol's whole grip.
-            const auto tip=VRMath::Transform(profile.tip,root);
-            auto well=VRMath::Transform(profile.tip,gun);
+            const auto insertionTip=InsertionTip();
+            const auto tip=VRMath::Transform(insertionTip,root);
+            auto well=VRMath::Transform(insertionTip,gun);
             const auto axis=VRMath::Transform(profile.axis,gun);
             for(unsigned a=0;a<3;++a) well[a]-=axis[a]*profile.travel;
             const float distance=VRMath::Length3(VRMath::Difference3(tip,well));
             insertionDistance=distance;
             const auto local=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
             const auto heldAxis=VRMath::Transform(profile.axis,root);
-            const bool aligned=VRMath::Dot3(heldAxis,axis)>profile.alignment && VRMath::Dot3(root[1],gun[1])>0.f;
+            const bool aligned=VRMath::Dot3(heldAxis,axis)>profile.alignment &&
+                (type==18 || VRMath::Dot3(root[1],gun[1])>0.f);
+            insertionAligned=aligned;
             if(!ammo.inserted && !guide.active && left && distance<profile.snap && aligned)
             {guide.Begin();guideStart=local;}
             if(guide.active)
@@ -567,7 +654,7 @@ namespace
                 if(!left) {ammo.DropHeld();guide={};dropped=true;droppedRoot=root;dropVelocity=0;dropAt=GetTickCount64();}
             }
         }
-        if(!ammo.holding && !racking && left && !leftGrip)
+        if(type!=18 && !ammo.holding && !racking && left && !leftGrip)
         {
             auto gripPoint=rest[slideBone][3];
             if(type==13 || type==15 || type==16) for(unsigned a=0;a<3;++a) gripPoint[a]+=profile.rackGripOffset[a];
@@ -632,7 +719,7 @@ void VRReloadRuntime::Fired(void*,void* weapon)
 {
     if(weapon!=guardedWeapon.load()) return;
     ammo.Fired();previousNativeTotal=ammo.NativeTotal();chamberReady=ammo.Ready();
-    PlayFireAnimation();
+    if(currentType!=18) PlayFireAnimation();
 }
 bool VRReloadRuntime::UsesLeftHand() {return leftBusy;}
 bool VRReloadRuntime::HoldsMagazine() {return guardedWeapon && reportedHeld.load()>0;}
@@ -667,6 +754,32 @@ bool VRReloadRuntime::IsScopeOccluder(const void* entity)
 {return entity && (entity==scopeGun.load() || entity==visualMagazine.load());}
 bool VRReloadRuntime::IsScopeGun(const void* entity)
 {return entity && entity==scopeGun.load();}
+void VRReloadRuntime::PrepareObjectRender(void* entity)
+{
+    // The simulation callback owns creation/ammo/rooms. Only refresh the
+    // loaded visual's frame here, immediately before its draw is queued:
+    // the native weapon attachment may have moved since Process().
+    if(!entity || currentType!=18 || !guardedWeapon.load() ||
+        entity!=visualMagazine.load() || !chamberReady.load() || reportedHeld.load()) return;
+    auto* gun=visualGun.load();
+    if(!gun) return;
+    auto* gunFrame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(gun)+0x20);
+    auto* rocketFrame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
+    if(!gunFrame || !rocketFrame) return;
+    auto root=VRMath::AffineXYZ(*gunFrame);
+    if(!VRGrip::Rigid(root)) return;
+    const float position[3]{},q[4]{0,0,-.70710678f,.70710678f};
+    auto rocket=VRMath::Multiply(VRMath::Pose(position,q),root);
+    rocket[3]=VRMath::Transform(RocketSeat(profile.rocketLoadedDepth),root);
+    *rocketFrame=rocket;
+    ++rocketRenderUpdates;
+}
+bool VRReloadRuntime::HideNativeRocket(const void* entity)
+{
+    if(entity && currentType==18 && guardedWeapon.load() && entity==nativeRocketVisual.load())
+    {++nativeRocketSkips;return true;}
+    return false;
+}
 
 std::array<float,4> VRReloadRuntime::RecoilSettings(unsigned type)
 {
@@ -674,10 +787,20 @@ std::array<float,4> VRReloadRuntime::RecoilSettings(unsigned type)
     if(type!=currentType || !enabled) {const auto defaults=Defaults(type);return {defaults.recoilKick,defaults.recoilSupportScale,defaults.recoilRecovery,defaults.recoilMaximum};}
     return {recoilKick.load(),recoilSupportScale.load(),recoilRecovery.load(),recoilMaximum.load()};
 }
+std::array<float,3> VRReloadRuntime::SupportRotation(unsigned type)
+{
+    const auto value=type==currentType && enabled ? profile:Defaults(type);
+    return {value.supportRotation[0],value.supportRotation[1],value.supportRotation[2]};
+}
+std::array<float,3> VRReloadRuntime::SupportOffset(unsigned type)
+{
+    const auto value=type==currentType && enabled ? profile:Defaults(type);
+    return {value.supportOffset[0],value.supportOffset[1],value.supportOffset[2]};
+}
 std::string VRReloadRuntime::Status()
 {
     return "{\"enabled\":"+std::string(enabled ? "true":"false")+",\"active\":"+(guardedWeapon ? "true":"false")+
-        ",\"assetReady\":"+(definition && magazineBone<boneCount && slideBone<boneCount ? "true":"false")+
+        ",\"assetReady\":"+(definition && magazineBone<boneCount && (currentType==18 || slideBone<boneCount) ? "true":"false")+
         ",\"chambered\":"+(chamberReady ? "true":"false")+",\"magazineInserted\":"+(inserted ? "true":"false")+
         ",\"configRevision\":"+std::to_string(configRevision.load())+",\"configValid\":"+(configValid ? "true":"false")+
         ",\"configPending\":"+(configPending ? "true":"false")+
@@ -689,9 +812,11 @@ std::string VRReloadRuntime::Status()
         ",\"configFile\":\""+ProfileFile(currentType.load())+"\",\"clip\":"+std::to_string(reportedClip.load())+",\"reserve\":"+std::to_string(reportedReserve.load())+
         ",\"heldRounds\":"+std::to_string(reportedHeld.load())+",\"discarded\":"+std::to_string(reportedDiscarded.load())+
         ",\"poseUpdates\":"+std::to_string(poseUpdates.load())+",\"magazineUpdates\":"+std::to_string(magazineUpdates.load())+
+        ",\"nativeRocketVisual\":"+(nativeRocketVisual.load() ? "true":"false")+",\"nativeRocketSkips\":"+std::to_string(nativeRocketSkips.load())+",\"rocketRenderUpdates\":"+std::to_string(rocketRenderUpdates.load())+
         ",\"blockedReloads\":"+std::to_string(blockedReloads.load())+",\"blockedTaskReloads\":"+std::to_string(blockedTaskReloads.load())+
         ",\"magazineRoom\":"+std::to_string(magazineRoom.load())+",\"insertionProgress\":"+std::to_string(insertionProgress.load())+
         ",\"insertionDistance\":"+std::to_string(insertionDistance.load())+
+        ",\"insertionAligned\":"+(insertionAligned ? "true":"false")+
         ",\"ejections\":"+std::to_string(ejections.load())+
         ",\"insertions\":"+std::to_string(insertions.load())+",\"racks\":"+std::to_string(racks.load())+"}";
 }

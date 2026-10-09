@@ -472,7 +472,7 @@ namespace
     }
 
     bool SupportedFirearm(unsigned type)
-    {return type==7 || type==9 || type==13 || type==15 || (type==16 && sniperSpread && delayedRay);}
+    {return type==7 || type==9 || type==13 || type==15 || type==18 || (type==16 && sniperSpread && delayedRay);}
 
     void __stdcall TrackedSniperSpread(void* shooter,const VRMath::Vector* origin,VRMath::Vector* target)
     {
@@ -559,7 +559,8 @@ namespace
         // Carry VR aiming eligibility through the ordinary native branch;
         // do not write the player's aiming flags or multiply base damage.
         auto* event=reinterpret_cast<unsigned char*>(regs.edi);
-        if(!event || !SupportedFirearm(*reinterpret_cast<unsigned*>(event+0xC)) || !OpenXRVR::HasFocusedViews()) return;
+        if(!event || *reinterpret_cast<unsigned*>(event+0xC)==18 ||
+            !SupportedFirearm(*reinterpret_cast<unsigned*>(event+0xC)) || !OpenXRVR::HasFocusedViews()) return;
         auto* shooter=*reinterpret_cast<void**>(event);
         if(!VRHands::Active(shooter)) return;
         ++aimedHeadshotChecks;
@@ -610,7 +611,7 @@ namespace
 
     void ProcessPistolTrigger()
     {
-        // Pistol: one request per squeeze. M4: hold; native Fire limits cadence. No pad
+        // Semiautomatic guns/RPG: one request per squeeze. Automatics: hold; native Fire limits cadence. No pad
         // injection or aiming task; native Fire owns readiness/ammo/cadence.
         OpenXRVR::ControllerInput input{};
         if(!weaponFire || !OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) ||
@@ -850,7 +851,10 @@ namespace
 
     bool ResolveSupportGrip(void* model,unsigned type)
     {
-        if(model==supportModel) return supportReady;
+        static unsigned revision=~0u;
+        const auto currentRevision=VRReloadRuntime::ConfigRevision();
+        if(model==supportModel && revision==currentRevision) return supportReady;
+        revision=currentRevision;
         supportModel=model; supportReady=false;
         // The pistol drawable owns the authored gun_grip / gun_grip2 frames.
         // CPed+B30 and model+CC belong to a different held-entity path.
@@ -880,9 +884,20 @@ namespace
         if(primary<0 || secondary<0) return false;
         primaryGripInverse=VRMath::InverseRigid(VRMath::AffineXYZ(locals[primary]));
         auto support=VRMath::AffineXYZ(locals[secondary]);
+        const auto correction=VRReloadRuntime::SupportRotation(type);
+        const auto position=support[3];
+        for(unsigned a=0;a<3;++a)
+        {
+            const float half=correction[a]*.00872664626f;
+            float p[3]{},q[4]{0,0,0,std::cos(half)};q[a]=std::sin(half);
+            support=VRMath::Multiply(VRMath::Pose(p,q),support);
+        }
+        support[3]=position; // Change the palm orientation without moving its accepted seat.
         // PSG-1 authored support pivot sits above/ahead of the forestock.
         // Adjust in weapon space, once, so recoil and final IK use the same seat.
         if(type==16) {support[3][0]-=.06f;support[3][2]-=.035f;}
+        const auto supportOffset=VRReloadRuntime::SupportOffset(type);
+        for(unsigned axis=0;axis<3;++axis) support[3][axis]+=supportOffset[axis];
         supportRelative=VRMath::Multiply(support,primaryGripInverse);
         for(const auto& row:supportRelative) for(float value:row)
             if(!std::isfinite(value)) return false;

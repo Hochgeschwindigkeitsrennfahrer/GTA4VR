@@ -99,8 +99,8 @@ namespace
             {
                 // Fixed test types only, no address/script execution or save.
                 // Preserve an owned pistol's ammunition when selecting it.
-                if((meleeTestType!=7 && meleeTestType!=9 && meleeTestType!=13 && meleeTestType!=15 && meleeTestType!=16) || !Natives::HasCharGotWeapon(ped,meleeTestType))
-                    Natives::GiveWeaponToChar(ped,meleeTestType,meleeTestType==7 ? 34u:(meleeTestType==9 ? 18u:(meleeTestType==16 ? 20u:((meleeTestType==13 || meleeTestType==15) ? 60u:1u))),false);
+                if((meleeTestType!=7 && meleeTestType!=9 && meleeTestType!=13 && meleeTestType!=15 && meleeTestType!=16 && meleeTestType!=18) || !Natives::HasCharGotWeapon(ped,meleeTestType))
+                    Natives::GiveWeaponToChar(ped,meleeTestType,meleeTestType==7 ? 34u:(meleeTestType==9 ? 18u:(meleeTestType==16 ? 20u:(meleeTestType==18 ? 4u:((meleeTestType==13 || meleeTestType==15) ? 60u:1u)))),false);
                 Natives::SetCurrentCharWeapon(ped,meleeTestType,true);
                 uint32_t selected=~0u;
                 if(!Natives::GetCurrentCharWeapon(ped,&selected) || selected!=meleeTestType) error="native equip readback failed";
@@ -266,6 +266,7 @@ namespace
         else if(command=="rifle-test m4") response=QueueMeleeTest(15);
         else if(command=="smg-test") response=QueueMeleeTest(13);
         else if(command=="sniper-test psg1") response=QueueMeleeTest(16);
+        else if(command=="launcher-test rpg") response=QueueMeleeTest(18);
         else if(command=="melee-test bat" || command=="melee-test cue" || command=="melee-test knife")
             response=QueueMeleeTest(command=="melee-test bat" ? 1u:(command=="melee-test cue" ? 2u:3u));
         else if(command=="hud-capture") {VRHud::Capture();response="{\"ok\":true,\"accepted\":true}";}

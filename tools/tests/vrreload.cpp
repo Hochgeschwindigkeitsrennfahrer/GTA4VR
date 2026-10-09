@@ -5,6 +5,22 @@
 static void Check(bool condition) {if(!condition) std::abort();}
 int main()
 {
+    VRReload::Pistol rocket;
+    rocket.Begin(1,4,1);
+    Check(rocket.Ready() && rocket.inserted && rocket.Clip()==1 && rocket.reserve==3);
+    Check(!rocket.TakeMagazine()); // Cannot acquire a second round into a loaded tube.
+    Check(rocket.Fired() && !rocket.Ready() && !rocket.inserted && rocket.NativeTotal()==3);
+    Check(!rocket.Fired());
+    Check(rocket.TakeMagazine() && rocket.held==1 && rocket.reserve==2 && rocket.Owned()==3);
+    rocket.Rack();Check(!rocket.Ready());
+    Check(rocket.Insert() && rocket.Ready() && rocket.Clip()==1 && rocket.NativeTotal()==3);
+    Check(rocket.Fired());
+    Check(rocket.TakeMagazine());rocket.DropHeld();
+    Check(rocket.discarded==1 && rocket.NativeTotal()==1 && !rocket.Ready());
+    Check(rocket.TakeMagazine());rocket.ReturnHeld();Check(rocket.NativeTotal()==1);
+    auto savedRocket=rocket;Check(savedRocket.Resume(1,1) && !savedRocket.Ready());
+    Check(savedRocket.TakeMagazine() && savedRocket.Insert() && savedRocket.Fired());
+    Check(savedRocket.NativeTotal()==0 && !savedRocket.TakeMagazine());
     VRRecoil::Kick kick; kick.Shot(1000,6,.18f,18);
     Check(std::abs(kick.degrees-6)<.00001f);
     const auto kickPose=VRRecoil::Pose(VRMath::Identity(),VRMath::Identity(),kick.degrees);

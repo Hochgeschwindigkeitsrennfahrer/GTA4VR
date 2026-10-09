@@ -47,7 +47,7 @@ namespace VRReload
             *this={};capacity=clipCapacity;
             clip=std::min({clip,total,capacity});
             chamber=clip>0;magazine=clip-(chamber ? 1u:0u);reserve=total-clip;
-            inserted=true;
+            inserted=capacity==1 ? chamber:true;
         }
         unsigned Clip() const {return magazine+(chamber ? 1u:0u);}
         unsigned NativeTotal() const {return Clip()+reserve;}
@@ -63,12 +63,14 @@ namespace VRReload
         unsigned Eject()
         {
             if(!inserted) return 0;
+            if(capacity==1)
+            {const unsigned lost=chamber ? 1u:0u;discarded+=lost;chamber=false;inserted=false;return lost;}
             const auto lost=magazine;discarded+=lost;magazine=0;inserted=false;
             return lost;
         }
         bool TakeMagazine()
         {
-            if(holding || !capacity || !reserve) return false;
+            if(holding || !capacity || !reserve || (capacity==1 && chamber)) return false;
             // Native clip capacity includes the chamber; retain that limit.
             held=std::min(reserve,capacity-(chamber ? 1u:0u));
             reserve-=held;holding=true;return true;
@@ -76,6 +78,8 @@ namespace VRReload
         bool Insert()
         {
             if(inserted || !holding) return false;
+            if(capacity==1)
+            {chamber=held==1;held=0;holding=false;inserted=chamber;return chamber;}
             magazine=held;held=0;holding=false;inserted=true;return true;
         }
         void ReturnHeld()
@@ -84,6 +88,7 @@ namespace VRReload
         {discarded+=held;held=0;holding=false;}
         void Rack()
         {
+            if(capacity==1) return; // A loaded rocket has no separate chamber operation.
             if(chamber) ++discarded;
             chamber=inserted && magazine>0;
             if(chamber) --magazine;
@@ -91,6 +96,7 @@ namespace VRReload
         bool Fired()
         {
             if(!Ready()) return false;
+            if(capacity==1) {chamber=false;inserted=false;return true;}
             chamber=inserted && magazine>0;
             if(chamber) --magazine;
             return true;
