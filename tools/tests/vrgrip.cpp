@@ -103,7 +103,9 @@ int main()
     shortGrip.Add({0,0,0,1},100);shortGrip.Add({1,0,0,1},110);
     if(shortGrip.Velocity(110,velocity)) return 1;
     Near(VRGrip::ThrowVelocity({}, {8,0,0,0},.5f,900)[0],8);
-    Near(VRGrip::ThrowVelocity({}, {50,0,0,0},.5f,900)[0],10);
+    Near(VRGrip::ThrowVelocity({}, {50,0,0,0},.5f,900)[0],50);
+    Near(VRGrip::ThrowVelocity({}, {3,0,0,0},.5f,900,4)[0],12);
+    Near(VRGrip::ThrowVelocity({}, {3,0,0,0},50,900,4)[0],1.08f);
     Near(VRGrip::ThrowVelocity({}, {8,0,0,0},50,900)[0],1.08f);
     Near(VRGrip::ThrowVelocity({}, {8,0,0,0},50,1800)[0],2.16f);
     Near(VRGrip::ThrowVelocity({3,0,0,0}, {8,0,0,0},0,900)[0],3);

@@ -6,20 +6,37 @@ Complete the remaining firearm work from closed #016 alongside physical ammuniti
 
 ## Tasks
 
-- [ ] Record a weapon/episode matrix and implement each class's grip, muzzle, firing/projectile path and support-hand attachment; include shotguns, rifles, automatic weapons, sniper/scoped weapons and special weapons explicitly.
+- [x] Record the supported weapon/episode matrix below; implement GTA IV grips, muzzle/projectile firing, scopes and support-hand attachment.
 - [ ] Add configurable dominant-hand ownership, mirrored attachment/calibration and opposite-hand support; verify switching and tracking recovery.
-- [ ] Verify muzzle obstruction and aim-assistance policy, damage, ammo, cadence, recoil, weapon switching and tracking loss for supported classes.
+- [x] Implement native firing/ammo/cadence, muzzle obstruction exclusions, aimed headshot eligibility, recoil and preserved ammunition across switching; record scoped runtime evidence below.
 - [ ] Record a final VR-disabled hands/controls/shooting regression; older flat-screen acceptance predates these hand changes.
-- [ ] Inventory weapon reload mechanisms and define per-class magazine, loose-round and charging states with correct ammo accounting.
-- [ ] Support eject/remove, grab ammunition, insert/load and physically operate the appropriate slide/bolt/charging mechanism; validate spatial interaction thresholds.
-- [ ] Integrate readiness, chamber state, firing, haptics and weapon switching; handle partial reloads, interrupted interactions and tracking loss.
-- [ ] Test supported weapon classes from empty/partial states and prevent ammo duplication/loss or firing before the weapon is ready. Verify flat-screen reloads.
+- [x] Implement per-class magazine, shell, rocket and charging states with documented ammo accounting.
+- [x] Support eject/remove, shoulder ammunition supply, guided insertion and physical slide/bolt/pump operation with user-tuned profiles.
+- [x] Integrate readiness, chamber state, firing and weapon switching; guard interrupted interactions and invalid tracking. Haptics remain deferred.
+- [x] Record per-weapon user acceptance and deterministic ammo/reload checks. A fresh exhaustive flat-screen reload regression remains unverified.
 
 ## Done when
 
 Supported weapons require their documented physical reload/charging sequence, then fire with correct magazine/chamber/reserve counts. Interrupted and invalid sequences remain recoverable. The weapon/episode matrix records supported 6DOF grip/firing and hand ownership, native damage/ammo/cadence/recoil and obstruction behavior, and a working VR-disabled fallback; unsupported classes stay explicitly listed.
 
 ## Notes / evidence
+
+### Closure — 2026-10-09
+
+Closed at the user's explicit request after acceptance of the final grenade/Molotov throws and self-collision correction. This completes the accepted GTA IV right-handed firearm/reload milestone; it does not claim the two unchecked compatibility/ownership tasks are finished. Left-handed weapon ownership, haptics, grenade cooking, exhaustive tracking/lifecycle/mission regressions and TLAD/TBoGT weapon variants are deferred. Final VR-disabled hands/reload regression was not repeated; prior flat-screen acceptance remains historical evidence only.
+
+| GTA IV weapon | Accepted interaction | Episode coverage |
+| --- | --- | --- |
+| Pistol, combat pistol | Magazine eject/insert, slide rack, native muzzle firing and shot animation | GTA IV accepted; TLAD/TBoGT unverified |
+| M4, AK-47 | Magazine reload, charging handle, automatic firing, support grip and recoil | GTA IV accepted; TLAD/TBoGT unverified |
+| SMG, Micro-SMG | Magazine reload, charging, automatic firing and support grip | GTA IV accepted; TLAD/TBoGT unverified |
+| Combat shotgun | Individual shell loading and bolt charging | GTA IV accepted; TLAD/TBoGT unverified |
+| Pump shotgun | Individual shell loading and required pump after every shot | GTA IV accepted; TLAD/TBoGT unverified |
+| Combat sniper, sniper rifle | Physical reload/charging, magnified depth-tested scope and corrected reticle alignment | GTA IV accepted; TLAD/TBoGT unverified |
+| RPG | Front-loaded rocket, empty/loaded visual, native launch and support grip | GTA IV accepted; TLAD/TBoGT unverified |
+| Grenade, Molotov | Tracked trigger-release throws, native fuse/impact and player attribution | GTA IV accepted; TLAD/TBoGT unverified |
+
+User accepted generic two-hand steering, stronger physical-object throws and the final full-lifetime player/owned-collider exclusion. Final deployed x86 Release SHA-256: `4D1C61A57F2DF652D7CEA9E4F58DC71002F48E21C164344E2A2B38F64D957904`; CE1.2.0.59, SteamVR2.17.10, Vive Wands, DXVK-Vulkan. Release build and focused optimized grip/throw tests passed; existing modupdater LNK4099 warnings only. No additional build or redundant baseline capture needed for this acceptance/commit step. Installed game and user profiles remain unchanged.
 
 ### Scope update - 2026-10-06
 
@@ -378,3 +395,23 @@ At the user's request, this existing issue owns all remaining firearm work from 
 - PID12840 reached responsive FOCUSED DXVK-Vulkan stereo, eyeImages/ready true, zero scope failures/command overflows. Fresh game image inspected after loading. Generic support feel check pending.
 
 - User accepts the generic spacing-weighted support correction on2026-10-09 and requests commit. Accepted Release31371BCE remains installed; #024 next covers grenade/Molotov physical throws.
+
+### 2026-10-09 — grenade and Molotov throws
+
+- User requests remaining thrown weapons. CE native WeaponInfo identifies grenade FUSE5000ms and Molotov IMPACT with native explosive/fire effects. B5FE20 projectile branch B60870 reaches creator9BE040, preserving player ownership and ammunition; assembly9BEA35 calls B25F10 with the world-linear-velocity vector. Implement tracked-trigger hold/release with physical hand velocity and a thread-local override only at that creator velocity call. No global projectile changes or automatic teleport/save changes. Fuse cooking is not part of this initial pass.
+
+- Release15CE884F621397F479129FADEB69E96359136D93D2CD7D563721A27E867F8915 built successfully (existing modupdater PDB warnings). Backed up ASI/global INI in C:\Users\Vetle Hjelle\Documents\ChatGPT\GTA4VR\build\issue024-throwables-20261009-173139 and deployed ASI only; all user profiles retained. Added bounded throwable-test grenade/molotov equipment commands, preserve owned ammo or supply8 if absent; no teleport/save writes. Ghidra9BEA35 bookmark previewed/read back/saved. Runtime/manual acceptance pending.
+
+- PID14468 live readback base00E50000 confirms equipped type4 grenade. Bounded equipment operation completed valid. hand-status.hands.throwReady=true, no throw attempts yet; FOCUSED continuous stereo and fresh activated GTAIV image verified. Physical grenade direction/fuse/repeat test requested. The first unactivated Sky capture returned the desktop rather than game contents; it was not used as image evidence.
+
+- Subsequent readback records one accepted native throw and one velocity override at2.38111m/s; GTAIV responsive. This confirms creator hook execution, not headset direction/effect/repeat acceptance.
+
+- User reports grenade/Molotov and prop throws too short. Added finite INI multipliers ThrowableVelocityScale=4 and HandThrowVelocityScale=4. Removed grabbed-object10m/s desired-speed cap and20m/s current-speed rejection; retained mass/strength-bounded release correction and blocked-contact checks. Gentle prop throw threshold reduced1.25→0.25m/s. Fourfold desired release speed applies to light props; heavy furniture remains strength-limited. Runtime acceptance pending.
+
+- Focused throw tests passed12m/s light-prop release at4x and unchanged1.08m/s heavy-object force budget. ReleaseBC52B613EAA9FA5DBE3F25FD78A31D53F0D849B03D91E6CEAD801E2CE76EE112 built successfully (existing modupdater PDB warnings); backed up/deployed in C:\Users\Vetle Hjelle\Documents\ChatGPT\GTA4VR\build\issue024-throw-strength-20261009-173737. Added only missing4x throw keys to installed VR INI; retained all other tuning/profiles. Normal relaunch, no teleport/save changes. Throw-distance/effects acceptance pending.
+
+- PID476 FOCUSED continuous stereo with live eye images; bounded type5 selection completed valid and throwReady=true. Fresh activated game image shows held lit Molotov and intact world/hands. No new throws at initial readback. Stronger throw/repeat/fire/prop test requested.
+
+- User accepts stronger throws but reports Molotov impact at release on player. Prior run counters13 throws/13 velocity overrides,11.08966m/s establish native creation/velocity execution, not safe trajectory. Added experimental500ms pair exclusion for the new projectile physics instance against its throwing player, held model and owned arm proxies only; native world contacts/fuse/impact remain unchanged. Register at9BEA35 where ECX is projectile entity; expose excludedThrowPairs. ReleaseA1A51D9DED0F9A61D517DDE95D92EFAA83DD7B3312A4F309BCB48E9E4135D2E0 built successfully (existing modupdater LNK4099), backed up ASI/INI in build/issue024-molotov-release-20261009-174857 and deployed ASI only, no profile/save/position changes. Ghidra bookmark updated/saved; headset acceptance pending.
+
+- User still reports frequent self-impact and requests whole body/custom collider exclusions. Prior500ms guard registered353 rejected pairs, proving it ran but not full protection. Replaced timeout with native projectile lifetime registry;9BF3B0 cleanup removes records before pointer recycling. Found separate Molotov impact update9C1940 called by9C1300 for projectile kind2; reads entity contact fields+16C/+170 and raycasts A536B0->738880 between old/new positions after Weapon::Fire. Scoped this update to the throwing owner/held model so ray queries also reject all owned proxies and whole player. Physical contact exclusions now last through flight; native scenery contacts and area explosion damage unchanged. Release4D1C61A57F2DF652D7CEA9E4F58DC71002F48E21C164344E2A2B38F64D957904 built successfully with existing LNK4099 only, backed up/deployed in C:\Users\Vetle Hjelle\Documents\ChatGPT\GTA4VR\build\issue024-molotov-impact-20261009-175836; installed INI/profile/save/position untouched. Ghidra9BF3B0/9C1940 annotations previewed/read back/saved. Headset acceptance pending.

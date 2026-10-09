@@ -389,6 +389,49 @@ namespace
     using WeaponFire=char (__thiscall*)(void*,void*,const VRMath::Matrix*,const VRMath::Vector*,const VRMath::Vector*,
         uint32_t,uint32_t,uint32_t,uint32_t,float);
     WeaponFire weaponFire=nullptr;
+    SafetyHookMid throwVelocityHook{};
+    SafetyHookInline throwCleanupHook{};
+    SafetyHookInline throwImpactHook{};
+    void __cdecl UpdateThrowImpact(void* record)
+    {
+        void* owner=nullptr;void* held=nullptr;
+        auto* projectile=record ? *reinterpret_cast<void**>(static_cast<char*>(record)+0x10):nullptr;
+        if(VRHandPhysics::ThrowOwner(projectile,owner,held))
+        {
+            // CE9C1940 Molotov update casts A536B0 between old/new positions
+            // outside Weapon::Fire. Keep self filtering through that raycast.
+            VRHandPhysics::WeaponQueryScope query(owner,held);
+            throwImpactHook.ccall<void>(record);
+        }
+        else throwImpactHook.ccall<void>(record);
+    }
+    void __cdecl CleanupThrowable(void* record)
+    {
+        // CE9BF3B0 releases the native projectile record and its entity+10.
+        // Remove immunity before destruction so recycled physics pointers
+        // never inherit another projectile's collision exclusions.
+        if(record) VRHandPhysics::ForgetThrowRelease(*reinterpret_cast<void**>(static_cast<char*>(record)+0x10));
+        throwCleanupHook.ccall<void>(record);
+    }
+    thread_local bool physicalThrow=false;
+    thread_local void* physicalThrowEntity=nullptr;
+    thread_local VRMath::Vector physicalThrowVelocity{};
+    float throwableVelocityScale=4.f;
+    VRGrip::ThrowMotion throwableMotion{};
+    void* throwableOwner=nullptr;
+    void* throwableWeapon=nullptr;
+    bool throwableArmed=false,throwableNeedsRelease=true;
+    std::atomic<unsigned> throwableAttempts=0,throwableShots=0,throwableVelocityOverrides=0;
+    std::atomic<float> throwableSpeed=0;
+
+    void ApplyThrowVelocity(SafetyHookContext& context)
+    {
+        if(!physicalThrow || !context.eax) return;
+        VRHandPhysics::ProtectThrowRelease(reinterpret_cast<void*>(context.ecx),throwableOwner,physicalThrowEntity);
+        auto* velocity=reinterpret_cast<float*>(context.eax);
+        for(unsigned axis=0;axis<3;++axis) velocity[axis]=physicalThrowVelocity[axis];
+        ++throwableVelocityOverrides;
+    }
     SafetyHookInline weaponFireHook{};
     SafetyHookInline bulletHitHook{};
     SafetyHookMid aimedHeadshotHook{};
@@ -505,6 +548,9 @@ namespace
     char __fastcall FireWeapon(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
         const VRMath::Vector* origin,const VRMath::Vector* target,uint32_t force,uint32_t a,uint32_t b,uint32_t c,float damage)
     {
+        const auto throwingType=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
+        if(throwVelocityHook && (throwingType==4 || throwingType==5) && !physicalThrow &&
+            VRHands::Active(shooter) && OpenXRVR::HasFocusedViews()) return 0;
         if(!VRReloadRuntime::CanFire(shooter,weapon)) return 0;
         const auto fired=weaponFireHook.unsafe_fastcall<char>(weapon,edx,shooter,frame,origin,target,force,a,b,c,damage);
         if(fired)
@@ -608,6 +654,54 @@ namespace
             }
         }
         return pistolFireHook.unsafe_fastcall<char>(weapon,edx,shooter,frame,origin,target,flag,extra,damage);
+    }
+
+    void ProcessThrowable()
+    {
+        auto cancel=[] {throwableArmed=false;throwableNeedsRelease=true;throwableMotion={};throwableOwner=nullptr;throwableWeapon=nullptr;};
+        OpenXRVR::ControllerInput input{};
+        if(!weaponFire || !throwVelocityHook || !OpenXRVR::HasFocusedViews() ||
+            !OpenXRVR::GetControllerInput(input) || !input.gripPoseValid[1] ||
+            !input.fireActive || input.phoneActive || Natives::IsPauseMenuActive()) {cancel();return;}
+        void* owner=nullptr;uint64_t at=0;VRMath::Matrix transform{};
+        AcquireSRWLockShared(&targetLock);owner=targetOwner;at=targetAt;transform=trackingToWorld;ReleaseSRWLockShared(&targetLock);
+        if(!owner || !at || GetTickCount64()-at>100) {cancel();return;}
+        void* entity=nullptr;void* weapon=EquippedWeapon(owner,entity);
+        const auto type=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
+        Ped player=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&player);
+        if((type!=4 && type!=5) || !player || Natives::IsCharDead(player) || Natives::IsCharInAnyCar(player)) {cancel();return;}
+        if(throwableOwner!=owner || throwableWeapon!=weapon)
+        {cancel();throwableOwner=owner;throwableWeapon=weapon;}
+        const auto hand=VRMath::Transform({input.gripPosition[1][0],input.gripPosition[1][1],input.gripPosition[1][2],1},transform);
+        throwableMotion.Add(hand,input.sampledAt);
+        if(throwableNeedsRelease) {if(input.fire<.3f) throwableNeedsRelease=false;return;}
+        if(input.fire>=.7f) {throwableArmed=true;return;}
+        if(input.fire>=.3f || !throwableArmed) return;
+        throwableArmed=false;
+        uint32_t ammo=0;Natives::GetAmmoInCharWeapon(player,type,&ammo);
+        if(!ammo) return;
+        auto* modelFrame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
+        if(!modelFrame) return;
+        alignas(16) auto frame=*modelFrame;
+        alignas(16) auto origin=frame[3];origin[3]=1;
+        alignas(16) VRMath::Vector velocity{};
+        throwableMotion.Velocity(input.sampledAt,velocity);
+        for(unsigned axis=0;axis<3;++axis) velocity[axis]*=throwableVelocityScale;
+        for(unsigned axis=0;axis<3;++axis) if(!std::isfinite(origin[axis]+velocity[axis])) return;
+        alignas(16) auto end=origin;
+        for(unsigned axis=0;axis<3;++axis) end[axis]+=velocity[axis];
+        physicalThrowVelocity=velocity;physicalThrowEntity=entity;physicalThrow=true;
+        ++throwableAttempts;throwableSpeed=VRMath::Length3(velocity);
+        VRHandPhysics::WeaponQueryScope query(owner,entity);
+        const bool fired=weaponFire(weapon,owner,&frame,&origin,&end,0,0,0,0,-1.f)!=0;
+        physicalThrow=false;physicalThrowEntity=nullptr;
+        if(fired)
+        {
+            ++throwableShots;
+            // Prepare the next owned throwable; never add reserve ammunition.
+            uint32_t remaining=0;Natives::GetAmmoInCharWeapon(player,type,&remaining);
+            if(remaining) Natives::SetAmmoInClip(player,type,1);
+        }
     }
 
     void ProcessPistolTrigger()
@@ -1398,6 +1492,11 @@ std::string VRHands::Status()
     sprintf_s(swapping,",\"weaponSwapEnabled\":%s,\"weaponSwaps\":%u}",
         weaponSwapEnabled ? "true":"false",weaponSwaps.load());
     result.pop_back(); result+=swapping;
+    result.pop_back();result+=",\"throwReady\":"+std::string(throwVelocityHook ? "true":"false")+
+        ",\"throwAttempts\":"+std::to_string(throwableAttempts.load())+
+        ",\"throws\":"+std::to_string(throwableShots.load())+
+        ",\"throwVelocityOverrides\":"+std::to_string(throwableVelocityOverrides.load())+
+        ",\"throwSpeed\":"+std::to_string(throwableSpeed.load())+"}";
     result.pop_back(); result+=",\"physics\":"+VRHandPhysics::Status()+"}";
     return result;
 }
@@ -1459,6 +1558,8 @@ bool VRHands::Calibrate(unsigned hand)
 void VRHands::Install()
 {
     CIniReader ini("");
+    throwableVelocityScale=ini.ReadFloat("VR","ThrowableVelocityScale",4.f);
+    if(!std::isfinite(throwableVelocityScale)) throwableVelocityScale=4.f;
     if(!ini.ReadInteger("VR","ExperimentalHandIK",0) ||
         !ini.ReadInteger("VR","ExperimentalControllerInput",0)) return;
     auto update=hook::pattern("55 8B EC 83 E4 F0 83 EC 14 53 56 57 FF 35 ? ? ? ? 8B F1 FF 15");
@@ -1534,6 +1635,16 @@ void VRHands::Install()
                     weaponFire=reinterpret_cast<WeaponFire>(dispatch.get_first());
                     weaponFireHook=safetyhook::create_inline(dispatch.get_first(),FireWeapon);
                     FusionFix::onGameProcessEvent() += ProcessPistolTrigger;
+                    auto velocity=hook::pattern("8B 0F 83 C4 08 8D 44 24 10 50 E8 ? ? ? ? 8B 0F 8D 44 24 30 50 E8");
+                    auto cleanup=hook::pattern("83 3D ? ? ? ? 01 0F 84 ? ? ? ? A1 ? ? ? ? 3B 05 ? ? ? ? 0F 85 ? ? ? ? 83 3D ? ? ? ? 12 0F 84 ? ? ? ? 53 56 8B 74 24 0C 57 8B 7E 10 8D 5E 10");
+                    auto impact=hook::pattern("55 8B EC 83 E4 F0 83 EC 78 0F 57 C0 56 8B 75 08 57 8B 46 10 F3 0F 10 88 70 01 00 00 0F 2F C8");
+                    if(velocity.size()==1 && cleanup.size()==1 && impact.size()==1)
+                    {
+                        throwCleanupHook=safetyhook::create_inline(cleanup.get_first(),CleanupThrowable);
+                        throwImpactHook=safetyhook::create_inline(impact.get_first(),UpdateThrowImpact);
+                        throwVelocityHook=safetyhook::create_mid(velocity.get_first(10),ApplyThrowVelocity);
+                        FusionFix::onGameProcessEvent() += ProcessThrowable;
+                    }
                 }
             }
         }

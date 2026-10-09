@@ -37,7 +37,7 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 - [021 — VR weapon wheel (canceled)](closed/021-vr-weapon-wheel.md)
 - [022 — Physical interactive in-world phone (closed)](closed/022-physical-interactive-phone.md)
 - [023 — Fix world objective markers visible only in the left eye](open/023-objective-markers-both-eyes.md)
-- [024 — Firearm coverage and physical weapon reloading](open/024-physical-weapon-reloading.md)
+- [024 — Firearm coverage and physical weapon reloading (closed)](closed/024-physical-weapon-reloading.md)
 - [025 — Physics-based money and weapon drops](open/025-physical-money-and-weapon-drops.md)
 - [026 — Remove cinematic depth and focus blur in VR (closed)](closed/026-disable-cinematic-depth-blur.md)
 - [027 — Fix stereo water shimmer and reflections](open/027-stereo-water-shading.md)

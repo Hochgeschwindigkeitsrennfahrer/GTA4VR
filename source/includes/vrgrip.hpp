@@ -172,12 +172,15 @@ namespace VRGrip
         }
     };
 
-    inline Vector ThrowVelocity(const Vector& current,const Vector& tracked,float mass,float strength)
+    inline Vector ThrowVelocity(const Vector& current,const Vector& tracked,float mass,float strength,float scale=1.f)
     {
-        if(!std::isfinite(mass+strength) || mass<=0 || strength<=0) return current;
+        if(!std::isfinite(mass+strength+scale) || mass<=0 || strength<=0) return current;
         // Transfer at most 60ms of the existing grip's force budget. Heavy
         // furniture cannot acquire the same velocity correction as a mug.
-        const auto delta=Bounded(VRMath::Difference3(Bounded(tracked,10.f),current),strength*.06f/mass);
+        auto requested=tracked;
+        for(unsigned axis=0;axis<3;++axis) requested[axis]*=scale;
+        if(!std::isfinite(VRMath::Length3(requested))) return current;
+        const auto delta=Bounded(VRMath::Difference3(requested,current),strength*.06f/mass);
         auto result=current;
         for(unsigned axis=0;axis<3;++axis) result[axis]+=delta[axis];
         return result;

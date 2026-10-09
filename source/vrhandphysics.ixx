@@ -21,6 +21,9 @@ export namespace VRHandPhysics
     void Publish(void* owner,void* held,unsigned hand,const VRMath::Vector* points,const VRMath::Matrix& wrist,bool supporting);
     void PublishBlade(void* owner,void* held,const VRMath::Vector* world,const VRMath::Vector* tracked,uint64_t sampledAt,const VRMelee::Profile& profile);
     bool IsGrabbing(unsigned hand);
+    void ProtectThrowRelease(void* projectile,void* owner,void* held);
+    void ForgetThrowRelease(void* projectile);
+    bool ThrowOwner(void* projectile,void*& owner,void*& held);
     class WeaponQueryScope
     {
         void* previousOwner;
@@ -42,6 +45,14 @@ namespace
     thread_local void* shotOwner=nullptr;
     thread_local void* shotWeapon=nullptr;
     std::atomic<unsigned> excludedShotQueries=0;
+    struct ReleasedProjectile
+    {
+        std::atomic<void*> entity{},instance{},owner{},held{};
+        std::atomic<bool> active{};
+    } releasedProjectiles[32];
+    unsigned nextReleasedProjectile=0;
+    std::atomic<unsigned> protectedThrows{};
+    std::atomic<unsigned> excludedThrowPairs=0;
     thread_local bool selectingGrab=false;
     thread_local void* punchOwner=nullptr;
     thread_local void* strikeWeapon=nullptr;
@@ -60,7 +71,7 @@ namespace
     std::atomic<void*> player=nullptr,weapon=nullptr;
     std::atomic<unsigned> created=0,removed=0,active=0,updates=0,excludedPairs=0,recoveries=0,limitedDrives=0;
     std::atomic<unsigned> excludedQueries=0;
-    float armForce=250.f,grabForce=900.f,recoveryDistance=.75f,acquisitionRadius=.22f;
+    float armForce=250.f,grabForce=900.f,recoveryDistance=.75f,acquisitionRadius=.22f,throwVelocityScale=4.f;
     constexpr float NodeMass=.15f,Stiffness=400.f,Damping=12.f;
     std::atomic<float> maxError=0;
     void* currentOwner=nullptr;
@@ -219,6 +230,16 @@ namespace
     bool __fastcall CanCollide(void* self,void*,void* other)
     {
         // Called by the native physics workers: no natives, locks or pool walks.
+        if(protectedThrows.load(std::memory_order_relaxed)) for(auto& release:releasedProjectiles)
+        {
+            if(!release.active.load(std::memory_order_acquire)) continue;
+            auto* projectile=release.instance.load(std::memory_order_relaxed);
+            auto* counterpart=self==projectile ? other:(other==projectile ? self:nullptr);
+            if(!counterpart) continue;
+            auto* entity=*reinterpret_cast<void**>(static_cast<char*>(counterpart)+0xC);
+            if(IsProxy(counterpart) || (entity && (entity==release.owner.load() || entity==release.held.load())))
+            {++excludedThrowPairs;return false;}
+        }
         if(IsHeld(self) || IsHeld(other))
         {
             auto* counterpart=IsHeld(self) ? other:self;
@@ -535,11 +556,11 @@ namespace
             if(!std::isfinite(error) || error>.12f) continue;
             auto motion=grab.motion;motion.Add(target[3],now);
             VRMath::Vector tracked{},current{};
-            if(!motion.Velocity(now,tracked) || VRMath::Length3(tracked)<1.25f) continue;
+            if(!motion.Velocity(now,tracked) || VRMath::Length3(tracked)<.25f) continue;
             Natives::GetObjectVelocity(grab.handle,&current[0],&current[1],&current[2]);
             const float speed=VRMath::Length3(current);
-            if(!std::isfinite(speed) || speed>20.f) continue;
-            const auto released=VRGrip::ThrowVelocity(current,tracked,grab.mass,grabForce*(shared ? 2.f:1.f));
+            if(!std::isfinite(speed)) continue;
+            const auto released=VRGrip::ThrowVelocity(current,tracked,grab.mass,grabForce*(shared ? 2.f:1.f),throwVelocityScale);
             // CE A06B00->B25F10 accepts world XYZ without angular setter's
             // frameTime*50 scaling. One write at release; contacts stay native.
             Natives::SetObjectInitialVelocity(grab.handle,released[0],released[1],released[2]);
@@ -1312,6 +1333,39 @@ VRHandPhysics::WeaponQueryScope::WeaponQueryScope(void* owner,void* held):previo
 {shotOwner=owner;shotWeapon=held;}
 VRHandPhysics::WeaponQueryScope::~WeaponQueryScope() {shotOwner=previousOwner;shotWeapon=previousWeapon;}
 
+void VRHandPhysics::ProtectThrowRelease(void* projectile,void* owner,void* held)
+{
+    if(!projectile || !owner) return;
+    auto* instance=*reinterpret_cast<void**>(static_cast<char*>(projectile)+0x38);
+    if(!instance) return;
+    // The native creator calls this on the simulation thread before velocity
+    // installation. Publish identity last; never dereference saved entities.
+    auto& release=releasedProjectiles[nextReleasedProjectile++%32];
+    if(release.active.exchange(false,std::memory_order_acq_rel)) --protectedThrows;
+    release.entity.store(projectile,std::memory_order_relaxed);
+    release.instance.store(instance,std::memory_order_relaxed);
+    release.owner.store(owner,std::memory_order_relaxed);
+    release.held.store(held,std::memory_order_relaxed);
+    release.active.store(true,std::memory_order_release);
+    ++protectedThrows;
+}
+
+void VRHandPhysics::ForgetThrowRelease(void* projectile)
+{
+    if(!projectile) return;
+    for(auto& release:releasedProjectiles)
+        if(release.entity.load(std::memory_order_relaxed)==projectile &&
+            release.active.exchange(false,std::memory_order_acq_rel)) --protectedThrows;
+}
+
+bool VRHandPhysics::ThrowOwner(void* projectile,void*& owner,void*& held)
+{
+    for(auto& release:releasedProjectiles)
+        if(release.active.load(std::memory_order_acquire) && release.entity.load()==projectile)
+        {owner=release.owner.load();held=release.held.load();return owner!=nullptr;}
+    return false;
+}
+
 void VRHandPhysics::PublishBlade(void* owner,void* held,const VRMath::Vector* world,const VRMath::Vector* tracked,uint64_t sampledAt,const VRMelee::Profile& profile)
 {
     if(!enabled || !combatEnabled || !owner || !held || !world || !tracked || !sampledAt ||
@@ -1351,6 +1405,8 @@ std::string VRHandPhysics::Status()
     std::string result=value;result.pop_back();
     return result+",\"shotFilterReady\":"+(rayHook ? "true":"false")+
         ",\"excludedShotQueries\":"+std::to_string(excludedShotQueries.load())+
+        ",\"excludedThrowPairs\":"+std::to_string(excludedThrowPairs.load())+
+        ",\"protectedThrows\":"+std::to_string(protectedThrows.load())+
         ",\"grabEnabled\":"+(grabbingEnabled ? "true":"false")+
         ",\"grabbing\":["+(grabbing[0] ? std::string("true"):std::string("false"))+","+(grabbing[1] ? "true":"false")+
         "],\"grabAttempts\":"+std::to_string(grabAttempts.load())+",\"grabStarts\":"+std::to_string(grabStarts.load())+
@@ -1467,6 +1523,8 @@ void VRHandPhysics::Install()
     }
     armForce=ini.ReadFloat("VR","HandPhysicsArmForce",250.f);
     grabForce=ini.ReadFloat("VR","HandGrabForce",900.f);
+    throwVelocityScale=ini.ReadFloat("VR","HandThrowVelocityScale",4.f);
+    if(!std::isfinite(throwVelocityScale)) throwVelocityScale=4.f;
     acquisitionRadius=ini.ReadFloat("VR","HandGrabRadius",.22f);
     recoveryDistance=ini.ReadFloat("VR","HandPhysicsRecoveryDistance",.75f);
     if(!std::isfinite(armForce)) armForce=250.f;
