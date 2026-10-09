@@ -16,6 +16,7 @@ import vrhands;
 
 export namespace VRCamera
 {
+    bool GenerateOpticalView(const rage::grcViewport& base,const VRMath::Matrix& camera,float verticalDegrees,rage::grcViewport& output);
     void Install();
     void Recenter(); // Atomic request, consumed by the world list builder.
     bool RestartAnchorProbe();
@@ -1300,6 +1301,24 @@ bool VRCamera::GetVehicleHudAnchor(VRMath::Matrix& anchor)
 {
     if(!vehicleHudValid)return false;
     anchor=vehicleHudAnchor;return true;
+}
+
+bool VRCamera::GenerateOpticalView(const rage::grcViewport& base,const VRMath::Matrix& camera,float verticalDegrees,rage::grcViewport& output)
+{
+    if(!setCamera || !setProjection || !base.mIsPerspective || base.mInvertZInProjectionMatrix ||
+        !std::isfinite(verticalDegrees) || verticalDegrees<1 || verticalDegrees>60) return false;
+    const float half=verticalDegrees*.00872664626f;
+    const float aspect=base.mAspect;
+    if(!std::isfinite(aspect) || aspect<=0) return false;
+    const float horizontal=std::atan(std::tan(half)*aspect);
+    const float fov[]{-horizontal,horizontal,half,-half};
+    alignas(16) auto pose=camera;
+    alignas(16) auto projection=VRMath::Projection(fov,.05f,base.mFarClip);
+    alignas(16) rage::grcViewport generated=base;
+    generated.mNearClip=.05f;generated.mFov=verticalDegrees;
+    generated.field_2C8=std::tan(half);generated.field_2CC=std::tan(half)*aspect;
+    setCamera(&generated,pose.data());setProjection(&generated,projection.data());
+    std::memcpy(&output,&generated,sizeof(generated));return true;
 }
 
 bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (&eyes)[2],

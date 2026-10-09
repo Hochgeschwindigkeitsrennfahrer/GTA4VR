@@ -1,9 +1,9 @@
 # Weapon firing animations
 
 Under #024, successful tracked shots on the Glock (type7), combat pistol
-(type9), SMG (type13) and M4 (type15) request the installed Animated Weapons `weapon_fire`
+(type9), SMG (type13), M4 (type15) and combat sniper (type16) request the installed Animated Weapons `weapon_fire`
 clip on the actual held weapon object. Dictionaries are `gun@handgun`,
-`gun@deagle`, `gun@mp5k` and `gun@ak47`, matching this install's weapon data. The mod's
+`gun@deagle`, `gun@mp5k`, `gun@ak47` and `gun@rifle`, matching this install's weapon data. The mod's
 reference implementation uses hash0xDF8E89EB for this same clip.
 
 This adapter uses the game's `PLAY_OBJECT_ANIM` native with nonlooping playback.
@@ -25,9 +25,8 @@ handle,2 means the dictionary was not loaded (requested for subsequent shots),
 3 means native playback was rejected. Zero means no failure or a successful
 request. Initial live shots failed because the handle lookup rejected inline
 object-pool storage. The user accepted visible playback for Glock, combat pistol
-and M4 on 2026-10-07, including manual-rack coexistence. The SMG's native clip
-request also succeeds; its visible playback and reload interaction still await
-headset acceptance.
+and M4 on 2026-10-07, including manual-rack coexistence. The SMG interaction
+is also user-accepted. Combat sniper playback and reload remain pending.
 
 `weapon-animation-test` queues one clip request on the simulation callback,
 under the same tracked/focused/free-hand reload gates. It does not fire or

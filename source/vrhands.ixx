@@ -28,6 +28,7 @@ export namespace VRHands
     bool Calibrate(unsigned hand);
     bool Trim(unsigned hand,int x,int y,int z);
     bool GetWrist(unsigned hand,VRMath::Matrix& world);
+    bool GetScopeGun(VRMath::Matrix& world);
 }
 
 namespace
@@ -50,6 +51,8 @@ namespace
     SRWLOCK wristLock=SRWLOCK_INIT;
     VRMath::Matrix publishedWrists[2]{};
     uint64_t publishedWristAt[2]{};
+    VRMath::Matrix publishedScopeGun{};
+    uint64_t publishedScopeAt=0;
     bool fitBodyHeight=false;
     bool supportGripEnabled=false;
     std::atomic<bool> supportGripping=false,supportReady=false;
@@ -372,6 +375,11 @@ namespace
     std::atomic<bool> fingerClosed[2]{};
     std::atomic<bool> weaponGrip{false};
     SafetyHookInline pistolFireHook{};
+    using SniperSpread=void (__stdcall*)(void*,const VRMath::Vector*,VRMath::Vector*);
+    SniperSpread sniperSpread=nullptr;
+    using DelayedRay=int (__cdecl*)(void*,void*,void*,void**,int,void*,int,int,int,int,int,int,int);
+    DelayedRay delayedRay=nullptr;
+    std::atomic<unsigned> sniperPrecisionShots=0,delayedShotQueries=0;
     using MuzzleLookup=VRMath::Vector* (__thiscall*)(void*,VRMath::Vector*,const VRMath::Matrix*,int);
     MuzzleLookup muzzleLookup=nullptr;
     using WeaponRange=float (__thiscall*)(void*,void*);
@@ -463,7 +471,35 @@ namespace
         return weapon;
     }
 
-    bool SupportedFirearm(unsigned type) {return type==7 || type==9 || type==13 || type==15;}
+    bool SupportedFirearm(unsigned type)
+    {return type==7 || type==9 || type==13 || type==15 || (type==16 && sniperSpread && delayedRay);}
+
+    void __stdcall TrackedSniperSpread(void* shooter,const VRMath::Vector* origin,VRMath::Vector* target)
+    {
+        void* entity=nullptr;void* weapon=nullptr;
+        if(OpenXRVR::HasFocusedViews() && VRHands::Active(shooter) &&
+            (weapon=EquippedWeapon(shooter,entity)) &&
+            *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16)
+        {++sniperPrecisionShots;return;}
+        sniperSpread(shooter,origin,target);
+    }
+
+    int __cdecl TrackedDelayedRay(void* start,void* end,void* previous,void** ignoredShooter,
+        int mode,void* hits,int capacity,int a,int b,int categories,int flags,int c,int d)
+    {
+        // CE D9BF7C: the delayed-bullet update queries collision AFTER Fire
+        // has returned. Its fourth argument points to the retained shooter.
+        void* shooter=ignoredShooter ? *ignoredShooter:nullptr;
+        void* entity=nullptr;
+        if(shooter && VRHands::Active(shooter))
+        {
+            EquippedWeapon(shooter,entity);
+            VRHandPhysics::WeaponQueryScope scope(shooter,entity);
+            ++delayedShotQueries;
+            return delayedRay(start,end,previous,ignoredShooter,mode,hits,capacity,a,b,categories,flags,c,d);
+        }
+        return delayedRay(start,end,previous,ignoredShooter,mode,hits,capacity,a,b,categories,flags,c,d);
+    }
 
     char __fastcall FireWeapon(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
         const VRMath::Vector* origin,const VRMath::Vector* target,uint32_t force,uint32_t a,uint32_t b,uint32_t c,float damage)
@@ -474,7 +510,7 @@ namespace
         {
             VRReloadRuntime::Fired(shooter,weapon);
             const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-            if((type==9 || type==13 || type==15) && VRHands::Active(shooter) &&
+            if((type==9 || type==13 || type==15 || type==16) && VRHands::Active(shooter) &&
                 OpenXRVR::HasFocusedViews())
             {
                 const auto settings=VRReloadRuntime::RecoilSettings(type);
@@ -812,7 +848,7 @@ namespace
         return VRMelee::ClubProfile(type,low,high,profile);
     }
 
-    bool ResolveSupportGrip(void* model)
+    bool ResolveSupportGrip(void* model,unsigned type)
     {
         if(model==supportModel) return supportReady;
         supportModel=model; supportReady=false;
@@ -843,7 +879,11 @@ namespace
         }
         if(primary<0 || secondary<0) return false;
         primaryGripInverse=VRMath::InverseRigid(VRMath::AffineXYZ(locals[primary]));
-        supportRelative=VRMath::Multiply(VRMath::AffineXYZ(locals[secondary]),primaryGripInverse);
+        auto support=VRMath::AffineXYZ(locals[secondary]);
+        // PSG-1 authored support pivot sits above/ahead of the forestock.
+        // Adjust in weapon space, once, so recoil and final IK use the same seat.
+        if(type==16) {support[3][0]-=.06f;support[3][2]-=.035f;}
+        supportRelative=VRMath::Multiply(support,primaryGripInverse);
         for(const auto& row:supportRelative) for(float value:row)
             if(!std::isfinite(value)) return false;
         supportReady=true;
@@ -976,7 +1016,7 @@ namespace
             SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)))
         {
             const auto weaponModelIndex=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
-            if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex]))
+            if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex],*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)))
             {
                 const auto supportTarget=VRMath::Multiply(supportRelative,targets[1]);
                 float distanceSquared=0;
@@ -996,7 +1036,7 @@ namespace
         supportGripping=supporting;
         float kick=0;
         const unsigned recoilType=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
-        const bool recoilWeaponSupported=recoilType==9 || recoilType==13 || recoilType==15;
+        const bool recoilWeaponSupported=recoilType==9 || recoilType==13 || recoilType==15 || recoilType==16;
         const auto recoilSettings=VRReloadRuntime::RecoilSettings(recoilType);
         AcquireSRWLockExclusive(&recoilLock);
         if(!recoilWeaponSupported || recoilOwner!=owner || recoilWeapon!=weapon) {recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;}
@@ -1006,7 +1046,7 @@ namespace
         if(kick>.001f && input.gripPoseValid[1])
         {
             const auto weaponModelIndex=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
-            if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex]))
+            if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex],recoilType))
             {
                 const auto gun=VRMath::Multiply(primaryGripInverse,targets[1]);
                 targets[1]=VRRecoil::Pose(targets[1],gun,kick);
@@ -1167,6 +1207,19 @@ namespace
         // so locomotion with a stationary blade cannot become an attack.
         void* held=nullptr;
         void* weapon=EquippedWeapon(physicsRig.owner,held);
+        AcquireSRWLockExclusive(&wristLock);
+        publishedScopeAt=0;
+        if(physicsRig.valid[1] && held && weapon && supportReady &&
+            *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16 && held==supportWeapon)
+        {
+            auto wrist=publishedWrists[1];
+            if(VRGrip::Rigid(wrist))
+            {
+                publishedScopeGun=VRMath::Multiply(primaryGripInverse,wrist);
+                publishedScopeAt=publishedWristAt[1];
+            }
+        }
+        ReleaseSRWLockExclusive(&wristLock);
         VRMelee::Profile profile{};
         if(held && held==physicsRig.held && weapon && ResolveMeleeProfile(held,
             *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18),profile))
@@ -1206,6 +1259,16 @@ bool VRHands::GetWrist(unsigned hand,VRMath::Matrix& world)
     AcquireSRWLockShared(&wristLock);
     world=publishedWrists[hand];
     const auto at=publishedWristAt[hand];
+    ReleaseSRWLockShared(&wristLock);
+    return at && GetTickCount64()-at<=100;
+}
+
+bool VRHands::GetScopeGun(VRMath::Matrix& world)
+{
+    if(!OpenXRVR::HasFocusedViews()) return false;
+    AcquireSRWLockShared(&wristLock);
+    world=publishedScopeGun;
+    const auto at=publishedScopeAt;
     ReleaseSRWLockShared(&wristLock);
     return at && GetTickCount64()-at<=100;
 }
@@ -1276,6 +1339,9 @@ std::string VRHands::Status()
         corrections[1][0][0],corrections[1][0][1],corrections[1][0][2],corrections[1][1][0],corrections[1][1][1],corrections[1][1][2],corrections[1][2][0],corrections[1][2][1],corrections[1][2][2]);
     std::string result=text;
     result.pop_back();
+    result+=",\"sniperReady\":"+std::string(sniperSpread && delayedRay ? "true":"false")+
+        ",\"sniperPrecisionShots\":"+std::to_string(sniperPrecisionShots.load())+
+        ",\"delayedShotQueries\":"+std::to_string(delayedShotQueries.load());
     char fingers[360];
     sprintf_s(fingers,",\"fingersEnabled\":%s,\"fingerJoints\":[%u,%u],\"fingerUpdates\":[%u,%u],\"closed\":[%s,%s],\"weaponGrip\":%s,\"pistolAimReady\":%s,\"muzzleShots\":%u,\"triggerReady\":%s,\"triggerAttempts\":%u,\"triggerShots\":%u}",
         fingersEnabled ? "true":"false",fingerJointCounts[0].load(),fingerJointCounts[1].load(),
@@ -1388,6 +1454,17 @@ void VRHands::Install()
     if(weaponSwapEnabled) FusionFix::onGameProcessEvent() += ProcessWeaponSwap;
     if(ini.ReadInteger("VR","ExperimentalPistolAim",0))
     {
+        // Fixed native delayed-fire call sites, verified on CE1.2.0.59.
+        // Preserve original spread for non-VR shooters and other weapons.
+        auto sniper=hook::pattern("E8 ? ? ? ? 51 8D 44 24 14 C7 04 24 00 00 7A 44 50 56");
+        auto delayed=hook::pattern("C7 84 24 20 04 00 00 FF FF 00 00 E8 ? ? ? ? 83 C4 34 89 44 24 0C 85 C0");
+        if(sniper.size()==1 && delayed.size()==1)
+        {
+            sniperSpread=reinterpret_cast<SniperSpread>(injector::GetBranchDestination(sniper.get_first()).as_int());
+            delayedRay=reinterpret_cast<DelayedRay>(injector::GetBranchDestination(delayed.get_first(11)).as_int());
+            injector::MakeCALL(sniper.get_first(),TrackedSniperSpread,true);
+            injector::MakeCALL(delayed.get_first(11),TrackedDelayedRay,true);
+        }
         auto fire=hook::pattern("55 8B EC 83 E4 F0 81 EC 68 0F 00 00 A1 ? ? ? ? 33 C4 89 84 24 64 0F 00 00");
         auto muzzle=hook::pattern("55 8B EC 83 E4 F0 83 EC 18 56 8B 75 08 57 8B 7D 0C 89 4C 24 0C 8B 47 30");
         auto range=hook::pattern("FF 71 18 E8 ? ? ? ? D9 40 18 83 C4 04 C2 04 00");

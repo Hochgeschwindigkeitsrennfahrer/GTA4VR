@@ -3,6 +3,7 @@ module;
 #include <wrl/client.h>
 #include <d3dx9shader.h>
 #include "includes/vrmath.hpp"
+#include "includes/vrscope.hpp"
 #include "includes/vrmodelrefs.hpp"
 #include "includes/vrconstantprobe.hpp"
 #include "includes/vrtexturerouting.hpp"
@@ -32,12 +33,14 @@ import vrcamera;
 import d3dx9_43;
 import vrhud;
 import vrhands;
+import vrreload;
 
 export namespace VRStereo
 {
     void Install();
     void Shutdown(); // Render callback thread, never DllMain.
     bool RestartExperiment();
+    bool RequestScopeProbe();
     bool RestartLodProbe();
     bool SetVisibilityTest(bool value);
     bool RequestSphereClassificationProbe();
@@ -103,6 +106,8 @@ namespace
         ComPtr<IDirect3DSurface9> originalBack;
         ComPtr<IDirect3DTexture9> finalTexture[2];
         ComPtr<IDirect3DSurface9> finalSurface[2];
+        ComPtr<IDirect3DSurface9> worldDepth[2];
+        D3DVIEWPORT9 worldViewport[2]{};
         HANDLE shared[2]{};
         std::vector<ComPtr<IDirect3DVertexShader9>> observedShaders;
         ComPtr<IDirect3DVertexShader9> symmetricRayShader,asymmetricRayShader;
@@ -111,6 +116,104 @@ namespace
     // Explicit render-thread ownership; process detach must not invoke driver
     // cleanup under the loader lock. The bridge/reset calls Shutdown instead.
     Resources* resources=nullptr;
+    Resources* scopeResources=nullptr;
+    Resources* mainResources=nullptr;
+    ComPtr<IDirect3DPixelShader9> scopeLensShader;
+    ComPtr<IDirect3DVertexShader9> scopeLensVertexShader;
+    VRScope::Settings scopeSettings{};
+    VRMath::Matrix scopeCamera{};
+    VRMath::Matrix queuedScopeGun{};
+    bool queuedScopeGunValid=false;
+    unsigned scopePoseSamples=0;
+    rage::grcViewport scopeViewport{};
+    bool scopeActive=false,buildingScope=false;
+    float worldTargetAspect=1.f;
+    unsigned scopeConfigRevision=~0u;
+    std::atomic<unsigned> scopeBuilds=0,scopeRenders=0,scopeLensDraws=0,scopeFailures=0;
+    unsigned scopeCompletedFrame=~0u;
+    std::atomic<bool> scopeProbeRequested=false;
+    std::atomic<bool> scopeCaptureRequested=false;
+    unsigned scopeProbeFrames=0;
+    VRMath::Matrix completedScopeCamera{};
+    void Log(const char* message);
+
+    void ReadScopeSettings()
+    {
+        const auto revision=VRReloadRuntime::ConfigRevision();
+        if(revision==scopeConfigRevision) return;
+        scopeConfigRevision=revision;
+        CIniReader ini("VRWeapons/psg1.ini");
+        VRScope::Settings next;
+        bool valid=true;
+        auto read=[&](const char* key,float fallback,float low,float high)
+        {
+            try
+            {
+                const auto text=ini.ReadString("Scope",key,std::to_string(fallback));
+                size_t end=0;const float value=std::stof(text,&end);
+                if(text.find_first_not_of(" \t\r\n",end)!=std::string::npos || !std::isfinite(value) || value<low || value>high)
+                    {char message[256];sprintf_s(message,"Scope config rejected: %s=%s; allowed %.3f..%.3f. Previous settings retained.",key,text.c_str(),low,high);Log(message);valid=false;return fallback;}
+                return value;
+            }
+            catch(...) {char message[160];sprintf_s(message,"Scope config rejected: invalid number for %s. Previous settings retained.",key);Log(message);valid=false;return fallback;}
+        };
+        next.enabled=ini.ReadInteger("Scope","Enabled",1)!=0;
+        next.depthTest=ini.ReadInteger("Scope","DepthTest",1)!=0;
+        next.debugLens=ini.ReadInteger("Scope","DebugLens",0)!=0;
+        next.eyepiece[0]=read("EyepieceX",next.eyepiece[0],-.5f,.5f);
+        next.eyepiece[1]=read("EyepieceY",next.eyepiece[1],-.2f,.2f);
+        next.eyepiece[2]=read("EyepieceZ",next.eyepiece[2],-.2f,.4f);
+        next.radius=read("LensRadius",next.radius,.005f,.06f);
+        next.surfaceOffset=read("LensSurfaceOffset",next.surfaceOffset,0,.05f);
+        next.eyeRelief=read("EyeRelief",next.eyeRelief,.04f,.5f);
+        // A broad eye box is useful during live lens-placement tuning.
+        next.eyeBox=read("EyeBoxRadius",next.eyeBox,.01f,1.5f);
+        next.verticalFov=read("VerticalFovDegrees",next.verticalFov,1,60);
+        if(valid) scopeSettings=next;else ++scopeFailures;
+    }
+
+    bool CreateScopeResources(IDirect3DDevice9* device)
+    {
+        if(scopeResources) return true;
+        if(!resources) return false;
+        // One world view, no additional OpenXR swapchain or shared handle.
+        // Keep native dimensions until all fullscreen screen-size constants
+        // can be scaled together; only render while the eyepiece is in use.
+        auto owned=std::make_unique<Resources>();
+        owned->originalBack=resources->originalBack;
+        D3DSURFACE_DESC back{};
+        if(FAILED(owned->originalBack->GetDesc(&back)) ||
+            FAILED(device->CreateTexture(back.Width,back.Height,1,D3DUSAGE_RENDERTARGET,
+                D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&owned->finalTexture[0],nullptr)) ||
+            FAILED(owned->finalTexture[0]->GetSurfaceLevel(0,&owned->finalSurface[0]))) return false;
+        // The routing cache recognizes both stereo slots, including every
+        // depth mip. Alias its unused slot to the single optical view; this
+        // adds references, not another allocation or another rendered camera.
+        owned->finalTexture[1]=owned->finalTexture[0];owned->finalSurface[1]=owned->finalSurface[0];
+        for(const auto& source:resources->targets)
+        {
+            Target target;target.name=source.name;target.original=source.original;
+            target.originalSurface=source.originalSurface;target.originalMips=source.originalMips;
+            D3DSURFACE_DESC desc{};
+            if(FAILED(target.original->GetLevelDesc(0,&desc)) ||
+                FAILED(device->CreateTexture(desc.Width,desc.Height,target.original->GetLevelCount(),desc.Usage,
+                    desc.Format,D3DPOOL_DEFAULT,&target.texture[0],nullptr)) ||
+                FAILED(target.texture[0]->GetSurfaceLevel(0,&target.surface[0]))) return false;
+            target.eyeMips[0].resize(target.originalMips.size());
+            if(desc.Usage&D3DUSAGE_RENDERTARGET)
+                device->StretchRect(target.originalSurface.Get(),nullptr,target.surface[0].Get(),nullptr,D3DTEXF_NONE);
+            for(unsigned level=0;level<target.originalMips.size();++level)
+            {
+                if(FAILED(target.texture[0]->GetSurfaceLevel(level+1,&target.eyeMips[0][level]))) return false;
+                if(desc.Usage&D3DUSAGE_RENDERTARGET)
+                    device->StretchRect(target.originalMips[level].Get(),nullptr,target.eyeMips[0][level].Get(),nullptr,D3DTEXF_NONE);
+            }
+            target.texture[1]=target.texture[0];target.surface[1]=target.surface[0];
+            target.eyeMips[1]=target.eyeMips[0];
+            owned->targets.push_back(std::move(target));
+        }
+        scopeResources=owned.release();return true;
+    }
 
     // No polling loop or FLUSH: consume completed older samples and skip a
     // full ring. Query allocation happens once, during the first capture.
@@ -198,6 +301,7 @@ namespace
     unsigned publishedFrame=0;
     OpenXRVR::EyeView completedViews[2]{};
     VRMath::Matrix completedViewProjection[2]{};
+    VRMath::Vector completedLogDepth[2]{};
     VRMath::Vector completedEyePosition[2]{};
     VRMath::Matrix completedEyeCamera[2]{};
     VRMath::Matrix completedWrist[2]{};
@@ -218,6 +322,8 @@ namespace
     std::atomic<bool> restartRequested{false},captureNextPair{false};
     SafetyHookInline sceneSetup{},drawSetup{},renderFrame{},buildFrame{};
     SafetyHookInline pedRender{};
+    SafetyHookInline scopeObjectRender{};
+    std::atomic<unsigned> scopeHiddenObjects=0;
     SafetyHookInline playerDrawCtor{},playerDrawExecute{},playerDrawDestroy{};
     SafetyHookInline retainModel{};
     VRModelRefs::Batch modelReferences[4]{};
@@ -366,6 +472,34 @@ namespace
     thread_local bool rayShaderBound=false;
     float originalRayConstants[4]{},eyeRayConstants[4]{};
 
+    // Native commands update RAGE's software state cache as they execute.
+    // Restoring an earlier D3D9 state block here would rewind only the device,
+    // leaving that cache inconsistent. Rebind(-1) restores routed resources
+    // and native shader registers; retain the native pass's final state and
+    // restore only our view-selection and first-eye sampling bookkeeping.
+    struct ScopeState
+    {
+        float cascade[4]{},ray[4]{},camera[16]{};
+        DWORD mipFilters[16]{};
+        bool mipValid[16]{};
+        bool Capture(IDirect3DDevice9*)
+        {
+            std::memcpy(cascade,cascadeForward,sizeof(cascade));
+            std::memcpy(ray,eyeRayConstants,sizeof(ray));
+            std::memcpy(camera,expectedCamera,sizeof(camera));
+            std::memcpy(mipFilters,gbufferMipFilters,sizeof(mipFilters));
+            std::memcpy(mipValid,gbufferMipValid,sizeof(mipValid));
+            return true;
+        }
+        void Restore(IDirect3DDevice9*)
+        {
+            std::memcpy(cascadeForward,cascade,sizeof(cascade));
+            std::memcpy(eyeRayConstants,ray,sizeof(ray));
+            std::memcpy(expectedCamera,camera,sizeof(camera));
+            std::memcpy(gbufferMipFilters,mipFilters,sizeof(mipFilters));
+            std::memcpy(gbufferMipValid,mipValid,sizeof(mipValid));
+        }
+    } scopeState;
     void Log(const char* message)
     {
         wchar_t path[MAX_PATH]{};
@@ -1625,7 +1759,7 @@ namespace
 
     HRESULT WINAPI SetVertexShader(IDirect3DDevice9* self,IDirect3DVertexShader9* shader)
     {
-        if(GetCurrentThreadId()!=routingThread || !resources)
+        if(composingHud || GetCurrentThreadId()!=routingThread || !resources)
             return setVertexShader.unsafe_stdcall<HRESULT>(self,shader);
         if(renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
         // Restore the engine's register before another lighting shader uses
@@ -1692,6 +1826,7 @@ namespace
 
     HRESULT WINAPI SetVertexConstants(IDirect3DDevice9* self,UINT start,const float* data,UINT count)
     {
+        if(composingHud) return setVertexConstants.unsafe_stdcall<HRESULT>(self,start,data,count);
         if(binderDevice)
         {
             if(self==binderDevice && binderConstants.Write(start,data,count))return S_OK;
@@ -1874,7 +2009,7 @@ namespace
 
     HRESULT WINAPI SetPixelShader(IDirect3DDevice9* device,IDirect3DPixelShader9* shader)
     {
-        if(GetCurrentThreadId()!=routingThread || !resources)
+        if(composingHud || GetCurrentThreadId()!=routingThread || !resources)
             return setPixelShader.unsafe_stdcall<HRESULT>(device,shader);
         if(renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
         if(cascadeShaderBound)
@@ -1929,6 +2064,7 @@ namespace
 
     HRESULT WINAPI SetPixelConstants(IDirect3DDevice9* device,UINT start,const float* data,UINT count)
     {
+        if(composingHud) return setPixelConstants.unsafe_stdcall<HRESULT>(device,start,data,count);
         if(!cascadeShaderBound && !constantProbeActive)
             return ObserveStateCall(VRProfile::StateKind::PixelConstants,
                 [&](){return setPixelConstants.unsafe_stdcall<HRESULT>(device,start,data,count);});
@@ -1976,20 +2112,25 @@ namespace
         int eye;
         unsigned stage,frame;
         bool begin;
+        bool optical;
         OpenXRVR::EyeView views[2]{};
         float camera[16]{};
         VRMath::Matrix viewProjection{},wristSnapshot{},dashboardSnapshot{};
         bool wristValid=false,dashboardValid=false;
         float shadowForward[4]{};
+        float opticalRay[4]{};
+        VRMath::Vector logDepth{};
         long long poseTime;
     public:
-        EyeMarker(int value,unsigned role,unsigned id,bool start):CBaseDC(),eye(value),stage(role),frame(id),begin(start),poseTime(viewTime)
+        EyeMarker(int value,unsigned role,unsigned id,bool start):CBaseDC(),eye(value),stage(role),frame(id),begin(start),optical(buildingScope),poseTime(viewTime)
         {views[0]=xrViews[0]; views[1]=xrViews[1]; std::memcpy(camera,eyeViewports[value].mViewInverseMatrix,sizeof(camera));
          std::memcpy(shadowForward,gameShadowForward,sizeof(shadowForward));
          VRMath::Matrix cameraWorld{},projection{};
          std::memcpy(cameraWorld.data(),eyeViewports[value].mViewInverseMatrix,sizeof(cameraWorld));
          std::memcpy(projection.data(),eyeViewports[value].mProjectionMatrix,sizeof(projection));
+         opticalRay[0]=1.f/projection[0][0];opticalRay[1]=1.f/projection[1][1];
          viewProjection=VRMath::Multiply(VRMath::InverseRigid(cameraWorld),projection);
+         logDepth=VRScope::DepthParameters(eyeViewports[value].mNearClip,eyeViewports[value].mFarClip);
          wristValid=VRHands::GetWrist(0,wristSnapshot);
          dashboardValid=VRCamera::GetVehicleHudAnchor(dashboardSnapshot);}
         int32_t GetSize() override {return sizeof(EyeMarker);}
@@ -1998,6 +2139,78 @@ namespace
             if(!ready || !RageDirect3DDevice9::m_pRealDevice) return;
             auto* device=*RageDirect3DDevice9::m_pRealDevice;
             if(!device) return;
+            if(optical)
+            {
+                if(scopeRenders.load()<3)
+                {
+                    char line[120];sprintf_s(line,"scope execute frame=%u stage=%u begin=%u",frame,stage,begin);Log(line);
+                }
+                if(begin && stage==1)
+                {
+                    if(!scopeState.Capture(device)) {++scopeFailures;return;}
+                    // Switch only on the command executor, after returning
+                    // bound eye surfaces to their native identities.
+                    Rebind(device,-1);
+                    mainResources=resources;
+                    if(!CreateScopeResources(device)) {++scopeFailures;mainResources=nullptr;scopeState.Restore(device);return;}
+                    scopeResources->symmetricRayShader=resources->symmetricRayShader;
+                    scopeResources->asymmetricRayShader=resources->asymmetricRayShader;
+                    scopeResources->cascadeShaders=resources->cascadeShaders;
+                    resources=scopeResources;
+                }
+                if(resources!=scopeResources) return;
+                constantProbeActive=routingProbeActive=normalProbeActive=false;
+                stateProbeActive=drawProbeActive=false;
+                textureCacheBypass=false;
+                renderEye=begin ? 0:-1;renderStage=begin ? stage:0;
+                routingPhaseGeneration=begin && GetCurrentThreadId()==routingThread ? routingGeneration.load(std::memory_order_relaxed):0;
+                if(begin)
+                {
+                    std::memcpy(expectedCamera,camera,sizeof(camera));
+                    std::memcpy(cascadeForward,shadowForward,sizeof(shadowForward));
+                    std::memcpy(eyeRayConstants,opticalRay,sizeof(opticalRay));
+                    if(stage==1) PrepareGBufferMipFilters(device,0);
+                }
+                if(!begin && scopeCaptureRequested.load())
+                {
+                    ComPtr<IDirect3DSurface9> current;device->GetRenderTarget(0,&current);
+                    char line[220];sprintf_s(line,"scope output stage=%u target=%p final=%p main=%p,%p",stage,current.Get(),
+                        scopeResources->finalSurface[0].Get(),mainResources->finalSurface[0].Get(),mainResources->finalSurface[1].Get());Log(line);
+                }
+                Rebind(device,renderEye);
+                if(!begin && stage==3)
+                {
+                    scopeCompletedFrame=frame;
+                    std::memcpy(completedScopeCamera.data(),camera,sizeof(camera));
+                    ++scopeRenders;
+                    if(scopeCaptureRequested.exchange(false))
+                    {
+                        captureNextPair=true; // Include one scene-depth/lens comparison.
+                        wchar_t path[MAX_PATH]{};GetModuleFileNameW(nullptr,path,MAX_PATH);
+                        if(auto* last=wcsrchr(path,L'\\')) last[1]=0;
+                        wcscat_s(path,L"plugins\\GTAIV.VR.scope.bmp");
+                        const bool wasComposing=composingHud;composingHud=true;
+                        const auto result=D3DXSaveSurfaceToFileW(path,D3DXIFF_BMP,scopeResources->finalSurface[0].Get(),nullptr,nullptr);
+                        composingHud=wasComposing;
+                        char line[120];sprintf_s(line,"scope source capture frame=%u result=%08X",frame,unsigned(result));Log(line);
+                        for(const auto& target:scopeResources->targets)
+                        {
+                            if(target.name!="_DEFERRED_GBUFFER_0_" && !target.name.starts_with("FullScreen")) continue;
+                            wchar_t targetPath[MAX_PATH]{};GetModuleFileNameW(nullptr,targetPath,MAX_PATH);
+                            if(auto* last=wcsrchr(targetPath,L'\\'))last[1]=0;
+                            std::wstring name(target.name.begin(),target.name.end());
+                            wcscat_s(targetPath,(L"plugins\\GTAIV.VR.scope-"+name+L".bmp").c_str());
+                            composingHud=true;
+                            const auto saved=D3DXSaveSurfaceToFileW(targetPath,D3DXIFF_BMP,target.surface[0].Get(),nullptr,nullptr);
+                            composingHud=wasComposing;
+                            sprintf_s(line,"scope intermediate %s result=%08X",target.name.c_str(),unsigned(saved));Log(line);
+                        }
+                    }
+                    resources=mainResources;mainResources=nullptr;
+                    scopeState.Restore(device);
+                }
+                return;
+            }
             if(begin && stage==1 && eye==0)
             {
                 UpdateCpuOmission();
@@ -2151,6 +2364,11 @@ namespace
             routingProbeActive=begin && stage>=1 && stage<=3 && phaseStart[eye][stage-1].epoch!=0;
             textureCacheBypass=begin && VRProfile::TextureLinearEnabled();
             if(begin && stage==1) PrepareGBufferMipFilters(device,eye);
+            if(!begin && stage==1)
+            {
+                device->GetDepthStencilSurface(&resources->worldDepth[eye]);
+                device->GetViewport(&resources->worldViewport[eye]);
+            }
             renderEye=begin ? eye : -1;
             renderStage=begin ? stage : 0;
             routingPhaseGeneration=begin && GetCurrentThreadId()==routingThread ?
@@ -2189,6 +2407,7 @@ namespace
                 if(completedFrame!=frame) {completedFrame=frame; completedEyes=0;}
                 completedEyes|=1u<<eye;
                 completedViewProjection[eye]=viewProjection;
+                completedLogDepth[eye]=logDepth;
                 std::memcpy(completedEyeCamera[eye].data(),camera,sizeof(camera));
                 completedWrist[eye]=wristSnapshot;completedWristValid[eye]=wristValid;
                 completedDashboard[eye]=dashboardSnapshot;completedDashboardValid[eye]=dashboardValid;
@@ -2304,13 +2523,43 @@ namespace
         return playerDrawDestroy.unsafe_fastcall<void*>(self,edx,flags);
     }
 
+    uint32_t __fastcall ScopeObjectRender(void* self,void* edx,uint32_t shader,
+        uint32_t flags,uint32_t alpha,uint32_t unknown)
+    {
+        // CE CObject virtual +8C, B12E80: thiscall, four arguments, RET10.
+        // Skip the owned rifle/magazine before generating scope draw commands.
+        // Main eyes and shared shadow/reflection builds retain these objects.
+        if(buildingScope && buildingStage && VRReloadRuntime::IsScopeOccluder(self))
+        {++scopeHiddenObjects;return 0;}
+        const auto result=scopeObjectRender.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
+        // The attachment can update after SceneSetup. Capture the object
+        // transform at the actual main-eye command-building call, so the
+        // optical view and aperture use the pose queued for the rifle.
+        if(scopeSettings.enabled && !buildingScope && buildingEye==0 && buildingStage==1 && VRReloadRuntime::IsScopeGun(self))
+        {
+            VRMath::Matrix gun{};
+            if(VRReloadRuntime::GetRenderedSniperPose(gun))
+            {
+                queuedScopeGun=gun;queuedScopeGunValid=true;
+                if(scopePoseSamples++<8)
+                {
+                    const auto current=VRScope::Camera(gun,scopeSettings);
+                    char line[180];sprintf_s(line,"scope queued pose delta=%.6g,%.6g,%.6g frame=%u",
+                        current[3][0]-scopeCamera[3][0],current[3][1]-scopeCamera[3][1],current[3][2]-scopeCamera[3][2],gameFrame);Log(line);
+                }
+            }
+        }
+        return result;
+    }
+
     uint32_t __fastcall PedRender(void* self,void* edx,uint32_t shader,
         uint32_t flags,uint32_t alpha,uint32_t unknown)
     {
         // CE CPed virtual +0x8C builds entity draw commands (ret 0x10).
         // Restrict filtering to the two world streams; shared shadows and
         // auxiliary views retain the character. Never alter entity flags.
-        if(buildingEye>=0 && buildingStage && VRCamera::HideLocalCharacter(self))
+        if(buildingEye>=0 && buildingStage && (VRCamera::HideLocalCharacter(self) ||
+            (buildingScope && VRCamera::ShowLocalBody(self))))
         {
             ++hiddenPlayerCalls[buildingEye];
             return 0;
@@ -2387,6 +2636,22 @@ namespace
             D3DLOCKED_RECT locked{};
             if(!Check("depth sample lock",staging->LockRect(&locked,nullptr,D3DLOCK_READONLY))) continue;
             float low=INFINITY,high=-INFINITY;
+            if(scopeResources && scopeCompletedFrame==completedFrame)
+            {
+                const auto world=VRMath::Transform({0,0,scopeSettings.surfaceOffset,1},completedScopeCamera);
+                const auto clip=VRMath::Transform(world,completedViewProjection[eye]);
+                if(std::isfinite(clip[0]+clip[1]+clip[2]+clip[3]) && clip[3]>.01f)
+                {
+                    const float x=(clip[0]/clip[3]+1)*desc.Width*.5f;
+                    const float y=(1-clip[1]/clip[3])*desc.Height*.5f;
+                    if(x>=0 && y>=0 && x<desc.Width && y<desc.Height)
+                    {
+                        float scene=0;std::memcpy(&scene,static_cast<unsigned char*>(locked.pBits)+unsigned(y)*locked.Pitch+unsigned(x)*4,4);
+                        char line[256];sprintf_s(line,"scope depth comparison eye=%u pixel=%u,%u lensNdc=%.9g lensLogDepth=%.9g sceneLogDepth=%.9g lensW=%.9g",
+                            eye,unsigned(x),unsigned(y),clip[2]/clip[3],VRScope::EncodeDepth(clip[3],completedLogDepth[eye]),scene,clip[3]);Log(line);
+                    }
+                }
+            }
             unsigned valid=0;
             unsigned long long hash=14695981039346656037ull;
             for(unsigned y=0;y<desc.Height;++y)
@@ -2526,6 +2791,127 @@ namespace
         }
     }
 
+    void DrawScopeLens(IDirect3DDevice9* device,unsigned eye)
+    {
+        if(!scopeResources || scopeCompletedFrame!=completedFrame || !scopeSettings.enabled ||
+            !VRScope::InEyeBox(completedScopeCamera,completedEyePosition[eye],scopeSettings)) return;
+        if(!scopeLensShader)
+        {
+            constexpr char code[]=
+                "sampler2D scene:register(s0);float4 parameters:register(c0);float4 logDepth:register(c1);"
+                "struct Output{float4 color:COLOR0;float depth:DEPTH;};"
+                "Output main(float2 uv:TEXCOORD0,float2 clipDepth:TEXCOORD1){"
+                "float2 p=uv*2-1;clip(1-dot(p,p));"
+                "float4 color=tex2D(scene,float2(.5+(uv.x-.5)*parameters.x,uv.y));"
+                "float crosshair=(min(abs(p.x),abs(p.y))<.008 && max(abs(p.x),abs(p.y))<.65);"
+                "Output o;o.color=float4(lerp(lerp(color.rgb,float3(0,0,0),crosshair),float3(0,1,0),parameters.y),1);"
+                "o.depth=saturate(log2(clipDepth.y*logDepth.x)*logDepth.y);return o;}";
+            ComPtr<ID3DXBuffer> compiled,errors;
+            if(FAILED(D3DXCompileShader(code,sizeof(code)-1,nullptr,nullptr,"main","ps_3_0",0,&compiled,&errors,nullptr)) ||
+                FAILED(device->CreatePixelShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&scopeLensShader)))
+                {++scopeFailures;return;}
+        }
+        if(!scopeLensVertexShader)
+        {
+            constexpr char code[]=
+                "row_major float4x4 vp:register(c0);"
+                "struct Output{float4 position:POSITION;float2 uv:TEXCOORD0;float2 clipDepth:TEXCOORD1;};"
+                "Output main(float3 position:POSITION,float2 uv:TEXCOORD0){"
+                "Output o;o.position=mul(float4(position,1),vp);o.uv=uv;o.clipDepth=o.position.zw;return o;}";
+            ComPtr<ID3DXBuffer> compiled,errors;
+            if(FAILED(D3DXCompileShader(code,sizeof(code)-1,nullptr,nullptr,"main","vs_3_0",0,&compiled,&errors,nullptr)) ||
+                FAILED(device->CreateVertexShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&scopeLensVertexShader)))
+                {++scopeFailures;return;}
+        }
+        ComPtr<IDirect3DStateBlock9> state;
+        ComPtr<IDirect3DSurface9> targets[4],depth,lensDepth;
+        D3DVIEWPORT9 viewport{};D3DSURFACE_DESC desc{};
+        if(FAILED(resources->finalSurface[eye]->GetDesc(&desc))) return;
+        // The native deferred renderer keeps geometry depth in GBuffer3
+        // (INTZ). The attachment left bound after the scene phase can instead
+        // be its stencil/post-process buffer and is not authoritative depth.
+        // Prefer the named geometry surface, validating that it really is a
+        // compatible depth attachment on this backend.
+        for(const auto& target:resources->targets)
+        {
+            if(target.name!="_DEFERRED_GBUFFER_3_") continue;
+            D3DSURFACE_DESC candidate{};
+            if(SUCCEEDED(target.surface[eye]->GetDesc(&candidate)) && (candidate.Usage&D3DUSAGE_DEPTHSTENCIL) &&
+                candidate.Width==desc.Width && candidate.Height==desc.Height)
+                lensDepth=target.surface[eye];
+        }
+        if(!lensDepth)
+        {
+            D3DSURFACE_DESC candidate{};
+            if(resources->worldDepth[eye] && SUCCEEDED(resources->worldDepth[eye]->GetDesc(&candidate)) &&
+                candidate.Width==desc.Width && candidate.Height==desc.Height)
+                lensDepth=resources->worldDepth[eye];
+        }
+        for(const auto& target:resources->targets)
+        {
+            if(lensDepth) break;
+            D3DSURFACE_DESC candidate{};
+            if(SUCCEEDED(target.surface[eye]->GetDesc(&candidate)) && (candidate.Usage&D3DUSAGE_DEPTHSTENCIL) &&
+                candidate.Width==desc.Width && candidate.Height==desc.Height)
+                {lensDepth=target.surface[eye];break;}
+        }
+        // The lens obeys scene depth rather than displaying over walls.
+        if(!lensDepth && scopeSettings.depthTest) {++scopeFailures;return;}
+        struct Vertex {float x,y,z,u,v;};Vertex vertices[4]{};
+        for(unsigned i=0;i<4;++i)
+        {
+            const float u=(i&1) ? 1.f:0.f,v=(i&2) ? 1.f:0.f;
+            const auto world=VRMath::Transform({(u-.5f)*scopeSettings.radius*2,
+                (.5f-v)*scopeSettings.radius*2,scopeSettings.surfaceOffset,1},completedScopeCamera);
+            if(!std::isfinite(world[0]+world[1]+world[2])) return;
+            vertices[i]={world[0],world[1],world[2],u,v};
+        }
+        if(FAILED(device->CreateStateBlock(D3DSBT_ALL,&state)) || FAILED(state->Capture())) return;
+        for(unsigned i=0;i<4;++i) device->GetRenderTarget(i,&targets[i]);
+        device->GetDepthStencilSurface(&depth);device->GetViewport(&viewport);
+        for(unsigned i=1;i<4;++i) device->SetRenderTarget(i,nullptr);
+        device->SetDepthStencilSurface(nullptr);device->SetRenderTarget(0,resources->finalSurface[eye].Get());
+        if(FAILED(device->SetDepthStencilSurface(lensDepth.Get())))
+        {
+            ++scopeFailures;
+            for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
+            device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
+            return;
+        }
+        // Use the geometry pass's depth range, not an assumed 0..1 range.
+        // Keep homogeneous projection on the GPU so a near-plane crossing
+        // clips the aperture rather than rejecting its entire CPU quad.
+        const auto& worldViewport=resources->worldViewport[eye];
+        const D3DVIEWPORT9 full{0,0,desc.Width,desc.Height,worldViewport.MinZ,worldViewport.MaxZ};device->SetViewport(&full);
+        device->SetVertexShader(scopeLensVertexShader.Get());device->SetPixelShader(scopeLensShader.Get());
+        device->SetVertexShaderConstantF(0,completedViewProjection[eye][0].data(),4);
+        device->SetFVF(D3DFVF_XYZ|D3DFVF_TEX1);device->SetTexture(0,scopeResources->finalTexture[0].Get());
+        if(scopeRenders.load()<4)
+        {
+            char line[200];sprintf_s(line,"scope lens eye=%u geometryDepth=%p phaseEndDepth=%p depthRange=%.6f..%.6f",eye,lensDepth.Get(),resources->worldDepth[eye].Get(),full.MinZ,full.MaxZ);Log(line);
+        }
+        const float parameters[]{float(desc.Height)/desc.Width,scopeSettings.debugLens ? 1.f:0.f,0,0};device->SetPixelShaderConstantF(0,parameters,1);
+        device->SetPixelShaderConstantF(1,completedLogDepth[eye].data(),1);
+        device->SetRenderState(D3DRS_ZENABLE,scopeSettings.depthTest);device->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);
+        device->SetRenderState(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
+        // Native material draws can leave a depth bias behind. The aperture
+        // has its own physical surface offset and must use unbiased depth.
+        device->SetRenderState(D3DRS_DEPTHBIAS,0);
+        device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS,0);
+        device->SetRenderState(D3DRS_FOGENABLE,FALSE);device->SetRenderState(D3DRS_CLIPPLANEENABLE,0);
+        device->SetRenderState(D3DRS_STENCILENABLE,FALSE);device->SetRenderState(D3DRS_SCISSORTESTENABLE,FALSE);
+        device->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE);device->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
+        device->SetRenderState(D3DRS_COLORWRITEENABLE,15);device->SetRenderState(D3DRS_SRGBWRITEENABLE,FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE);device->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE);
+        device->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);device->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
+        device->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_NONE);device->SetSamplerState(0,D3DSAMP_SRGBTEXTURE,FALSE);
+        device->SetSamplerState(0,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);device->SetSamplerState(0,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);
+        if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) ++scopeLensDraws;else ++scopeFailures;
+        device->SetDepthStencilSurface(nullptr);
+        for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
+        device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
+    }
+
     void PublishEyes(IDirect3DDevice9* device)
     {
         if(!submit || !resources || completedEyes!=3 || publishedFrame==completedFrame) return;
@@ -2535,6 +2921,7 @@ namespace
         VRProfile::Scope profile(VRProfile::Metric::Publish);
         VRHud::CaptureRadar(device,resources->originalBack.Get());
         composingHud=true;
+        for(unsigned eye=0;eye<2;++eye) DrawScopeLens(device,eye);
         for(unsigned eye=0;eye<2;++eye) VRHud::Draw(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],completedEyePosition[eye],completedWristValid[eye] ? &completedWrist[eye]:nullptr,completedDashboardValid[eye] ? &completedDashboard[eye]:nullptr);
         const auto hudPose=VRMath::BlendRigidPose(completedEyeCamera[0],completedEyeCamera[1],.5f);
         for(unsigned eye=0;eye<2;++eye) VRHud::DrawOverlay(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],hudPose);
@@ -2603,6 +2990,7 @@ namespace
         if(!Check("back buffer",device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&owned->originalBack))) return;
         D3DSURFACE_DESC back{};
         if(!Check("back description",owned->originalBack->GetDesc(&back)) || back.MultiSampleType!=D3DMULTISAMPLE_NONE) return;
+        worldTargetAspect=float(back.Width)/back.Height;
         ComPtr<IDirect3DSwapChain9> desktopChain;
         D3DPRESENT_PARAMETERS desktopParameters{};
         if(SUCCEEDED(device->GetSwapChain(0,&desktopChain)) && SUCCEEDED(desktopChain->GetPresentParameters(&desktopParameters)))
@@ -3064,6 +3452,23 @@ namespace
         auto* base=reinterpret_cast<rage::grcViewport*>(static_cast<char*>(self)+0xB0);
         std::memcpy(gameShadowForward,base->mViewInverseMatrix[2],sizeof(gameShadowForward));
         if(!VRCamera::Generate(*base,xrViews,eyeViewports)) return;
+        scopeActive=false;
+        queuedScopeGunValid=false;
+        ReadScopeSettings();
+        if(scopeProbeRequested.exchange(false)) scopeProbeFrames=30;
+        VRMath::Matrix gun{};
+        if(scopeSettings.enabled && scopeObjectRender && VRReloadRuntime::GetRenderedSniperPose(gun))
+        {
+            scopeCamera=VRScope::Camera(gun,scopeSettings);
+            for(const auto& eye:eyeViewports)
+            {
+                VRMath::Vector position{};std::memcpy(position.data(),eye.mViewInverseMatrix[3],sizeof(position));
+                if(VRScope::InEyeBox(scopeCamera,position,scopeSettings)) scopeActive=true;
+            }
+            alignas(16) auto opticalBase=*base;opticalBase.mAspect=worldTargetAspect;
+            if(scopeProbeFrames) {scopeActive=true;--scopeProbeFrames;}
+            scopeActive=scopeActive && VRCamera::GenerateOpticalView(opticalBase,scopeCamera,scopeSettings.verticalFov,scopeViewport);
+        }
         if(stereoFrames==0) Log("generated stereo camera");
         VRMath::Matrix cameras[2]{};
         float fov[2][4]{};
@@ -3177,6 +3582,48 @@ namespace
             buildFrame.unsafe_fastcall(self,edx);
             if(stereoFrames==0) Log(eye ? "build eye 1 end" : "build eye 0 end");
         }
+        // Main-eye construction has now finalized the weapon attachment.
+        // Recompute the scope from that same queued pose, not the earlier
+        // setup snapshot or a newer independently sampled controller pose.
+        if(scopeSettings.enabled && queuedScopeGunValid)
+        {
+            scopeCamera=VRScope::Camera(queuedScopeGun,scopeSettings);
+            scopeActive=false;
+            for(const auto& eye:eyeViewports)
+            {
+                VRMath::Vector position{};std::memcpy(position.data(),eye.mViewInverseMatrix[3],sizeof(position));
+                if(VRScope::InEyeBox(scopeCamera,position,scopeSettings)) scopeActive=true;
+            }
+            alignas(16) auto opticalBase=saved[0][0];opticalBase.mAspect=worldTargetAspect;
+            if(scopeProbeFrames) scopeActive=true;
+            scopeActive=scopeActive && VRCamera::GenerateOpticalView(opticalBase,scopeCamera,scopeSettings.verticalFov,scopeViewport);
+        }
+        if(scopeActive)
+        {
+            // Reuse only world phase dispatch; never repeat simulation, UI,
+            // shared shadow/reflection construction or XR frame submission.
+            const auto ordinaryEye=eyeViewports[0];
+            const auto ordinaryOtherEye=eyeViewports[1];
+            const auto ordinaryPlanes=visibilityPlanes;
+            const auto ordinaryEyePlanes=eyeVisibilityPlanes[0];
+            eyeViewports[0]=scopeViewport;
+            eyeViewports[1]=scopeViewport;
+            VRMath::Matrix cameras[2]{scopeCamera,scopeCamera};
+            const float half=scopeSettings.verticalFov*.00872664626f;
+            const float horizontal=std::atan(std::tan(half)*scopeViewport.mAspect);
+            float fov[2][4]{{-horizontal,horizontal,half,-half},{-horizontal,horizontal,half,-half}};
+            visibilityPlanes=VRMath::UnionBounds(cameras,fov,scopeViewport.mNearClip,scopeViewport.mFarClip);
+            std::memcpy(eyeVisibilityPlanes[0].data(),scopeViewport.mFrustumClipPlanes,sizeof(scopeViewport.mFrustumClipPlanes));
+            for(unsigned phase=0;phase<3;++phase)
+                for(unsigned slot=0;slot<2;++slot)
+                    std::memcpy(static_cast<char*>(phases[phase])+(slot ? 0x4A0 : 0xB0),&scopeViewport,sizeof(scopeViewport));
+            phaseArray=eyeWorldPhases.data();phaseCount=static_cast<uint16_t>(eyeWorldPhases.size());
+            buildingEye=0;buildingScope=true;
+            buildFrame.unsafe_fastcall(self,edx);
+            buildingScope=false;++scopeBuilds;
+            eyeViewports[0]=ordinaryEye;eyeViewports[1]=ordinaryOtherEye;
+            visibilityPlanes=ordinaryPlanes;eyeVisibilityPlanes[0]=ordinaryEyePlanes;
+        }
         buildingEye=-1;
         buildingStage=0;
         if(sphereClassificationProbeFrames && --sphereClassificationProbeFrames==0)
@@ -3228,6 +3675,9 @@ namespace
 void VRStereo::Shutdown()
 {
     VRHud::Reset();
+    scopeActive=buildingScope=false;scopeCompletedFrame=~0u;scopeConfigRevision=~0u;
+    scopeProbeRequested=false;scopeCaptureRequested=false;scopeProbeFrames=0;
+    scopeLensShader.Reset();scopeLensVertexShader.Reset();delete scopeResources;scopeResources=nullptr;mainResources=nullptr;
     cpuOmitRequested=99;cpuOmitMode=0;cpuOmitDeadline=0;cpuOmitHook.reset();
     liveMeshRequested=0;liveMeshMode=0;liveMeshPackets.reset();liveMeshRenderer=VRRigidInstance::Renderer{};liveMeshClear.reset();RemoveLiveMeshResourceHooks();
     billboardInstancingRequested=false;
@@ -3398,6 +3848,12 @@ bool VRStereo::RequestModelCommandProbe()
     return true;
 }
 
+bool VRStereo::RequestScopeProbe()
+{
+    if(!ready || !enabled) return false;
+    scopeCaptureRequested=true;scopeProbeRequested=true;return true;
+}
+
 std::string VRStereo::Status()
 {
     char line[400];
@@ -3406,7 +3862,11 @@ std::string VRStereo::Status()
         enabled ? "true" : "false",ready ? "true" : "false",stereoFrames.load(),maxFrames,maxFrames ? "false" : "true",
         retainedModelPeak,duplicateModelReferences,commandBufferCapacity,commandBufferPeak.load(),commandBufferOverflows.load());
     ReleaseSRWLockShared(&modelReferencesLock);
-    return line;
+    std::string result=line;result.pop_back();
+    result+=",\"scopeBuilds\":"+std::to_string(scopeBuilds.load())+",\"scopeRenders\":"+std::to_string(scopeRenders.load())+
+        ",\"scopeLensDraws\":"+std::to_string(scopeLensDraws.load())+",\"scopeFailures\":"+std::to_string(scopeFailures.load())+
+        ",\"scopeHiddenObjects\":"+std::to_string(scopeHiddenObjects.load())+"}";
+    return result;
 }
 
 void VRStereo::Install()
@@ -3512,6 +3972,9 @@ void VRStereo::Install()
         if(volume.size()==1) cameraVolumeCull=safetyhook::create_inline(volume.get_first(),CameraVolumeCull);
         Log(cameraVolumeCull ? "VR main-world camera-volume correction installed" : "VR camera-volume correction unavailable");
         if(ped.size()==1) pedRender=safetyhook::create_inline(ped.get_first(),PedRender);
+        auto object=hook::pattern("83 EC 08 56 8B F1 F7 86 10 02 00 00 00 00 10 00 0F 85 ? ? ? ? 8B 86");
+        if(object.size()==1) scopeObjectRender=safetyhook::create_inline(object.get_first(),ScopeObjectRender);
+        Log(scopeObjectRender ? "Scope owned-object filter installed" : "Scope owned-object filter unavailable");
         VRCamera::SetVisibilityAvailable(static_cast<bool>(pedRender));
         if(ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0) || ini.ReadInteger("VR","ExperimentalHandIK",0))
         {
