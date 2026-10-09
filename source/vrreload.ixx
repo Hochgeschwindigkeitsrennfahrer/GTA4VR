@@ -15,7 +15,7 @@ import openxrvr;
 export namespace VRReloadRuntime
 {
     void Install();
-    void Publish(void* owner,const VRMath::Matrix& transform,const VRMath::Matrix (&wrists)[2]);
+    void Publish(void* owner,const VRMath::Matrix& transform,const VRMath::Matrix (&tracked)[2],const VRMath::Matrix (&rendered)[2]);
     bool CanFire(void* owner,void* weapon);
     void EmptyTrigger(void* owner,void* weapon);
     void Fired(void* owner,void* weapon);
@@ -48,7 +48,7 @@ namespace
     using FinishReloadTask=void (__thiscall*)(void*,void*);
     FinishReloadTask finishReloadTask=nullptr;
     SRWLOCK poseLock=SRWLOCK_INIT;
-    struct Sample {void* owner=nullptr;VRMath::Matrix transform{},wrist[2]{};uint64_t at=0;} sample;
+    struct Sample {void* owner=nullptr;VRMath::Matrix transform{},wrist[2]{},hand[2]{};uint64_t at=0;} sample;
     struct SlideHand {void* owner=nullptr;void* gun=nullptr;VRMath::Matrix local{},gripInverse{};uint64_t at=0;} slideHand;
     void* owner=nullptr;void* currentWeapon=nullptr;void* gunEntity=nullptr;
     std::atomic<unsigned> currentType=7;
@@ -290,13 +290,17 @@ namespace
     VRMath::Matrix HeldMagazine(const VRMath::Matrix& gun,const Sample& view)
     {
         const auto rotation=RotationXYZ(profile.handRotation);
-        auto root=VRMath::Multiply(rotation,VRMath::Multiply(
-            VRMath::Multiply(gun,VRMath::InverseRigid(view.wrist[1])),view.wrist[0]));
+        // Use the authored weapon attachment, not a live gun transform sampled
+        // before its attachment update divided by this frame's right wrist.
+        // That mixed two pose times when acquiring ammo while running.
+        const auto gunInWrist=primaryGripBone<boneCount ? VRMath::InverseRigid(rest[primaryGripBone]):
+            VRMath::Multiply(gun,VRMath::InverseRigid(view.wrist[1]));
+        auto root=VRMath::Multiply(rotation,VRMath::Multiply(gunInWrist,view.hand[0]));
         const auto center=VRMath::Transform(currentType==18 ? RocketSeat():rest[magazineBone][3],root);
         for(unsigned a=0;a<3;++a)
         {
-            float offset=0;for(unsigned row=0;row<3;++row) offset+=view.wrist[0][row][a]*profile.handOffset[row];
-            root[3][a]+=view.wrist[0][3][a]+offset-center[a];
+            float offset=0;for(unsigned row=0;row<3;++row) offset+=view.hand[0][row][a]*profile.handOffset[row];
+            root[3][a]+=view.hand[0][3][a]+offset-center[a];
         }
         return root;
     }
@@ -674,13 +678,13 @@ namespace
             if(VRMath::Length3(delta)<.60f && behind>.10f && leftTracking[1]>head[1]-.35f && ammo.reserve)
             {
                 const auto root=HeldMagazine(gun,view);
-                if(MakeMagazine(root) && ammo.TakeMagazine()) magazineOffset=VRGrip::Capture(root,view.wrist[0]);
+                if(MakeMagazine(root) && ammo.TakeMagazine()) magazineOffset=VRGrip::Capture(root,view.hand[0]);
             }
         }
         if(ammo.holding && magazineEntity)
         {
-            if(refreshHeldPose) magazineOffset=VRGrip::Capture(HeldMagazine(gun,view),view.wrist[0]);
-            auto root=VRGrip::Target(magazineOffset,view.wrist[0]);
+            if(refreshHeldPose) magazineOffset=VRGrip::Capture(HeldMagazine(gun,view),view.hand[0]);
+            auto root=VRGrip::Target(magazineOffset,view.hand[0]);
             // The leading end meets the bottom opening; do not snap the
             // magazine's center to a sphere around the pistol's whole grip.
             const auto insertionTip=InsertionTip();
@@ -778,11 +782,14 @@ namespace
         refreshHeldPose=false;leftBusy=ammo.holding || racking;rightGrip=right;leftGrip=left;WriteAmmo(ped);
     }
 }
-void VRReloadRuntime::Publish(void* ped,const VRMath::Matrix& transform,const VRMath::Matrix (&wrists)[2])
+void VRReloadRuntime::Publish(void* ped,const VRMath::Matrix& transform,const VRMath::Matrix (&tracked)[2],const VRMath::Matrix (&rendered)[2])
 {
     if(!enabled) return;
     AcquireSRWLockExclusive(&poseLock);sample.owner=ped;sample.transform=transform;
-    sample.wrist[0]=wrists[0];sample.wrist[1]=wrists[1];sample.at=GetTickCount64();ReleaseSRWLockExclusive(&poseLock);
+    // Gestures need the physical controller trajectory even when the visible
+    // hand is snapped to a slide/pump. Loose ammo follows the rendered hand.
+    for(unsigned hand=0;hand<2;++hand) {sample.wrist[hand]=tracked[hand];sample.hand[hand]=rendered[hand];}
+    sample.at=GetTickCount64();ReleaseSRWLockExclusive(&poseLock);
 }
 bool VRReloadRuntime::CanFire(void*,void* weapon)
 {return weapon!=guardedWeapon.load() || (chamberReady && (!racking || ((currentType==10 || currentType==17) && !pumpOpen)));}

@@ -378,5 +378,24 @@ int main()
         Near(camera[3][1]+2.f*(y+p[2][1])/p[1][1],hudPoint[1]);
     }
     if(std::abs(pixels[0]-pixels[1])<.01f) return 1;
-    std::puts("VR math: camera/visibility, rig, and binocular HUD convergence passed");
+    // Compare the same physical hand across render publication, ordinary
+    // running, and consumed room motion. Collision-blocked body translation
+    // must not double count the physical step or lose its rejected distance.
+    auto origin=VRMath::Identity();origin[3]={100,200,10,1};
+    const VRMath::Vector oldBody{100,200,10,1},runningBody{100.3f,200.2f,10,1};
+    const VRMath::Vector handLocal{.25f,.4f,1.4f,1};
+    const auto runFrame=VRMath::RebaseTrackingFrame(origin,oldBody,runningBody);
+    const auto runHand=VRMath::Transform(handLocal,runFrame);
+    Near(runHand[0],100.55f);Near(runHand[1],200.6f);
+    const VRMath::Vector physicalStep{.2f,0,0,0},roomBody{100.5f,200.2f,10,1};
+    const auto roomFrame=VRMath::RebaseTrackingFrame(runFrame,runningBody,roomBody,physicalStep);
+    auto steppedHand=handLocal;steppedHand[0]+=.2f;
+    const auto roomHand=VRMath::Transform(steppedHand,roomFrame);
+    Near(roomHand[0],runHand[0]+.2f); // consumed step counted once
+    const auto blockedFrame=VRMath::RebaseTrackingFrame(runFrame,runningBody,runningBody,physicalStep);
+    const auto blockedHand=VRMath::Transform(steppedHand,blockedFrame);
+    Near(blockedHand[0],runHand[0]); // same physical step rejected by wall
+    const auto repeated=VRMath::RebaseTrackingFrame(roomFrame,roomBody,roomBody);
+    for(unsigned r=0;r<4;++r) for(unsigned a=0;a<4;++a) Near(repeated[r][a],roomFrame[r][a]);
+    std::puts("VR math: camera/visibility, rig, binocular HUD, and tracking origin rebasing passed");
 }

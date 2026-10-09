@@ -19,6 +19,7 @@ export namespace VRHands
 {
     void Install();
     void PublishTrackingTransform(const VRMath::Matrix& trackingToWorld,void* owner,bool active);
+    void ConsumeRoomMotion(void* owner,const VRMath::Vector& consumed);
     bool StationaryBodyHeading(void* owner,float current,float& heading);
     bool Active(void* owner);
     void SetTraversalState(void* owner,bool moving,bool neutralAllowed);
@@ -72,6 +73,7 @@ namespace
     float bodyHeadAllowance=.25f;
     float bodyHeightScale=1.f;
     float bodyVerticalOffset=.10f;
+    float bodyForwardPlacement=.08f;
     bool trackedBody=false;
     std::atomic<float> torsoDrop=0;
     std::atomic<unsigned> legUpdates=0;
@@ -92,6 +94,7 @@ namespace
         bool pending=false;
         bool captured=false;
         VRMath::Vector pivot{};
+        VRMath::Vector placement{};
         float scale=1;
         VRMath::Matrix before[255]{},after[255]{};
     } scaledPose;
@@ -332,6 +335,8 @@ namespace
             if(!scaledPose.captured) scaledPose.before[bone]=scaledPose.matrices[bone];
             auto result=VRMath::ScaleBoneAbout(scaledPose.matrices[bone],scaledPose.pivot,scaledPose.scale);
             if(trackedBody) result[3][2]+=bodyVerticalOffset;
+            if(trackedBody)
+                for(unsigned axis=0;axis<2;++axis) result[3][axis]+=scaledPose.placement[axis];
             scaledPose.matrices[bone]=scaledPose.after[bone]=result;
         }
     }
@@ -363,6 +368,7 @@ namespace
     using ArmSolver=bool (__thiscall*)(void*,int,const void*,const void*);
     ArmSolver solveArm=nullptr;
     VRMath::Matrix trackingToWorld{};
+    VRMath::Vector trackingBodyPosition{};
     void* targetOwner=nullptr;
     uint64_t targetAt=0;
     VRMath::Matrix wristCorrection[2]={VRMath::Identity(),VRMath::Identity()};
@@ -1059,6 +1065,13 @@ namespace
 
         auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(owner)+0x20);
         if(!root) return;
+        // The camera publishes at render time. Include subsequent native
+        // locomotion before solving this simulation pose, without integrating
+        // controller deltas or inheriting animated shoulder motion.
+        AcquireSRWLockShared(&targetLock);
+        if(targetOwner==owner)
+            transform=VRMath::RebaseTrackingFrame(transform,trackingBodyPosition,(*root)[3]);
+        ReleaseSRWLockShared(&targetLock);
         ResolveBodyHeight(skeleton,owner);
         float scale=1,bottom=0;
         AcquireSRWLockShared(&targetLock);
@@ -1072,6 +1085,14 @@ namespace
             scaledPose.owner=owner; scaledPose.matrices=matrices; scaledPose.count=boneCount;
             scaledPose.pending=true;
             scaledPose.pivot=pivot; scaledPose.scale=scale;
+            // Move the visible body behind its head position instead of
+            // orbiting the tracking origin when the user rotates their head.
+            // Native root+Y is the body's forward axis; physics stays native.
+            scaledPose.placement={};
+            const float forward=std::hypot((*root)[1][0],(*root)[1][1]);
+            if(trackedBody && forward>1.e-4f)
+                for(unsigned axis=0;axis<2;++axis)
+                    scaledPose.placement[axis]=-bodyForwardPlacement*(*root)[1][axis]/forward;
         }
         const auto modelIndex=*reinterpret_cast<short*>(static_cast<char*>(owner)+0x2E);
         if(modelIndex<0) return;
@@ -1189,7 +1210,7 @@ namespace
             // The final wrist position remains exactly at the tracked Wand.
             for(unsigned axis=0;axis<3;++axis)
                 target[3][axis]=pivot[axis]+(target[3][axis]-pivot[axis]-
-                    (trackedBody && axis==2 ? bodyVerticalOffset:0.f))/scale;
+                    (trackedBody ? (axis==2 ? bodyVerticalOffset:scaledPose.placement[axis]):0.f))/scale;
             if(hand==0 && (supporting || sliding))
             {
                 if(!rightSolved) {supportGripping=false; continue;}
@@ -1233,21 +1254,18 @@ namespace
                 const auto parentOffset=reinterpret_cast<uintptr_t>(parent)-reinterpret_cast<uintptr_t>(bones);
                 if(parent && parentOffset%0xE0==0 && parentOffset/0xE0<boneCount)
                 {physicsRig.elbow[hand]=static_cast<int>(parentOffset/0xE0); physicsRig.valid[hand]=true;}
+                // Native IK owns the elbow bend, but tracking/contact owns
+                // the endpoint. Its reach clamp and animated wrist must not
+                // displace free hands, held ammo, or the weapon at idle/run.
+                for(unsigned row=0;row<4;++row)
+                    for(unsigned axis=0;axis<3;++axis)
+                        matrices[wrist][row][axis]=absoluteTarget[row][axis];
                 if(hand==1)
                 {
                     solvedRight=VRMath::AffineXYZ(matrices[wrist]);
                     rightSolved=true;
                     for(const auto& row:solvedRight) for(float value:row)
                         rightSolved &= std::isfinite(value);
-                }
-                if(hand==0 && (supporting || sliding))
-                {
-                    // IK positions the elbow/arm, but its endpoint clamp must
-                    // not make an attached hand slide over the gun. Retain
-                    // native W lanes and carry fingers from this locked wrist.
-                    for(unsigned row=0;row<4;++row)
-                        for(unsigned axis=0;axis<3;++axis)
-                            matrices[wrist][row][axis]=absoluteTarget[row][axis];
                 }
                 UpdateFingers(matrices,hand,wrist,input,preserveGrip ? nativePose : nullptr,nativeWrist,hand==0 && supporting,hand==0 && sliding);
             }
@@ -1260,14 +1278,14 @@ namespace
 {
     void PublishPhysicsPose()
     {
-        if(physicsRig.valid[0] && physicsRig.valid[1])
-            VRReloadRuntime::Publish(physicsRig.owner,physicsRig.trackingTransform,physicsRig.requested);
+        VRMath::Matrix renderedWrists[2]{};
         for(unsigned hand=0;hand<2;++hand)
         {
             if(physicsRig.valid[hand])
             {
                 AcquireSRWLockExclusive(&wristLock);
                 publishedWrists[hand]=VRMath::AffineXYZ(physicsRig.matrices[physicsRig.wrist[hand]]);
+                renderedWrists[hand]=publishedWrists[hand];
                 publishedWristAt[hand]=GetTickCount64();
                 ReleaseSRWLockExclusive(&wristLock);
             }
@@ -1316,6 +1334,8 @@ namespace
             points[VRHandPhysics::ContactNodeCount]=gripWrist[3];
             VRHandPhysics::Publish(physicsRig.owner,physicsRig.held,hand,points,gripWrist,physicsRig.supporting[hand]);
         }
+        if(physicsRig.valid[0] && physicsRig.valid[1])
+            VRReloadRuntime::Publish(physicsRig.owner,physicsRig.trackingTransform,physicsRig.requested,renderedWrists);
         // Use the rendered equipped entity, not a gun-muzzle semantic (the
         // knife has none). Transform back to tracking space for motion gating
         // so locomotion with a stationary blade cannot become an attack.
@@ -1356,6 +1376,9 @@ void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* own
     if(!enabled) return;
     AcquireSRWLockExclusive(&targetLock);
     trackingToWorld=transform; targetOwner=active ? owner : nullptr;
+    if(active && owner)
+        if(auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(owner)+0x20))
+            trackingBodyPosition=(*root)[3];
     targetAt=active ? GetTickCount64() : 0;
     if(!active) supportGripping=false;
     ReleaseSRWLockExclusive(&targetLock);
@@ -1365,6 +1388,23 @@ void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* own
         recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;recoilDegrees=0;
         ReleaseSRWLockExclusive(&recoilLock);
     }
+}
+
+void VRHands::ConsumeRoomMotion(void* owner,const VRMath::Vector& consumed)
+{
+    if(!enabled || !owner) return;
+    auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(owner)+0x20);
+    if(!root) return;
+    AcquireSRWLockExclusive(&targetLock);
+    if(targetOwner==owner && targetAt)
+    {
+        // Room movement advances the native body and consumes the matching
+        // tracking displacement. Rebase both together so IK cannot count the
+        // same physical step twice between render and simulation callbacks.
+        trackingToWorld=VRMath::RebaseTrackingFrame(trackingToWorld,trackingBodyPosition,(*root)[3],consumed);
+        trackingBodyPosition=(*root)[3];
+    }
+    ReleaseSRWLockExclusive(&targetLock);
 }
 
 bool VRHands::GetWrist(unsigned hand,VRMath::Matrix& world)
@@ -1577,6 +1617,8 @@ void VRHands::Install()
     bodyHeightScale=ini.ReadFloat("VR","BodyHeightScale",1.f);
     trackedBody=ini.ReadInteger("VR","ExperimentalTrackedBody",0)!=0;
     bodyVerticalOffset=ini.ReadFloat("VR","BodyVerticalOffset",.10f);
+    bodyForwardPlacement=ini.ReadFloat("VR","FirstPersonForwardOffset",.08f);
+    if(!std::isfinite(bodyForwardPlacement)) bodyForwardPlacement=.08f;
     if(!std::isfinite(bodyVerticalOffset) || bodyVerticalOffset<-.15f || bodyVerticalOffset>.25f) bodyVerticalOffset=.10f;
     if(!std::isfinite(bodyHeightScale) || bodyHeightScale<.75f || bodyHeightScale>1.15f) bodyHeightScale=1.f;
     if(!std::isfinite(bodyHeadAllowance) || bodyHeadAllowance<.1f || bodyHeadAllowance>.4f) bodyHeadAllowance=.25f;

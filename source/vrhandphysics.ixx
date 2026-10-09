@@ -398,6 +398,7 @@ namespace
         Natives::SetObjectInvincible(node.handle,true);
         Natives::SetObjectCcd(node.handle,true);
         Natives::SetObjectDynamic(node.handle,true);
+        Natives::SetObjectRecordsCollisions(node.handle,true);
         // The native wrapper clones the archetype before changing its mass.
         // -1 leaves other properties intact, including its collision bound.
         Natives::SetObjectPhysicsParams(node.handle,i==VRHandPhysics::ContactNodeCount ? 2.f:NodeMass,-1.f,-1.f,-1.f,-1.f,-1.f,-1.f,-1.f,0xbf800000,0xbf800000);
@@ -1265,7 +1266,6 @@ namespace
                 VRMath::Vector position{};
                 Natives::GetObjectCoordinates(node.handle,&position[0],&position[1],&position[2]);
                 const float distance=VRMath::Length3(VRMath::Difference3(target,position));
-                auto feedbackPosition=position;
                 if(!std::isfinite(distance)) {failed=true; Clear(); return;}
                 if(distance>recoveryDistance)
                 {ClearHand(hand); ++recoveries; result.at[hand]=0; break;}
@@ -1274,8 +1274,6 @@ namespace
                 Natives::GetObjectVelocity(node.handle,&velocity[0],&velocity[1],&velocity[2]);
                 if(now>node.at && now-node.at<=100)
                     for(unsigned axis=0;axis<3;++axis) targetVelocity[axis]=(target[axis]-node.target[axis])*1000.f/float(now-node.at);
-                const float speed=VRMath::Length3(targetVelocity);
-                if(speed>5.f) for(unsigned axis=0;axis<3;++axis) targetVelocity[axis]*=5.f/speed;
                 // Implicit spring motor on OUR rigid body. Force is shared over
                 // ten nodes per arm. Never apply forces to a contacted prop;
                 // native collision solving supplies its contact response.
@@ -1297,7 +1295,19 @@ namespace
                 // world axes/COM offset, no implicit mass multiplication.
                 Natives::ApplyForceToObject(node.handle,0,force[0],force[1],force[2],0,0,0,0,0,0,0);
                 node.target=target; node.at=now;
-                if(i==0) {result.wrists[hand]=pose.wrists[hand];result.wrists[hand][3]=feedbackPosition;result.at[hand]=now;}
+                // Native CObject+150 is the current collision flag read by
+                // HAS_OBJECT_COLLIDED_WITH_ANYTHING (CE A052F0). Free-space
+                // motor latency is not an obstacle and must not delay the
+                // rendered hand. Any contacted finger/forearm blocks it;
+                // held-object/hinge feedback can still override below.
+                if(i==0) result.wrists[hand]=pose.wrists[hand];
+                if(Natives::HasObjectCollidedWithAnything(node.handle))
+                {
+                    if(!result.at[hand])
+                        for(unsigned axis=0;axis<3;++axis)
+                            result.wrists[hand][3][axis]=pose.wrists[hand][3][axis]+position[axis]-target[axis];
+                    result.at[hand]=now;
+                }
             }
         }
         if(grabbingEnabled) DriveGrabs(pose,dt,now,result);

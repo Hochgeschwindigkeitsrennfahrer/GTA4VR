@@ -13,6 +13,17 @@ namespace VRMath
     using Vector = std::array<float, 4>;
     using Matrix = std::array<Vector, 4>;
 
+    // Rebase a published tracking origin to the current simulation body.
+    // Consumed room displacement already moved that body; subtract it once.
+    inline Matrix RebaseTrackingFrame(const Matrix& frame,const Vector& previousBody,
+        const Vector& body,const Vector& consumed={})
+    {
+        auto result=frame;
+        for(unsigned axis=0;axis<3;++axis)
+            result[3][axis]+=body[axis]-previousBody[axis]-(axis<2 ? consumed[axis]:0.f);
+        return result;
+    }
+
     inline Matrix ScaleBoneAbout(const Matrix& bone,const Vector& pivot,float scale)
     {
         auto result=bone;

@@ -45,15 +45,14 @@ namespace
     SafetyHookInline controllerPadUpdate{};
     using PadGetter=void* (__cdecl*)();
     PadGetter localPad=nullptr;
-    bool previousJump=false,previousEnter=false,previousHandbrake=false,previousRun=false;
+    bool previousJump=false,previousEnter=false,previousHandbrake=false,previousRun=false,previousHangGrip[2]{true,true};
     bool buttonsArmed=false;
-    std::atomic<unsigned> padButtonUpdates{0},padJumpPresses{0},padEnterPresses{0},padDrivingUpdates{0};
+    std::atomic<unsigned> padButtonUpdates{0},padJumpPresses{0},padEnterPresses{0},padDrivingUpdates{0},padHangDrops{0};
     std::atomic<unsigned> phoneDelivered[6]{};
     SafetyHookInline phoneRawPressed{},phoneRawJustPressed{};
     std::atomic<unsigned> phoneRawDown{0},phoneRawRising{0},phoneRawQueries{0},phoneRawMatches{0};
     std::atomic<uint64_t> phoneRawSampledAt{0};
     std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
-    float firstPersonForwardOffset=.08f;
     std::atomic<bool> firstPersonActive{false};
     bool visibilityAvailable=false;
     bool debugBody=false;
@@ -356,11 +355,14 @@ namespace
             VRMath::Vector before{};
             if(matrix) for(unsigned axis=0;axis<3;++axis) before[axis]=matrix[12+axis];
             if(MoveRoomBody(owner,delta,body))
+            {
                 for(unsigned axis=0;axis<2;++axis)
                 {
                     roomMotion.consumed[axis]+=delta[axis];
                     roomAchieved[axis]+=body[axis]-before[axis];
                 }
+                VRHands::ConsumeRoomMotion(owner,delta);
+            }
             processedRoomPosition=lastRoomPosition;
         }
         ReleaseSRWLockExclusive(&roomLock);
@@ -640,6 +642,7 @@ namespace
         if(!fresh)
         {
             buttonsArmed=false; previousJump=previousEnter=previousHandbrake=previousRun=false;
+            previousHangGrip[0]=previousHangGrip[1]=true;
             padSteering=padThrottle=padBrake=0;
             return; // The freshly updated native values already cleared VR input.
         }
@@ -664,14 +667,29 @@ namespace
         const bool driving=vehicleView;
         const bool jump=buttonsArmed && center && !driving && !animatedView;
         const bool enter=buttonsArmed && menu;
+        const bool grip[2]{input.gripActive[0] && input.gripped[0],input.gripActive[1] && input.gripped[1]};
+        const bool newGrip=(grip[0] && !previousHangGrip[0]) || (grip[1] && !previousHangGrip[1]);
+        bool drop=false;
+        if(!driving && newGrip &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::GET_PED_CLIMB_STATE)))
+        {
+            Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+            const unsigned climb=ped ? Natives::GetPedClimbState(ped):0;
+            // CF47A0 maps hang/shimmy to2/3/4. CF57C0 asks CF4210
+            // mode0, which reads INPUT_ENTER's rising edge before selecting
+            // the native hang_drop animation. Keep vault/ladder input native.
+            drop=climb>=2 && climb<=4;
+        }
+        previousHangGrip[0]=grip[0];previousHangGrip[1]=grip[1];
         const bool handbrake=buttonsArmed && center && driving;
         button(2,jump,previousJump); // INPUT_JUMP
-        button(3,enter && !driving,previousEnter && !driving); // INPUT_ENTER
+        button(3,(enter || drop) && !driving,previousEnter && !driving); // INPUT_ENTER / hang drop
         button(43,enter && driving,previousEnter && driving); // INPUT_VEH_EXIT
         button(44,handbrake,previousHandbrake); // INPUT_VEH_HANDBRAKE
         button(45,handbrake,previousHandbrake); // alternate handbrake
         if(jump && !previousJump) ++padJumpPresses;
         if(enter && !previousEnter) ++padEnterPresses;
+        if(drop) ++padHangDrops;
         previousJump=jump; previousEnter=enter; previousHandbrake=handbrake;
         ++padButtonUpdates;
         auto analog=[&](unsigned id,unsigned char decoded)
@@ -1123,9 +1141,9 @@ std::string VRCamera::ControllerMovementStatus()
         static_cast<unsigned>(controllerAxisCallers[6].load()),static_cast<unsigned>(controllerAxisCallers[7].load()));
     std::string result=text; result.pop_back();
     char buttons[340];
-    sprintf_s(buttons,",\"buttonsConfigured\":%s,\"buttonsInstalled\":%s,\"buttonUpdates\":%u,\"jumpPresses\":%u,\"enterPresses\":%u,\"drivingUpdates\":%u,\"steering\":%.3f,\"throttle\":%.3f,\"brake\":%.3f}",
+    sprintf_s(buttons,",\"buttonsConfigured\":%s,\"buttonsInstalled\":%s,\"buttonUpdates\":%u,\"jumpPresses\":%u,\"enterPresses\":%u,\"drivingUpdates\":%u,\"steering\":%.3f,\"throttle\":%.3f,\"brake\":%.3f,\"hangDrops\":%u}",
         controllerButtons ? "true":"false",controllerPadUpdate ? "true":"false",padButtonUpdates.load(),
-        padJumpPresses.load(),padEnterPresses.load(),padDrivingUpdates.load(),padSteering.load(),padThrottle.load(),padBrake.load());
+        padJumpPresses.load(),padEnterPresses.load(),padDrivingUpdates.load(),padSteering.load(),padThrottle.load(),padBrake.load(),padHangDrops.load());
     result+=buttons;result.pop_back();result+=",\"phoneDelivered\":[";
     for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(phoneDelivered[i].load());}
     return result+"],\"phoneRawInstalled\":"+(phoneRawPressed && phoneRawJustPressed ? "true":"false")+
@@ -1185,8 +1203,6 @@ void VRCamera::Install()
             }
         }
     }
-    const float forwardOffset=ini.ReadFloat("VR","FirstPersonForwardOffset",.08f);
-    if(std::isfinite(forwardOffset)) firstPersonForwardOffset=std::clamp(forwardOffset,0.f,.15f);
     roomScale=firstPerson && ini.ReadInteger("VR","ExperimentalRoomScale",0)!=0;
     physicalCrouchEnabled=firstPerson && ini.ReadInteger("VR","ExperimentalPhysicalCrouch",0)!=0;
     const float crouchReference=ini.ReadFloat("VR","PlayerHeight",1.75f);
@@ -1460,18 +1476,13 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
                 if(!std::isfinite(value)) throw std::invalid_argument("Invalid game camera");
         VRHands::PublishTrackingTransform(VRMath::Multiply(referenceInverse,gameCamera),
             FindPlayerPed ? FindPlayerPed(0) : nullptr,useFirstPerson && !vehicle && !animated && OpenXRVR::HasFocusedViews());
-        // Move the eyes relative to the visible body, without shifting the
-        // controller/body tracking origin or changing vehicle/action anchors.
-        const auto headPose=VRMath::Multiply(VRMath::Multiply(
-            VRMath::Pose(eyes[0].position,eyes[0].orientation),referenceInverse),gameCamera);
-        const float forwardLength=std::hypot(headPose[2][0],headPose[2][1]);
+        // Eye translation comes only from the native anchor and OpenXR pose.
+        // VRHands applies configured head/body placement to the visible rig;
+        // head yaw must never rotate a positional offset around these eyes.
         for(unsigned eye=0;eye<2;++eye)
         {
             alignas(16) VRMath::Matrix pose=VRMath::Multiply(VRMath::Multiply(
                 VRMath::Pose(eyes[eye].position,eyes[eye].orientation),referenceInverse),gameCamera);
-            if(useFirstPerson && !vehicle && !animated && forwardLength>1.e-4f)
-                for(unsigned axis=0;axis<2;++axis)
-                    pose[3][axis]-=firstPersonForwardOffset*headPose[2][axis]/forwardLength;
             alignas(16) VRMath::Matrix projection=VRMath::Projection(eyes[eye].fov,base.mNearClip,base.mFarClip);
             // Engine matrix helpers use aligned SSE loads/stores. The mirrored
             // viewport type has only four-byte alignment, so never pass an
