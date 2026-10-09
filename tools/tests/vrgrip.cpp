@@ -14,6 +14,34 @@ int main()
 {
     constexpr float pi=3.141592654f;
     const float origin[3]{};
+    {
+        auto primary=VRMath::Identity(),support=primary,relative=primary;
+        primary[3]={3,5,7,1};relative[3]={.4f,0,0,1};
+        support[3]={3,5.4f,7,1};
+        const auto aim=VRGrip::TwoHandAim(primary,support,relative);
+        Near(aim[0][0],0);Near(aim[0][1],1);
+        PoseNear(VRGrip::TwoHandAim(primary,primary,relative),primary);
+        for(unsigned i=0;i<4;++i) Near(aim[3][i],primary[3][i]);
+        Near(VRMath::Length3(aim[0]),1);Near(VRMath::Dot3(aim[0],aim[1]),0);
+        const auto seat=VRMath::Multiply(relative,aim);
+        for(unsigned i=0;i<3;++i) Near(seat[3][i],support[3][i]);
+        support[3]={2.6f,5,7,1};
+        const auto opposite=VRGrip::TwoHandAim(primary,support,relative);
+        Near(opposite[0][0],-1);Near(VRMath::Length3(opposite[2]),1);
+        // Moving both hands together leaves relative aim unchanged.
+        primary[3]={0,0,0,1};support[3]={0,.4f,0,1};
+        const auto translated=VRGrip::TwoHandAim(primary,support,relative);
+        for(unsigned row=0;row<3;++row) for(unsigned i=0;i<3;++i) Near(translated[row][i],aim[row][i]);
+        relative[3]={.08f,0,0,1};support[3]={0,.08f,0,1};
+        PoseNear(VRGrip::TwoHandAim(primary,support,relative),primary);
+        relative[3]={.20f,0,0,1};support[3]={0,.20f,0,1};
+        const auto medium=VRGrip::TwoHandAim(primary,support,relative);
+        Near(medium[0][0],std::sqrt(.5f));Near(medium[0][1],std::sqrt(.5f));
+        // Physical hands brought together also reduce influence, regardless
+        // of a long weapon's configured support seat.
+        relative[3]={.4f,0,0,1};support[3]={0,.08f,0,1};
+        PoseNear(VRGrip::TwoHandAim(primary,support,relative),primary);
+    }
     float hinge=0;
     if(!VRGrip::HingeTarget({0,0,0,1},{0,0,1,0},{1,0,0,1},{0,1,3,1},0,pi/2,hinge)) return 1;
     Near(hinge,1); // Height changes do not affect opening.

@@ -360,3 +360,21 @@ At the user's request, this existing issue owns all remaining firearm work from 
 - PID9664 type17 equipment readback valid; active/assetReady/configValid. FOCUSED continuous stereo, zero command overflows and scope failures; scope renders/lens draws advance. Fresh image check performed. Both-sniper impact/reticle alignment still requires user confirmation.
 
 - User confirms both sniper sight corrections work on2026-10-09 and requests commit. Stored exact installed sniper.ini as the distributed profile (matching SHA-256); retained installed game/configuration and accepted ReleaseF104989A unchanged. Standard bolt-action reload/scope and both-sniper reticle alignment are accepted. #024 remains open for remaining firearm and episode/fallback coverage. Optimized ammo/scope tests and x86 Release already passed; no redundant rebuild or baseline capture for this documentation/configuration checkpoint.
+
+### 2026-10-09 — two-hand weapon steering
+
+- User requests support-hand positional control of held firearms. Added a rigid two-position aiming solve before recoil/native arm IK: keep the shooting wrist as pivot, align the configured support-grip baseline with the physical Wand baseline using the shortest rotation, and retain primary-hand roll. No weapon stretching or pose smoothing; existing grip-button acquisition/release, per-weapon offsets, finger seating and reload exclusions remain. Coincident hands retain primary aim. Live acceptance pending.
+
+- Focused optimized x86 grip tests passed fixed shooting-wrist pivot, support-direction steering, rigid frame, coincident/antiparallel baselines and translation invariance. Release5070F6558C031043481D4D92C356182CA0BE1B68A62617C393A20DF7422AFB72 built successfully (existing modupdater PDB warnings). Verified bridge exit, backed up ASI/global INI in build/issue024-two-hand-20261009-171856, deployed ASI only; user profiles unchanged. Normal relaunch, no teleport/save changes. Headset steering acceptance pending.
+
+- PID9580 reached responsive FOCUSED continuous DXVK-Vulkan stereo with eyeImages=true/ready=true, zero command-buffer overflows and scope failures. Fresh Sky game image inspected. Headset support steering/release check requested; no visual acceptance inferred from startup.
+
+- User accepts two-hand steering on weapons with separated grip points, but reports unstable pistol/SMG support. Restored primary-wrist aiming for compact native types7/9/12/13; these retain attached support palms and supported recoil reduction. Rifles, shotguns and RPG retain two-position steering. Compact-weapon runtime acceptance pending.
+
+- Before deploying the compact-type exception, user requested a generic solution. Removed all weapon-type checks. TwoHandAim now weights its angular correction by the smaller of configured grip spacing and physical Wand spacing: smoothstep influence0 at10cm to1 at30cm. Tests cover short span retaining primary aim, intermediate20cm giving half angular steering and collapsed hands on a long grip. No temporal filtering or arbitrary profile validation limits added.
+
+- Generic spacing-weighted Release31371BCE71553671911F4F19DEBC79767D30A5473319E346BE78E29E696B6240 built successfully; focused grip tests passed. ASI/global INI backed up in C:\Users\Vetle Hjelle\Documents\ChatGPT\GTA4VR\build\issue024-spacing-support-20261009-172405; deployed ASI only, retaining user profiles. Compact-type exception was never deployed. Normal relaunch without teleport/save changes; headset acceptance pending.
+
+- PID12840 reached responsive FOCUSED DXVK-Vulkan stereo, eyeImages/ready true, zero scope failures/command overflows. Fresh game image inspected after loading. Generic support feel check pending.
+
+- User accepts the generic spacing-weighted support correction on2026-10-09 and requests commit. Accepted Release31371BCE remains installed; #024 next covers grenade/Molotov physical throws.

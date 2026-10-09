@@ -1046,7 +1046,11 @@ namespace
                 // release. Do not detach when the physical support Wand moves.
                 supporting=input.support && !VRReloadRuntime::UsesLeftHand() && !VRHandPhysics::IsGrabbing(0) &&
                     (supportGripping || distanceSquared<.12f*.12f);
-                if(supporting) targets[0]=supportTarget;
+                if(supporting)
+                {
+                    targets[1]=VRGrip::TwoHandAim(targets[1],targets[0],supportRelative);
+                    targets[0]=VRMath::Multiply(supportRelative,targets[1]);
+                }
             }
         }
         supportGripping=supporting || VRReloadRuntime::PumpHeld();

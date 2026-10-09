@@ -24,6 +24,52 @@ namespace VRGrip
     using VRMath::Vector;
     using VRMath::Matrix;
 
+    // Aim a held weapon using both tracked positions. The primary wrist is
+    // the pivot; its orientation supplies roll. Rotate the authored support
+    // baseline onto the physical hand baseline without stretching the weapon.
+    inline Matrix TwoHandAim(const Matrix& primary,const Matrix& support,
+        const Matrix& relative)
+    {
+        const auto seat=VRMath::Multiply(relative,primary);
+        auto from=VRMath::Difference3(seat[3],primary[3]);
+        auto to=VRMath::Difference3(support[3],primary[3]);
+        const float a=VRMath::Length3(from),b=VRMath::Length3(to);
+        // Coincident hands have no defined aiming direction.
+        if(!std::isfinite(a+b) || a<1.e-5f || b<.05f) return primary;
+        for(unsigned i=0;i<3;++i) {from[i]/=a;to[i]/=b;}
+        auto axis=VRMath::Cross3(from,to);
+        float sine=VRMath::Length3(axis);
+        float cosine=std::clamp(VRMath::Dot3(from,to),-1.f,1.f);
+        if(sine<1.e-5f)
+        {
+            if(cosine>0) return primary;
+            // Deterministic half-turn axis at an antiparallel baseline.
+            const Vector reference=std::abs(from[2])<.9f ? Vector{0,0,1,0}:Vector{0,1,0,0};
+            axis=VRMath::Cross3(from,reference);
+            const float length=VRMath::Length3(axis);
+            for(unsigned i=0;i<3;++i) axis[i]/=length;
+            sine=0;
+        }
+        else for(unsigned i=0;i<3;++i) axis[i]/=sine;
+        // A short baseline is a poor direction measurement. Smoothly give
+        // steering back to the primary wrist as either the authored grip span
+        // or the physical hand span shrinks. This applies to every weapon.
+        const float spacing=std::min(a,b);
+        const float t=std::clamp((spacing-.10f)/.20f,0.f,1.f);
+        const float influence=t*t*(3.f-2.f*t);
+        const float angle=std::atan2(sine,cosine)*influence;
+        cosine=std::cos(angle);sine=std::sin(angle);
+        auto result=primary;
+        for(unsigned row=0;row<3;++row)
+        {
+            const auto cross=VRMath::Cross3(axis,primary[row]);
+            const float along=VRMath::Dot3(axis,primary[row]);
+            for(unsigned i=0;i<3;++i)
+                result[row][i]=primary[row][i]*cosine+cross[i]*sine+axis[i]*along*(1-cosine);
+        }
+        return result;
+    }
+
     inline bool Rigid(Matrix& pose)
     {
         for(unsigned row=0;row<4;++row) for(unsigned axis=0;axis<3;++axis)
