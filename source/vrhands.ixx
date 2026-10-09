@@ -29,6 +29,7 @@ export namespace VRHands
     bool Trim(unsigned hand,int x,int y,int z);
     bool GetWrist(unsigned hand,VRMath::Matrix& world);
     bool GetScopeGun(VRMath::Matrix& world);
+    bool GetScopeMuzzle(const VRMath::Matrix& gun,VRMath::Vector& world);
 }
 
 namespace
@@ -472,14 +473,14 @@ namespace
     }
 
     bool SupportedFirearm(unsigned type)
-    {return type==7 || type==9 || type==10 || type==11 || type==12 || type==13 || type==14 || type==15 || type==18 || (type==16 && sniperSpread && delayedRay);}
+    {return type==7 || type==9 || type==10 || type==11 || type==12 || type==13 || type==14 || type==15 || type==18 || ((type==16 || type==17) && sniperSpread && delayedRay);}
 
     void __stdcall TrackedSniperSpread(void* shooter,const VRMath::Vector* origin,VRMath::Vector* target)
     {
         void* entity=nullptr;void* weapon=nullptr;
         if(OpenXRVR::HasFocusedViews() && VRHands::Active(shooter) &&
             (weapon=EquippedWeapon(shooter,entity)) &&
-            *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16)
+            (*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16 || *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==17))
         {++sniperPrecisionShots;return;}
         sniperSpread(shooter,origin,target);
     }
@@ -510,7 +511,7 @@ namespace
         {
             VRReloadRuntime::Fired(shooter,weapon);
             const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
-            if((type==9 || type==10 || type==11 || type==12 || type==13 || type==14 || type==15 || type==16) && VRHands::Active(shooter) &&
+            if((type==9 || type==10 || type==11 || type==12 || type==13 || type==14 || type==15 || type==16 || type==17) && VRHands::Active(shooter) &&
                 OpenXRVR::HasFocusedViews())
             {
                 const auto settings=VRReloadRuntime::RecoilSettings(type);
@@ -1051,7 +1052,7 @@ namespace
         supportGripping=supporting || VRReloadRuntime::PumpHeld();
         float kick=0;
         const unsigned recoilType=weapon ? *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18):0;
-        const bool recoilWeaponSupported=recoilType==9 || recoilType==10 || recoilType==11 || recoilType==12 || recoilType==13 || recoilType==14 || recoilType==15 || recoilType==16;
+        const bool recoilWeaponSupported=recoilType==9 || recoilType==10 || recoilType==11 || recoilType==12 || recoilType==13 || recoilType==14 || recoilType==15 || recoilType==16 || recoilType==17;
         const auto recoilSettings=VRReloadRuntime::RecoilSettings(recoilType);
         AcquireSRWLockExclusive(&recoilLock);
         if(!recoilWeaponSupported || recoilOwner!=owner || recoilWeapon!=weapon) {recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;}
@@ -1225,7 +1226,7 @@ namespace
         AcquireSRWLockExclusive(&wristLock);
         publishedScopeAt=0;
         if(physicsRig.valid[1] && held && weapon && supportReady &&
-            *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16 && held==supportWeapon)
+            (*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16 || *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==17) && held==supportWeapon)
         {
             auto wrist=publishedWrists[1];
             if(VRGrip::Rigid(wrist))
@@ -1278,6 +1279,20 @@ bool VRHands::GetWrist(unsigned hand,VRMath::Matrix& world)
     return at && GetTickCount64()-at<=100;
 }
 
+bool VRHands::GetScopeMuzzle(const VRMath::Matrix& gun,VRMath::Vector& world)
+{
+    if(!muzzleLookup || !FindPlayerPed) return false;
+    void* entity=nullptr;void* ped=FindPlayerPed(0);
+    void* weapon=ped ? EquippedWeapon(ped,entity):nullptr;
+    if(!weapon) return false;
+    const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
+    if(type!=16 && type!=17) return false;
+    alignas(16) auto frame=gun;
+    alignas(16) VRMath::Vector point{0,0,0,1};
+    muzzleLookup(weapon,&point,&frame,3); // Same native semantic as ProcessPistolTrigger.
+    for(unsigned a=0;a<3;++a) if(!std::isfinite(point[a])) return false;
+    world=point;return true;
+}
 bool VRHands::GetScopeGun(VRMath::Matrix& world)
 {
     if(!OpenXRVR::HasFocusedViews()) return false;

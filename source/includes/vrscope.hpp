@@ -39,6 +39,18 @@ namespace VRScope
         return camera;
     }
 
+    // Render along the actual firing ray, while the physical lens stays at
+    // Camera(gun, settings). Preserve its longitudinal station, eliminating
+    // transverse sight/bore parallax without tilting or redirecting bullets.
+    inline VRMath::Matrix SightCamera(const VRMath::Matrix& lens,const VRMath::Vector& muzzle)
+    {
+        auto camera=lens;
+        float axial=0;
+        for(unsigned a=0;a<3;++a) axial+=(lens[3][a]-muzzle[a])*lens[2][a];
+        for(unsigned a=0;a<3;++a) camera[3][a]=muzzle[a]+lens[2][a]*axial;
+        return camera;
+    }
+
     inline bool InEyeBox(const VRMath::Matrix& camera,const VRMath::Vector& eye,const Settings& settings)
     {
         const auto local=VRMath::Transform(eye,VRMath::InverseRigid(camera));

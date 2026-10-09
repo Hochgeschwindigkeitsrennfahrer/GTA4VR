@@ -145,5 +145,14 @@ int main()
     Check(pump.Owned()==16 && pump.discarded==0);
     Check(pump.TakeMagazine() && pump.Insert() && !pump.Ready());
     pump.Rack();Check(pump.Ready() && pump.Clip()==1 && pump.Owned()==16);
+    // Bolt action combines detachable magazines with manual per-shot chambering.
+    VRReload::Pistol bolt;bolt.Begin(5,20,5);bolt.pump=true;
+    Check(bolt.Fired() && !bolt.Ready() && bolt.Clip()==4 && !bolt.Fired());
+    Check(bolt.Resume(19,5) && !bolt.Ready() && bolt.pump);
+    Check(bolt.Eject()==4 && bolt.Clip()==0 && bolt.discarded==4);
+    Check(bolt.TakeMagazine() && bolt.Insert() && bolt.Clip()==5 && !bolt.Ready());
+    bolt.Rack();Check(bolt.Ready() && bolt.Clip()==5 && bolt.NativeTotal()==15);
+    Check(bolt.Fired() && !bolt.Ready() && bolt.Clip()==4);
+    bolt.Rack();Check(bolt.Ready() && bolt.Clip()==4);
     std::puts("pistol/rifle/rocket/shotgun/pump reload accounting passed");
 }

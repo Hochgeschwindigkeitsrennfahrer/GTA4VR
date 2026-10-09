@@ -13,6 +13,23 @@ int main()
     eye[0]+=.20f;assert(!VRScope::InEyeBox(camera,eye,settings));
     eye=settings.eyepiece;eye[0]-=.10f;eye[1]+=.20f;
     assert(!VRScope::InEyeBox(camera,eye,settings));
+    // Center optical rays coincide with the muzzle ray at every distance,
+    // independent of eyepiece height/side offset or weapon rotation.
+    const float sightPosition[]{17,29,3},sightRotation[]{0,0,.70710678f,.70710678f};
+    for(const auto& pose:{gun,VRMath::Pose(sightPosition,sightRotation)})
+    {
+        const auto lens=VRScope::Camera(pose,settings);
+        const auto muzzle=VRMath::Transform({.5f,.012f,.055f,1},pose);
+        const auto sight=VRScope::SightCamera(lens,muzzle);
+        for(float distance:{1.f,10.f,100.f})
+        {
+            auto hit=muzzle;
+            for(unsigned a=0;a<3;++a) hit[a]+=pose[0][a]*distance;
+            const auto projected=VRMath::Transform(hit,VRMath::InverseRigid(sight));
+            assert(std::abs(projected[0])<1.e-4f && std::abs(projected[1])<1.e-4f && projected[2]<0);
+        }
+        assert(lens[3]==VRScope::Camera(pose,settings)[3]);
+    }
     const auto depth=VRScope::DepthParameters(.05f,1500.f);
     assert(std::abs(depth[0]-20.f)<1.e-5f);
     assert(std::abs(depth[1]-.0672373995f)<1.e-7f);

@@ -121,7 +121,7 @@ namespace
     ComPtr<IDirect3DPixelShader9> scopeLensShader;
     ComPtr<IDirect3DVertexShader9> scopeLensVertexShader;
     VRScope::Settings scopeSettings{};
-    VRMath::Matrix scopeCamera{};
+    VRMath::Matrix scopeCamera{},scopeLensPose{};
     VRMath::Matrix queuedScopeGun{};
     bool queuedScopeGunValid=false;
     unsigned scopePoseSamples=0;
@@ -142,17 +142,17 @@ namespace
         const auto revision=VRReloadRuntime::ConfigRevision();
         if(revision==scopeConfigRevision) return;
         scopeConfigRevision=revision;
-        CIniReader ini("VRWeapons/psg1.ini");
+        CIniReader ini(VRReloadRuntime::ScopeProfileFile());
         VRScope::Settings next;
         bool valid=true;
-        auto read=[&](const char* key,float fallback,float low,float high)
+        auto read=[&](const char* key,float fallback)
         {
             try
             {
                 const auto text=ini.ReadString("Scope",key,std::to_string(fallback));
                 size_t end=0;const float value=std::stof(text,&end);
-                if(text.find_first_not_of(" \t\r\n",end)!=std::string::npos || !std::isfinite(value) || value<low || value>high)
-                    {char message[256];sprintf_s(message,"Scope config rejected: %s=%s; allowed %.3f..%.3f. Previous settings retained.",key,text.c_str(),low,high);Log(message);valid=false;return fallback;}
+                if(text.find_first_not_of(" \t\r\n",end)!=std::string::npos || !std::isfinite(value))
+                    {char message[256];sprintf_s(message,"Scope config rejected: invalid finite number %s=%s. Previous settings retained.",key,text.c_str());Log(message);valid=false;return fallback;}
                 return value;
             }
             catch(...) {char message[160];sprintf_s(message,"Scope config rejected: invalid number for %s. Previous settings retained.",key);Log(message);valid=false;return fallback;}
@@ -160,15 +160,18 @@ namespace
         next.enabled=ini.ReadInteger("Scope","Enabled",1)!=0;
         next.depthTest=ini.ReadInteger("Scope","DepthTest",1)!=0;
         next.debugLens=ini.ReadInteger("Scope","DebugLens",0)!=0;
-        next.eyepiece[0]=read("EyepieceX",next.eyepiece[0],-.5f,.5f);
-        next.eyepiece[1]=read("EyepieceY",next.eyepiece[1],-.2f,.2f);
-        next.eyepiece[2]=read("EyepieceZ",next.eyepiece[2],-.2f,.4f);
-        next.radius=read("LensRadius",next.radius,.005f,.06f);
-        next.surfaceOffset=read("LensSurfaceOffset",next.surfaceOffset,0,.05f);
-        next.eyeRelief=read("EyeRelief",next.eyeRelief,.04f,.5f);
+        next.eyepiece[0]=read("EyepieceX",next.eyepiece[0]);
+        next.eyepiece[1]=read("EyepieceY",next.eyepiece[1]);
+        next.eyepiece[2]=read("EyepieceZ",next.eyepiece[2]);
+        next.radius=read("LensRadius",next.radius);
+        next.surfaceOffset=read("LensSurfaceOffset",next.surfaceOffset);
+        next.eyeRelief=read("EyeRelief",next.eyeRelief);
         // A broad eye box is useful during live lens-placement tuning.
-        next.eyeBox=read("EyeBoxRadius",next.eyeBox,.01f,1.5f);
-        next.verticalFov=read("VerticalFovDegrees",next.verticalFov,1,60);
+        next.eyeBox=read("EyeBoxRadius",next.eyeBox);
+        next.verticalFov=read("VerticalFovDegrees",next.verticalFov);
+        // Positive dimensions and a perspective FOV are structural requirements.
+        if(next.radius<=0 || next.eyeRelief<=0 || next.eyeBox<=0 ||
+            next.verticalFov<=0 || next.verticalFov>=180) valid=false;
         if(valid) scopeSettings=next;else ++scopeFailures;
     }
 
@@ -2115,7 +2118,7 @@ namespace
         bool optical;
         OpenXRVR::EyeView views[2]{};
         float camera[16]{};
-        VRMath::Matrix viewProjection{},wristSnapshot{},dashboardSnapshot{};
+        VRMath::Matrix viewProjection{},wristSnapshot{},dashboardSnapshot{},lensSnapshot{};
         bool wristValid=false,dashboardValid=false;
         float shadowForward[4]{};
         float opticalRay[4]{};
@@ -2123,7 +2126,7 @@ namespace
         long long poseTime;
     public:
         EyeMarker(int value,unsigned role,unsigned id,bool start):CBaseDC(),eye(value),stage(role),frame(id),begin(start),optical(buildingScope),poseTime(viewTime)
-        {views[0]=xrViews[0]; views[1]=xrViews[1]; std::memcpy(camera,eyeViewports[value].mViewInverseMatrix,sizeof(camera));
+        {views[0]=xrViews[0]; views[1]=xrViews[1]; lensSnapshot=scopeLensPose; std::memcpy(camera,eyeViewports[value].mViewInverseMatrix,sizeof(camera));
          std::memcpy(shadowForward,gameShadowForward,sizeof(shadowForward));
          VRMath::Matrix cameraWorld{},projection{};
          std::memcpy(cameraWorld.data(),eyeViewports[value].mViewInverseMatrix,sizeof(cameraWorld));
@@ -2181,7 +2184,7 @@ namespace
                 if(!begin && stage==3)
                 {
                     scopeCompletedFrame=frame;
-                    std::memcpy(completedScopeCamera.data(),camera,sizeof(camera));
+                    completedScopeCamera=lensSnapshot; // Physical aperture, independent of bore-aligned optical view.
                     ++scopeRenders;
                     if(scopeCaptureRequested.exchange(false))
                     {
@@ -3463,11 +3466,14 @@ namespace
         VRMath::Matrix gun{};
         if(scopeSettings.enabled && scopeObjectRender && VRReloadRuntime::GetRenderedSniperPose(gun))
         {
-            scopeCamera=VRScope::Camera(gun,scopeSettings);
+            scopeLensPose=VRScope::Camera(gun,scopeSettings);
+            scopeCamera=scopeLensPose;
+            VRMath::Vector sightMuzzle{};
+            if(VRHands::GetScopeMuzzle(gun,sightMuzzle)) scopeCamera=VRScope::SightCamera(scopeLensPose,sightMuzzle);
             for(const auto& eye:eyeViewports)
             {
                 VRMath::Vector position{};std::memcpy(position.data(),eye.mViewInverseMatrix[3],sizeof(position));
-                if(VRScope::InEyeBox(scopeCamera,position,scopeSettings)) scopeActive=true;
+                if(VRScope::InEyeBox(scopeLensPose,position,scopeSettings)) scopeActive=true;
             }
             alignas(16) auto opticalBase=*base;opticalBase.mAspect=worldTargetAspect;
             if(scopeProbeFrames) {scopeActive=true;--scopeProbeFrames;}
@@ -3591,12 +3597,15 @@ namespace
         // setup snapshot or a newer independently sampled controller pose.
         if(scopeSettings.enabled && queuedScopeGunValid)
         {
-            scopeCamera=VRScope::Camera(queuedScopeGun,scopeSettings);
+            scopeLensPose=VRScope::Camera(queuedScopeGun,scopeSettings);
+            scopeCamera=scopeLensPose;
+            VRMath::Vector sightMuzzle{};
+            if(VRHands::GetScopeMuzzle(queuedScopeGun,sightMuzzle)) scopeCamera=VRScope::SightCamera(scopeLensPose,sightMuzzle);
             scopeActive=false;
             for(const auto& eye:eyeViewports)
             {
                 VRMath::Vector position{};std::memcpy(position.data(),eye.mViewInverseMatrix[3],sizeof(position));
-                if(VRScope::InEyeBox(scopeCamera,position,scopeSettings)) scopeActive=true;
+                if(VRScope::InEyeBox(scopeLensPose,position,scopeSettings)) scopeActive=true;
             }
             alignas(16) auto opticalBase=saved[0][0];opticalBase.mAspect=worldTargetAspect;
             if(scopeProbeFrames) scopeActive=true;
