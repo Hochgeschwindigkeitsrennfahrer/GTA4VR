@@ -51,7 +51,7 @@ workspace "GTAIV.EFLC.FusionFix"
    defines { "rsc_LegalCopyright=\"GPL-3.0 license\""}
    defines { "rsc_InternalName=\"%{prj.name}\"", "rsc_ProductName=\"%{prj.name}\"", "rsc_OriginalFilename=\"%{cfg.buildtarget.name}\"" }
    defines { "rsc_FileDescription=\"GTAIV.EFLC.FusionFix\"" }
-   defines { "rsc_UpdateUrl=\"https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix\"" }
+   defines { "rsc_UpdateUrl=\"https://github.com/bordplate/GTA4VR\"" }
 
    local major = os.date("%d")
    local minor = os.date("%m")

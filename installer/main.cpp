@@ -11,19 +11,17 @@ int main(int argc, char** argv)
 
     HICON icon = LoadIconW(hm, MAKEINTRESOURCEW(101));
     muSetInstallerIcon(hm, icon);
-    muSetInstallerWindowTitle(hm, "Fusion Fix for GTAIV: The Complete Edition");
-    muSetInstallerMainInstruction(hm, "Choose where to install Fusion Fix");
+    muSetInstallerWindowTitle(hm, "GTA4VR for GTA IV: The Complete Edition");
+    muSetInstallerMainInstruction(hm, "Choose where to install GTA4VR");
     muSetInstallerContent(hm,
-        "Fusion Fix is a comprehensive modification for Grand Theft Auto IV: The Complete Edition that aims "
-        "to fix a wide range of technical issues, bugs, and limitations in the game that were left unaddressed in "
-        "official updates. This project represents a community-driven effort to restore and enhance the Grand Theft "
-        "Auto IV experience for modern systems."
+        "GTA4VR adds experimental single-player VR to GTA IV: The Complete Edition, based on FusionFix. "
+        "Vive headset and Wands with SteamVR are the tested setup. Some mission actions still require flat-screen play."
         "\n\n"
-        "<a href=\"https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix\">GitHub repository</a>\n"
-        "<a href=\"https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/issues\">Report an issue</a>"
+        "<a href=\"https://github.com/bordplate/GTA4VR\">GitHub repository</a>\n"
+        "<a href=\"https://github.com/bordplate/GTA4VR/issues\">Report an issue</a>"
     );
 
-    muSetInstallerFooter(hm, "<a href=\"https://fusionfix.io/iv\">fusionfix.io/iv</a>");
+    muSetInstallerFooter(hm, "<a href=\"https://github.com/bordplate/GTA4VR\">GTA4VR</a>");
     muSetRGLAppID(hm, "Grand Theft Auto IV", "");
     muSetSteamAppID(hm, "12210", "GTAIV");
     // any of them marks a game folder, "Launch" starts the first one found
@@ -58,7 +56,7 @@ int main(int argc, char** argv)
     muSetInstallerThemeColor(hm, MU_THEME_LIGHT, MU_COLOR_LINK, RGB(0x00, 0x14, 0x5A));            // navy, lighter blues are hard to read over the picture
     muSetInstallerThemeColor(hm, MU_THEME_LIGHT, MU_COLOR_LINK_HOVER, RGB(0x00, 0x32, 0xA0));
 
-    muSetUpdateURL(hm, "https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/releases/latest/download/GTAIV.EFLC.FusionFix.zip");
+    muSetUpdateURL(hm, "https://github.com/bordplate/GTA4VR/releases/latest/download/GTA4VR.zip");
     return muRunInstaller();
 }
 

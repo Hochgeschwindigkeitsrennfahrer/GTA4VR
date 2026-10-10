@@ -8,7 +8,7 @@ body:
     attributes:
       label: What should happen
       placeholder: |
-        Fusion Fix should have a menu setting that downloads more ram and boosts fps.
+        Describe the VR interaction or feature you would like to improve.
       description: >
         Be specific and descriptive.
 
@@ -16,7 +16,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: "Check the [latest git build](https://ci.appveyor.com/api/projects/ThirteenAG/gtaiv-eflc-fusionfix/artifacts/GTAIV.EFLC.FusionFix.zip) in case it's already implemented."
+        - label: "Check the [latest git build](https://github.com/bordplate/GTA4VR/actions/workflows/msvc_x86.yml) in case it's already implemented."
           required: true
-        - label: "[Search for other requests](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/search?q=my+issue&type=issues) of the same feature."
+        - label: "[Search for other requests](https://github.com/bordplate/GTA4VR/issues) of the same feature."
           required: true

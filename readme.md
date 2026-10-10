@@ -1,464 +1,137 @@
-[![Actions Status: Release](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/actions/workflows/msvc_x86.yml/badge.svg)](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/actions)
-[![AppVeyor](https://img.shields.io/appveyor/build/ThirteenAG/GTAIV-EFLC-FusionFix?label=AppVeyor%20Build&logo=Appveyor&logoColor=white)](https://ci.appveyor.com/project/ThirteenAG/gtaiv-eflc-fusionfix)
-
-<p align="center">
-  <a href="https://fusionfix.io/iv" target="_blank"><img width="600" src="https://raw.githubusercontent.com/ThirteenAG/GTAIV.EFLC.FusionFix/refs/heads/master/installer/ff_iv_outline2.svg"></a>
-  <br />
-  <a href="https://patreon.fusionfix.io/" target="_blank"><picture><source media="(max-width: 768px) and (prefers-color-scheme: dark)" srcset="https://fusionlegacyinitiative.com/sponsors-progress/sponsors-progress-ffiv-mobile-dark.svg"><source media="(max-width: 768px)" srcset="https://fusionlegacyinitiative.com/sponsors-progress/sponsors-progress-ffiv-mobile.svg"><source media="(prefers-color-scheme: dark)" srcset="https://fusionlegacyinitiative.com/sponsors-progress/sponsors-progress-ffiv-dark.svg"><img width="100%" src="https://fusionlegacyinitiative.com/sponsors-progress/sponsors-progress-ffiv.svg"></picture></a>
-  <br />
-  <a href="https://github.com/sponsors/ThirteenAG"><picture><source media="(prefers-color-scheme: dark)" srcset="https://thirteenag.github.io/img/buttons/github-dark.svg"><img src="https://thirteenag.github.io/img/buttons/github.svg" width="250"></picture></a>
-  <a href="https://ko-fi.com/thirteenag"><picture><source media="(prefers-color-scheme: dark)" srcset="https://thirteenag.github.io/img/buttons/kofi-dark.svg"><img src="https://thirteenag.github.io/img/buttons/kofi.svg" width="250"></picture></a>
-  <a href="https://paypal.me/SergeyP13"><picture><source media="(prefers-color-scheme: dark)" srcset="https://thirteenag.github.io/img/buttons/paypal-dark.svg"><img src="https://thirteenag.github.io/img/buttons/paypal.svg" width="250"></picture></a>
-  <a href="https://www.patreon.com/ThirteenAG"><picture><source media="(prefers-color-scheme: dark)" srcset="https://thirteenag.github.io/img/buttons/patreon-dark.svg"><img src="https://thirteenag.github.io/img/buttons/patreon.svg" width="250"></picture></a>
-  <a href="https://boosty.to/thirteenag"><picture><source media="(prefers-color-scheme: dark)" srcset="https://thirteenag.github.io/img/buttons/boosty-dark.svg"><img src="https://thirteenag.github.io/img/buttons/boosty.svg" width="250"></picture></a><br><br>
-  <a href="https://discord.gg/2ckFCS572Z" target="_blank"><img width="50" src="https://raw.githubusercontent.com/ThirteenAG/GTAIV.EFLC.FusionFix/refs/heads/master/installer/discord.svg"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://t.me/fusionfix" target="_blank"><img width="50" src="https://raw.githubusercontent.com/ThirteenAG/GTAIV.EFLC.FusionFix/refs/heads/master/installer/telegram.svg"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://www.youtube.com/@FusionFix10" target="_blank"><img width="50" src="https://raw.githubusercontent.com/ThirteenAG/GTAIV.EFLC.FusionFix/refs/heads/master/installer/youtube.svg"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://x.com/fusionfix10" target="_blank"><img width="50" src="https://raw.githubusercontent.com/ThirteenAG/GTAIV.EFLC.FusionFix/refs/heads/master/installer/x.svg"></a>
-  &nbsp;&nbsp;&nbsp;
-</p>
-
-This projects aims to fix some issues in Grand Theft Auto IV: The Complete Edition, as well as add various new features for modern systems.
-
-This fork uses FusionFix as a base to add VR to the game.
-
-Also available for [Max Payne 3](https://github.com/ThirteenAG/MaxPayne3.FusionFix#readme) and [other games](https://thirteenag.github.io/wfp).
-
-## Installation:
-
-> [!NOTE]
-> Install **Grand Theft Auto IV: The Complete Edition** from your library, then:
->
-> * Download [GTAIV.EFLC.FusionFix.zip](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/releases/latest/download/GTAIV.EFLC.FusionFix.zip) and unpack its contents to the game's root directory, where the exe is located.
-> * Or alternatively download [GTAIV.EFLC.FusionFixWebInstaller.exe](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/releases/latest/download/GTAIV.EFLC.FusionFixWebInstaller.exe) or [GTAIV.EFLC.FusionFixOfflineInstaller.exe](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/releases/latest/download/GTAIV.EFLC.FusionFixOfflineInstaller.exe), open it, select the game's directory and wait for it to finish. Note: If you get an error while installing, this is likely due to the installer not having write access. Go into the properties of the games directory and change your system's users to have write permission and hit apply, now installation should work. 
->
-
-> [!WARNING]
-> Non-Windows users (Proton/Wine) need to perform a **DLL override**.
->
-> <details>
-> <summary>Click here for details</summary>
-> <br>
->
-> You need to tell Wine explicitly that the `dinput8.dll` file is to be used. There's more than one way to achieve it. Note that Proton Experimental already loads it by default, so you may skip this step.
->
-> ###
->
-> **Method 1**: `WINEDLLOVERRIDES` variable lets you temporarily specify DLL overrides. It can be used from a command line as well as in the Steam launcher. In case of command line, simply prepend the usual start command with `WINEDLLOVERRIDES="dinput8=n,b"` . For Steam, head to game’s properties and set `LAUNCH OPTIONS` to `WINEDLLOVERRIDES="dinput8=n,b" %command%`.
->
->  ![steam-wine-dll-override](https://cookieplmonster.github.io/assets/img/setup/steam-wine-dll-override.png)
->
-> **Method 2**: Use `winecfg` tool to make a permanent override for a specific Wine prefix. In case of Proton, Steam creates the Wine prefix for Grand Theft Auto IV: The Complete Edition in `$HOME/.steam/steam/steamapps/compatdata/12210/pfx`. Then you need to run `winecfg` with that path:
-> ```
-> WINEPREFIX="$HOME/.steam/steam/steamapps/compatdata/12210/pfx" winecfg
-> ```
-> Select `Libraries` tab and fill the combo box with the name of the library you wish to override and hit `Add`. You can verify that it’s been added to the list below with `(native, builtin)` suffix. Then close the window with `OK` button.
->
-> ![winecfg-dll-override](https://cookieplmonster.github.io/assets/img/setup/winecfg-dll-override.png)
->
-> Related Wine documentation:
-> * [More on DLL overrides](https://wiki.winehq.org/Wine_User's_Guide#DLL_Overrides)
-> * [More on WINEDLLOVERRIDES method](https://wiki.winehq.org/Wine_User's_Guide#WINEDLLOVERRIDES.3DDLL_Overrides)
-> </details>
->
-> Additionally:
-> * Install and run Protontricks.
-> * Select "Grand Theft Auto IV" -> "Select the default Wineprefix" -> "Install a Windows DLL or component".
-> * Search for "d3dx9_43", select it and click OK.
+# GTA4VR
 
 > [!IMPORTANT]
-> Only The Complete Edition is fully supported. Legacy versions of the game (e.g., v1.0.7.0 or v1.0.8.0) additionally require the installation of the [Legacy Addon](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/releases/latest/download/GTAIV.EFLC.FusionFixLegacyAddon.zip), which is done by unpacking its contents to the game's root directory.
->
-> Multiplayer is not supported. [Take-Two has agreed that it generally will not take legal action against third-party projects involving Rockstar’s PC games that are single-player, non-commercial, and respect the intellectual property (IP) rights of third parties. This does not apply to (i) multiplayer or online services; (ii) tools, files, libraries, or functions that could be used to impact multiplayer or online services, or (iii) use or importation of other IP (including other Rockstar IP) in the project; or (iv) making new games, stories, missions, or maps.](https://support.rockstargames.com/articles/5NVOAYjcTomO8v6SX2k76k/pc-single-player-mods)
-> Forking this project or creating any derivative software intended for use with multiplayer of any kind is forbidden. Any persons or entities who do so are not associated with this project.
-> 
-> No support will be provided for illegal copies of the game. Purchase an official copy from either [Steam](https://store.steampowered.com/app/12210/) or [Rockstar Games Launcher](https://store.rockstargames.com/game/buy-grand-theft-auto-iv).
+> This entire project is fully AI slop coded. While I have a lot of experience with reverse engineering and game modding, I have not reversed or coded anything for this project. It is entirely AI driven and all I've done is instruct it about what I want, which means I have not read basically any of the produced code. I'm sharing the project because I believe there's still some value to it if someone happens to find it interesting.
 
-## New menu options
+A single-player VR mod for **Grand Theft Auto IV: The Complete Edition**, built on [FusionFix](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix).
 
-> FusionFix adds new options to the in-game menu that can be easily toggled and customized in real time. The config file allows for further customization by advanced users.
+> **Full playthrough entirely in VR is not possible yet.** Shops, some mission actions, NPC interactions and minigames are not supported. You will need to temporarily disable VR and play those sections on a flat screen with keyboard/mouse or a gamepad.
 
-#### Display
+The Lost and Damned and The Ballad of Gay Tony have **not** been tested at all.
 
-- **FOV**, adjusts in-game field of view
-- **Language**, switch languages in-game like in previous versions
-- **Definition**, toggle the old fuzzy look from consoles
-- **Console Gamma**, restores contrasted look from consoles
-- **Console Auto Exposure**, restores the stronger auto exposure / eye adaptation effect from consoles
-- **Motion Blur**, a separate toggle for motion blur with several intensity levels
-- **Depth of Field**, controls how intense the distant blur is during gameplay and whether it's enabled in cutscenes
-- **Tree Lighting**, offers "PC", "PC" with some improvements ("PC+") and "Console" style tree lighting
-- **Tree Alpha**, offers "PC", "PC" with some improvements ("PC+") and "Console" alpha test reference for trees
-- **Bloom**, a global toggle for bloom
-- **Screen Filter**, an option to change color filters in the main game and episodes
-- **Distant Lights**, toggle for integrated [Project2DFX](https://thirteenag.github.io/p2dfx)
+## Current features
 
-#### Graphics
+- **First-person stereo rendering:** independent eye views, headset rotation, room-scale movement with body collision and physical crouching.
+- **Tracked hands and arms:** character-rig IK follows the controllers, with button-driven finger poses and physical hand/forearm contact.
+- **Locomotion:** head-relative touchpad movement, jogging, sprinting, jumping and strafing/backward movement.
+- **Physical firearms:** controller-directed shooting, two-hand aiming, recoil, magazines/shells/rockets, charging handles and slides. The pump shotgun requires pumping after each shot. Sniper scopes render a magnified view inside the scope.
+- **Melee and throwing:** tracked punches, knife/bat strikes, and physical grenade/Molotov throws.
+- **Physics interaction:** grab, move and throw props; use one or two hands; manipulate car doors, bonnets and trunks; grab ragdolled NPCs. Object weight and arm strength affect movement.
+- **Cars:** freely tracked hands, physical steering-wheel grip and rotation, basic driving controls, left-hand drive-by weapon handling and the native phone. Other vehicle classes and combined gameplay routes need more testing.
+- **VR UI:** wrist radar with health/armor and wanted stars; a car dashboard radar; stereo subtitles and popup HUD; world-space loading/pause screens with a controller pointer.
+- **Physical phone:** the native phone stays in the character's hand, with controller navigation rather than a large HUD replacement.
 
-- **FPS Limiter**, set a custom FPS limit, selects from a list of predefined values, or turn it off
-- **Anti-aliasing**, a toggle for FXAA or SMAA
-- **Volumetric Fog**, a more advanced fog shader that hides the edges of the world
-- **Sun Shafts**, a godrays implementation faithful to the original art style
-- **Extended Sunlight Reach**, allows sunlight to reach surfaces that it couldn't before, and increases cloud shading
-- **Tone Mapping**, prevents highlights from being blown out, more operators can be found [here](https://github.com/Parallellines0451/GTAIV.EFLC.FusionShaders/tree/main/assets/luts/samples)
-- **Ambient Occlusion**, a toggle for scalable ambient obscurance
-- **Shadow Filter**, toggles between sharp, soft, or contact hardening shadows
-- **Graphics API**, selects between DirectX 9 and Vulkan (through [DXVK](https://github.com/doitsujin/dxvk/releases)), requires a restart 
+Physical firearm coverage includes the pistol, combat pistol, Micro-SMG, SMG, AK-47, M4, pump/combat shotguns, both sniper rifles and RPG. Physical reloading is currently an on-foot interaction; vehicles use native ammunition/reload handling.
 
-#### Game
+### Feature showcase
 
-- **Skip Intro**, added an option to skip intro
-- **Skip Menu**, added an option to skip main menu after startup
-- **Letterbox**, draws cutscene borders on top and bottom of the screen
-- **Pillarbox**, draws cutscene borders on screen sides in ultrawide
-- **Transparent Map Menu**, makes the map screen background transparent
-- **FPS Counter**, shows an episode colored FPS counter on the top left of the screen
-- **Windowed**, toggle windowed mode
-- **Windowed Borderless**, toggle borderless mode
-- **Pause Game On Focus Loss**, pauses the game when it's minimized
-- **Extra Night Shadows**, forces every lamppost and player headlights to cast shadows (*original PC-only "feature"; extremely broken, not recommended*)
-- **LightSyncRGB**, custom ambient lighting for IV, TLAD and TBOGT, health indication on G-Keys, police lights, ammo counter, only Logitech hardware is supported, requires Logitech G HUB app, [**watch full clip on YouTube**](https://www.youtube.com/watch?v=oLxn3q-NnZ0&hd=1)
+Short clips of the current build; these demonstrate individual features, not a complete playable campaign.
 
-![LightSyncRGB](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/assets/4904157/f925ad27-19ce-4dde-8801-0cec1578ade7)
+**Firearms and physical reloads**
+![Tracked shooting and weapon handling](docs/media/firearms.gif)
 
-- **Seasonal Events**, enables added seasonal events at specific date
-- **Check For Fusion Fix Updates**, checks if there's an update available on startup
+**Physical combat**
+![Two fist-fight clips combined](docs/media/fist-fight.gif)
 
-#### Audio
+**Grabbing and throwing props**
+![Lifting a chair and throwing a mug](docs/media/physics-grabbing.gif)
 
-- **Cutscene Audio Sync**, [see issue 691](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/issues/691), only enables this if you experience audio desynchronization in cutscenes
-- **Alternative Dialogues**, when enabled, forces the game to use alternative dialogues in some missions
+**Vehicle interactions**
+![Breaking car glass and closing a door](docs/media/car-interaction.gif)
 
-#### Controls
+**Driving and tracked hands**
+![Looking at passengers and driving](docs/media/driving.gif)
 
-- **Always Run**, allows running by default and sprinting in interiors, tap Sprint button to toggle between walk and run
-- **Allow Movement When Zoomed**, allows movement when aiming with a sniper rifle
-- **Extended Sniper Controls**, allows aiming with sniper rifles without using the scope, press Jump button to toggle between third-person aim and the scope
-- **Auto Climb Ladders**, makes player climb ladder automatically when getting close to ladder
-- **Camera Shake**, shake effect has been fixed to work consistently at any frame rate and can be disabled with this option
-- **Stunt Jump Camera**, can be disabled to skip the cinematic camera and slow motion during unique stunt jumps
-- **Fence Climb & Car Jack Camera**, can be disabled to skip the cinematic camera when climbing fences and stealing cars
-- **Centered Vehicle Camera**, makes vehicle camera centered, for more options install the [original mod](https://github.com/gennariarmando/iv-centered-vehicle-cam) separately
-- **Centered On Foot Camera**, makes on foot camera centered, also for more options install the [original mod](https://github.com/gennariarmando/iv-centered-onfoot-cam)
-- **Turn Indicators**, allows the player to use vehicle turn indicators and hazard lights
-- **Always Show Bullet Traces**, shows bullet traces on every shot instead of randomly, like in the older games
-- **Disable Wardrobe Transition**, disables all screen fading in/out process when switching clothes in the wardrobe or buying clothes in the clothes stores
-- **Instant Taxi Stop**, makes the taxi stop immediately after skipping taxi ride journey
-- **Look-Around Sensitivity**, controls the look sensitivity when using controller
-- **Aiming Sensitivity**, controls the aim sensitivity when using controller
-- **Mouse Look Sensitivity**, controls the look sensitivity when using mouse
-- **Mouse Aim Sensitivity**, controls the aim sensitivity when using mouse
-- **Vehicle Camera Centering Delay**, controls the time until vehicle camera auto centering kicks in after moving it
-- **On Foot Camera Centering Delay**, controls the time until on foot camera auto centering kicks in after moving it
-- **Vehicle Camera Turn Speed**, controls the camera turn speed when driving a vehicle and turning
-- **Gamepad Icons**, allows to select various controller icon styles (Xbox 360, Xbox One, PS3, PS4, PS5, Nintendo Switch, Steam Deck)
-- **Raw Input**, raw input for menu and adjustments for in-game camera mouse look
+## Known limitations and mission blockers
 
-## Core/Gameplay Changelog
+| Limitation | Tracking |
+| --- | --- |
+| **Concrete Jungle:** the required take-cover step needs keyboard/gamepad input; VR controls do not provide it yet. | [#12](https://github.com/bordplate/GTA4VR/issues/12) |
+| **Clothing stores:** purchasing items does not work through VR controls, blocking an early mission. | [#13](https://github.com/bordplate/GTA4VR/issues/13) |
+| **Minigames:** not currently playable through the VR control path. | [#14](https://github.com/bordplate/GTA4VR/issues/14) |
+| **NPC services:** interactions such as hot-dog vendors and bowling staff are missing; the bowling interaction is required for mission progression. | [#15](https://github.com/bordplate/GTA4VR/issues/15) |
 
-### General
+There are also known stereo issues with [traffic-light lamps](https://github.com/bordplate/GTA4VR/issues/1), [objective markers](https://github.com/bordplate/GTA4VR/issues/4) and [water](https://github.com/bordplate/GTA4VR/issues/6). UI coverage, vehicle classes and lifecycle handling remain under development. The desktop currently shows an eye view; an independent third-person desktop camera is [planned](https://github.com/bordplate/GTA4VR/issues/7).
 
-- [Comprehensive shader overhaul with fixes for several longstanding issues, and various improvements](https://www.youtube.com/watch?v=sAfKfvAIsXw)
-- [Fixed recoil behavior that was different when playing with keyboard/mouse and gamepad](https://github.com/GTAmodding/GTAIV-Issues-List/issues/6)
-- [Fixed forced "definition off" setting in cutscenes, now cutscenes will respect the menu setting](https://github.com/GTAmodding/GTAIV-Issues-List/issues/5)
-- [Fixed DLC car lights in TBoGT](https://github.com/GTAmodding/GTAIV-Issues-List/issues/3)
-- [Fixed various issues related to frame rate](https://github.com/GTAmodding/GTAIV-Issues-List/issues/112)
-- [Fixed aiming zoom in TBoGT](https://github.com/GTAmodding/GTAIV-Issues-List/issues/19)
-- [Fixed possible crash when manually dialing a phone number using the keypad in TLAD](https://github.com/GTAmodding/GTAIV-Issues-List/issues/232)
-- [Fixed possible crash in TLAD mission "Marta Full of Grace"](https://github.com/GTAmodding/GTAIV-Issues-List/issues/235)
-- [Added an option to fix a bug that only make taxis spawn](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/issues/85)
-- [Added a file overload solution that allows to replace game files without actually replacing them](https://github.com/ThirteenAG/Ultimate-ASI-Loader?tab=readme-ov-file#update-folder-overload-from-folder)
-- Added IMG Loader (from update folder)
-- Added GXT Overloading, allow game to load additional gxt files to overwrite vanilla lines or add new lines, without editing vanilla gxt files
-- Added a solution to add entries to shader preload list dynamically
-- Increased corona limit to avoid heavy flickering of game's lights
-- Improved ultrawide support
-- Fixed improper VRAM detection on some setups
-- Fixed draw distance sliders not being applied on startup
-- Fixed mouse cursor scale, and hidden mouse cursor when using controller
-- Significantly sped up loading screens
-- Added various fixed weapon, movement and other animations
-- Added various fixed vehicle models
-- Fixed Johnny and Luis' broken head models
-- Workaround for Johnny's broken facial animations in cutscene
-- Restored missing lamppost coronas and uncompressed corona texture from console
-- Added new tree LOD atlas based on the PC trees
-- Fixed PC grass models stuck underground
-- Fixed jagged vehicle reflections
-- LOD lights now appear at the appropriate time and can render in cutscene, like on the console version
-- Added an option to allow depth related postfx effect to render behind transparent objects properly
-- Added an option to apply MSAA for various reflection maps
-- Restored higher shadow render distance from old versions of the game
-- Improved cascaded shadows performance, and added an option to double their resolution
-- Added dynamic shadows for trees
-- Restored night shadow for vehicles
-- Made night shadows resolution be adjusted by night shadows option
-- Reduced water flickering issue (only when **Extra Night Shadows** is off)
-- Added several cheat code to enable seasonal events, restore some unused player assets for Niko and Johnny, speed up game physics, and spawn some vehicles in TLAD and TBoGT, they can be found hidden in relevant locations, or finding them [here](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/blob/master/source/cheats.ixx)
+**Performance varies by scene.** Dense city views can easily fall below the headset's refresh rate. A steady 90 FPS experience everywhere is not promised, see [performance work](https://github.com/bordplate/GTA4VR/issues/2).
 
-### Scripts
+## Headsets and controllers
 
-#### General
+**VR testing has only been done with a Vive headset and Vive Wands, using SteamVR on Windows.** The recorded development setup is a VIVE Pro at 90 Hz, GTA IV Complete Edition 1.2.0.59 and the DXVK/Vulkan rendering path.
 
-- [Fixed various script issues related to frame rate](https://github.com/GTAmodding/GTAIV-Issues-List/issues/294)
-- Fixed police computer softlock where one interface from it couldn't be closed with the keyboard
-- Fixed too sensitive arrow keys inputs in police computer virtual keyboard
-- Fixed possible issue where player gets stuck on buying food for several seconds in fast-food restaurants
-- Fixed possible crash when The Lost clubhouse memorial wall photos are full
-- Fixed busker script terminating too early in TBoGT, now Luis can give money to buskers normally
-- Fixed Armando and Henrique's respect not increasing after finishing hang out friend activity
-- Restored Star Junction Burger Shot blip in TBoGT
-- Improved various scripted camera mouse controls
-- Added a new phone option to save game anywhere
+| Configuration | What to expect |
+| --- | --- |
+| Tested Vive + Wands + SteamVR setup | The reference configuration for the features described above; known limitations still apply. |
+| Other headsets through SteamVR | Headset rendering and tracking are plausible because the mod uses OpenXR. This is an engineering expectation, **not tested compatibility**. |
+| Index, Touch or other controllers | Untested. The code currently supplies default bindings only for the Vive controller profile. Expect custom SteamVR bindings and possibly code changes or hand/weapon pose calibration; plug-and-play support is not promised. |
+| Other OpenXR runtimes, standalone headsets without PC streaming, or Linux/Proton | Untested. The current Vulkan bootstrap is SteamVR-specific; OpenXR support alone does not establish compatibility. |
 
-#### Models
+There is not enough testing to give a meaningful percentage chance that another configuration will work. Other SteamVR headsets are a more plausible first experiment than changing both the runtime and controllers. Headset compatibility and usable controller bindings are separate questions. See the [OpenXR interaction-profile specification](https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html#semantic-paths-interaction-profiles) for the underlying input model.
 
-- Fixed pool ball shadows flickering in Playboy apartment's pool table
-- Restored transparency on pool minigame
-- Restored console player transparency on air hockey minigame
-- Restored traffic cops in toll booths
-- Restored non-cop pedestrians in helicopters flying around city
-- Restored missing book from one kind of preacher in IV
-- Restored own unique soda can model for eCola vending machines instead of reusing Sprunk ones
-- Restored TLAD combat shotgun own unique prop model (prop_e1_pumpshot) instead of reusing IV model (cj_prop_pumpshot)
-- Restored the gun shop owner own unique model (M_M_GunNut_01) instead of using the strip club bouncer model (M_Y_bouncer_01)
-- Fixed two bought PC Perseus suits textures not matching prop models
-- Fixed Niko's hands being forced back to vanilla while switching clothes to Perseus suits
-- Fixed Esperanto being spawned instead of Roman's Taxi in Roman's cab depot
+## Installation
 
-#### Voice Lines
+1. Install the official Windows **GTA IV: The Complete Edition** and [SteamVR](https://store.steampowered.com/app/250820/SteamVR/). In SteamVR settings, make SteamVR the active OpenXR runtime.
+2. Download **GTA4VR.zip** from [Releases](https://github.com/bordplate/GTA4VR/releases/latest).
+3. Extract its contents directly into the game folder containing **GTAIV.exe**. For Steam, this is normally `steamapps/common/Grand Theft Auto IV/GTAIV`. Allow the mod files to merge/replace after backing up any existing mod installation.
+4. Start SteamVR, turn on your headset/controllers, then launch the game normally.
 
-- Fixed incorrect voice lines after exiting Chinatown gun shop when not buying something
-- Fixed Johnny's incorrect voice lines after exiting the gun shop when buying something (used to use voice lines from Higgin's Heli Tours)
-- Restored Luis' voice lines when exiting the gun shop (buying/not buying)
-- Restored missing voice lines from Luis & Johnny when exiting the Broker gun shop
-- Restored missing voice lines from Johnny when triggering pool minigame
-- Restored non-friend NPC voice lines on air hockey minigame
-- Restored Jim, Terry, Clay own voice lines on hi-lo cards minigame
-- Restored Uptown Riders' own voice lines on arm wrestling minigame (used to use Angels of Death's voice lines)
-- Restored Clay's voice lines, he'll now respond to Johnny's arrival in hang out friend activity
-- Restored Armando and Henrique's voice lines, they'll now greet Luis when he is close to them in strip club
-- Restored Luis' voice lines, he'll now respond to what the pilot tells him about the landmarks during Heli Tours
-- Workaround for TLAD Heli Tours, now pilot voice trigger time won't be affected by Johnny voice text clear bug
+**You do not need a separate FusionFix.** The package includes the FusionFix base, ASI loader, DXVK, OpenXR loader, and VR configuration.
 
-#### Missions
->Note: this section contains story spoilers.
->
-- Fixed scripted depth of field not being removed properly in several missions (e.g. "Catch the Wave")
-- Fixed Faustin execution animation sync issue in mission "The Master and the Molotov"
-- Fixed one dialogue couldn't be restored and continue if Niko is too far away from Packie in mission "Diamonds are a Girl's Best Friend"
-- Fixed the FIB arriving too early at the abandoned mansion in mission "To Live and Die in Alderney"
-- Workaround for a bug where Niko dies after being kicked off of Dimitri's helicopter and falling into the water (Deal Ending)
-- Workaround for a bug where one burned target fails to fall from hotel rooftop in mission "Late Checkout"
-- Fixed Ilyena call and Brycebug content not triggering after loading save (From Ilyena's random encounter and Stubbs' job)
-- Fixed damaged vehicles increasing payment, rather than decreasing payment, in Brucie's web email vehicles theft
-- Fixed vehicles being removed too early after parking it in garage in Brucie's web email vehicles theft
-- Fixed TLAD intro scripted cutscene cutting off distant world in several shots
-- Fixed Johnny being invisible in the second intro cutscene
-- Fixed possible issue where mission fails to continue even though Johnny has been close to Roman's Taxi in mission "Roman's Holiday"
-- Fixed Roman sometimes lacking clothes model or using incorrect clothes textures in TLAD ending credits
-- Fixed Malc's motorcycle using incorrect colors in TLAD ending credits
-- Fixed Yusuf's incorrect position during one scripted cutscene in mission "Caught With Your Pants Down"
-- Fixed delayed animations in two scripted cutscenes in mission "Departure Time"
-- Fixed Luis sometimes leaving cover automatically while shooting behind cover in Bulgarin's plane in mission "Departure Time"
+Optional web/offline installers are also provided in releases.
 
-#### Misc
+### Configuration and flat-screen play
 
-- Fixed ammo reset when buying different pistol from gun shop in IV
-- Fixed ammo reset when buying different weapon from gun shop in TLAD/TBoGT
-- The Desert Eagle and Micro SMG are now using their unique sounds when viewing them (required modifying the animation dictionary "missgunlockup.wad")
-- Restored the temporary ban from the gun shop when attacking the owner in TLAD/TBoGT
-- Re-enabled Roman's cab depot script in TLAD
-- Superd2 is now accepted by car wash, meanwhile packer2, police3, police4, policew are now not accepted
-- Fixed incorrect car wash price help text for a one type of taxi
-- Fixed time won't advance after skipping taxi ride journey
-- Fixed 200 pigeons extermination annihilator reward preventing Brucie from landing helicopter at Star Junction landing site
-- Fixed damaged vending machines being usable
-- Fixed phone being not usable after giving money to buskers
-- Fixed using phone camera will terminate beggar script immediately
-- Fixed NPCs driving away with a delay after finishing paying in toll booths
-- Workaround for NPCs abnormal overtaking behavior in toll booths
-- Added support to use mouse wheel when using phone keypad
-- Fixed memorial wall photos not spawning while entering The Lost clubhouse from roof entry in TLAD
-- Fixed several motorcycles using incorrect paying animation in toll booths in TBoGT
-- Fixed Luis' vehicle always being removed after playing golf and drinking minigame
-- Fixed scripted depth of field not being removed after playing drinking minigame
+Settings are in `plugins/GTAIV.EFLC.FusionFix.ini`, with weapon profiles in `plugins/VRWeapons/`. Configure `[VR] PlayerHeight` for your height in metres; in-game calibration is planned. Controller actions can be rebound through SteamVR.
 
-### Episodic content
+To play a blocked section on a flat screen, quit, set **`[VR] DisableOpenXR=1`** in the INI and relaunch. After completing the section, quit, set **`DisableOpenXR=0`** and relaunch. The old `EnableOpenXR` option is no longer used. Keep a keyboard/gamepad available. Missing or unsupported runtime/headset initialization should fall back to flat-screen play.
 
->Note: most of this content requires additional modifications by the end user to the game in order to fully use these features.
->
-- Added an option to enable support for APC, buzzard, smuggler, floater, blade and all their abilities in IV and TLAD
-- Added an option to enable support for DSR1, grenade launcher, pipe bomb, sticky bomb, AA12 explosive shells, P90 vehicle check, partially parachute and all their abilities in IV, TLAD and TBoGT
-- Added an option to enable explosive rounds on annihilator in IV
-- Added an option to enable camera bobbing in clubs, cell phone switching, altimeter in helicopters and parachute, explosive sniper and fists cheats in IV and TLAD
-- Added an option to raise height limit for helicopters in IV and TLAD to match TBoGT level
-- Added an option to give P90 and AA12 to SWAT and FIB and M249 to police in helicopters in IV and TLAD
-- Added an option to disable SCO signature check, allow game to use any episodic SCO on all episodes
+Development diagnostics remain off by default. Advanced graphics options and the optional SteamVR path override are covered in [graphics bridge notes](docs/vulkan-openxr-feasibility.md) and [diagnostic settings](docs/vr-diagnostics.md).
 
-### Misc
+## Vive Wand controls
 
-- Restored timecycles from consoles with improved auto exposure and restored missing moon in certain weather
-- Fixed glass shards lacking colors
-- Fixed particles flickering in some situations
-- Restored particle file from console and fixed some broken particles
-- Restored environment reflection intensity from consoles
-- Added an option to restore the more reflective cars from consoles
-- Fixed incorrect water texture and post processing noise tiling on **Water Quality** levels other than medium
-- Restored Xbox360 contrast slider behavior
-- Disabled Z-write behavior for emissive shaders to fix some visual issues
-- Improved phone screen resolution
-- Fixed offset mirrors
-- Fixed washed out mirror reflections on some graphics cards
-- Significantly reduced pop-in on higher graphics settings
-- Restored functionality of some rain parameters from visualsettings.dat
-- Fixed black rain droplets and missing refraction
-- Restored console rain density
-- Sped up menu and pause transitions
-- Pressed radar zoom out button now will make it stay zoomed out for a few seconds
-- Fixed date won't advance after dying, being busted or respraying at certain time
-- Fixed helicopter searchlights flickering violently when more than one helicopter is present
-- Fixed radio reset after cutscene
-- Fixed incorrect TBoGT bullet tracer position
-- Fixed NPC lanes swerving suddenly on the Algonquin Bridge when there is a train under it
-- Partially fixed P90 being selectable in vehicles on keyboard
-- Workaround for lights & motion blur flickering intermittently when player is drunk
-- Made stunt jump camera speed be controlled by mouse wheel when using keyboard and mouse
-- Added an option to restore unused death music in IV
-- Fixed not being able to give money to beggars normally on PC
-- Fixed TLAD phone keypad rendering on top of the plastic cover
-- Fixed TLAD incorrect traffic cops head texture
-- Fixed some cutscenes and interiors models
-- Fixed and improved some lights and emissive materials
-- Fixed one font '9' using incorrect style in TBoGT
-- Restored missing color combination for blade
-- Added an option to enable shadows for some objects and vegetation that lack them
-- Added options to customize shadow blur, bias and cascade blending 
-- Various other fixes, like now driveby is disabled when using cellphone
+Bindings are named actions in SteamVR and can be customized. These are the current default gestures; an existing custom binding may need newly added actions assigned manually.
 
-### Some details
+| Context | Controls |
+| --- | --- |
+| Move | Touch the left trackpad; its outer edge jogs. Hold its click to sprint. |
+| Jump / weapon selection | Right trackpad center click jumps; left/right clicks cycle weapons. |
+| Pause / phone | Tap left Menu for pause; hold it to open the phone, including while driving. |
+| Fire / support | Right trigger fires on foot. Hold left grip near the weapon to support it. |
+| Grab | Grip near an object with a free hand; hold to retain it. |
+| Reload | Right grip ejects supported magazines; left grip over the shoulder retrieves ammunition. Insert it, then manipulate the slide/handle/pump as required by the weapon. Ejected magazine ammunition is discarded. |
+| Vehicle entry/exit | Right Menu. |
+| Driving | Right trigger accelerates; left trigger brakes/reverses. Touch left trackpad to steer, or grip the wheel. Right trackpad center click is handbrake; upper click is horn. |
+| Armed driving | Left trigger fires the left-hand weapon; left trackpad click brakes/reverses. Right trackpad side clicks select weapons, including unarmed. |
+| Phone | Right trackpad directional clicks navigate; center confirms. Right Menu goes back. |
+| Pause menus | Point with the right controller and press the trigger; right Menu goes back. |
 
-- **AimingZoomFix** - set to **1** for proper fix, so it behaves like on Xbox360 (memorize the zoom level from the last time aiming was canceled), set to **2** to have this fixed feature enabled in IV and TLAD, set to **-1** to disable this feature. **0** disables the fix, as usual.
-- **FpsLimit** - enter a desired value to specify the number of frames per second you want for the game. Like 30, 45, 60 or more. This will affect all gameplay. Refresh rate offsets may also be used.
-- **CutsceneFpsLimit** - enter a desired value to specify the number of frames per second you want for the game to use on cutscenes only.
-- **DefaultCameraAngleInTLAD** - TLAD uses a different camera angle on bikes, this option can force the original IV camera angle. [Enabled](https://i.imgur.com/PqFHJfU.jpg) / [Disabled](https://i.imgur.com/5kM5Sgn.jpg)
-- **PedDeathAnimFixFromTBoGT** - when you perform a counter attack after a dodge in IV & TLAD, the ped after falling and dying performs an additional death animation, which doesn't happen in TBoGT. [Enabled](https://imgur.com/EYsiGPe) / [Disabled](https://imgur.com/CR3LEdR)
-- **DisableCameraCenteringInCover** - [see issue 20](https://github.com/GTAmodding/GTAIV-Issues-List/issues/20).
-- **VehicleBudget** - allows to increase the budget of vehicles, used to avoid only taxi will spawn. For more information about TaxiBug and VehicleBudget, please watch [TJGM's video](https://www.youtube.com/watch?v=wr8m9kL3U20&t=237s).
-- **PedBudget** - allows to increase the budget of pedestrians.
-
-## Shaders Changelog
-
-#### General
-
-- Fixed z-fighting
-- Restored deferred object and LOD fading
-- Restored console screen door transparency
-
-#### Lighting
-
-- Fixed volumetric lights occlusion
-- Improved light volume transparency
-- Restored XBOX foliage translucency
-- Improved PC foliage lighting
-- Fixed mismatched AO behavior of shadow casting lights
-- Fixed lights that were made invisible with patch 1.0.6.0
-- Fixed black normal map halos on several surfaces such as asphalt, sidewalks and rocks
-
-#### Shadows
-
-- Restored rotated disk filter from versions prior to 1.0.6.0
-- Fixed large shadow rectangles visible from high altitudes
-- Fixed shadowmap being erroneously blurred before the lighting pass
-- Fixed shadows stretching at certain camera angles
-- Fixed shadow view distance being lower than the actual rendered distance
-- Fixed distant shadows with cutoff edges
-- Restored normal offset bias from versions prior to 1.0.6.0
-- Added contact hardening shadows
-- Fixed displaced night shadows
-- Fixed blur artifacts between shadow cascades under some conditions
-- Added basic cascade blending
-- Fixed pitch black shadows under vehicles
-- Added wind sway for real tree shadows
-- Fixed incorrectly offset shadows on water
-- Fixed flickering when shadows of transparent objects overlap
-- Fixed dark lines in night shadows
-
-#### Post processing
-
-- Split depth of field, motion blur and stippling filter into separate passes to prevent overlap
-- Fixed color banding, most noticeably in the sky
-- Added alternative bloom threshold that doesn't cause color shifting
-- Added a mask to selectively filter screen door transparency
-- Fixed depth of field and bloom becoming weaker at resolutions higher than 720p
-- Reduced depth of field haloing and increased bokeh intensity
-- Improved bloom weights and stability in motion
-- Fixed excessively blurry screen compared to consoles caused by leftover anti aliasing code
-- Restored console bloom dilation
-- Fixed flickering auto exposure under some conditions
-- Fixed motion blur becoming weaker at high frame rates
-- Fixed motion blur affecting props attached to the player, like guns and parachutes
-- Fixed phone camera aspect ratio
-- Fixed TLAD noise aspect ratio
-
-#### Reflections
-
-- Restored tree and terrain reflection behavior from XBOX
-- Fixed excessive specularity of several meshes in Alderney
-- Restored corona depth test in water reflections
-- Added fading to coronas in paraboloid reflections
-- Fixed anisotropic filtering affecting vehicle reflection intensity
-- Fixed distorted mirror reflections at certain camera angles
-- Improved vehicle and ped normal map quality
-
-#### Particles
-
-- Fixed soft particles
-- Fixed particles flickering in some interiors
-- Fixed stuttery particle animations caused by patch 1.0.5.0
-- Fixed rain being almost invisible, especially at night
-- Fixed rain streaks becoming shorter at high frame rates
-
-#### Water
-
-- Fixed flickering outlines around shores and thin objects
-- Fixed offset water reflections
-- Restored water foam from consoles
-- Improved shallow water transparency and improved foam texture
-- Fixed flat, mirror-like water surface on some graphics cards
-
-#### Misc
-
-- Fixed outlines around objects when using some versions of DXVK
-- Partially fixed building windows visible near the far plane if emissive depth write is disabled
-- Restored gta_cutout_fence mipmap bias from versions prior to 1.0.6.0
-- Fixed incorrect texture filtering used in several shaders
-- Added AO to gta_normal_spec_reflect_emissive if emissivity is 0 so it can be used to disable night shadows for certain objects
-- Added support to instantaneously turn lamppost bulbs on or off alongside their lighting
-
-# Contributing
-
-If you have an idea for a fix, add a module with its implementation to [source](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/tree/master/source) directory and open a pull request. See [contributing.ixx](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/blob/master/source/contributing.ixx) for reference.
+See [controller actions](docs/vr-controller-actions.md), [vehicle interactions](docs/vehicle-interactions.md) and the weapon-specific documents under [`docs`](docs). Some technical notes describe earlier development stages; their historical three-digit issue IDs are not current GitHub issue numbers.
 
 ## Building
 
-Run `premake5.bat` to generate the Visual Studio solution in `build`, then build it.
+Clone with submodules and use Visual Studio 2026 with the C++ toolchain and Windows SDK:
 
-To deploy to your game automatically after each build, create a `.env` file in the repository root pointing `GTAIV_DIR` at the folder containing `GTAIV.exe`, then run `premake5.bat` again, for example:
-
+```powershell
+git clone --recurse-submodules https://github.com/bordplate/GTA4VR.git
+cd GTA4VR
+.\premake5.bat
+msbuild build/GTAIV.EFLC.FusionFix.slnx /m /p:Configuration=Release /p:Platform=Win32
 ```
-GTAIV_DIR=C:\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto IV\GTAIV
-```
 
-The build then copies the built `GTAIV.EFLC.FusionFix.asi` into the `plugins` folder of that game folder, replacing the plugin that is already installed there, and debugging launches `GTAIV.exe` from there. The `.env` file is ignored by git. Without it, nothing is copied.
+The plugin is built under `bin`. The OpenXR loader is built separately; consult the [build workflow](.github/workflows/msvc_x86.yml) for dependency and packaging steps. The release packaging step includes the credited Animated Weapons models and generated FusionFix data.
 
-# Reporting more issues
+Optional automatic ASI deployment uses an ignored `.env` file with `GTAIV_DIR` pointing to the directory containing `GTAIV.exe`. It replaces an already installed plugin, so back it up first. Without `.env`, the build does not deploy to the game.
 
-We're making a list of **GTA IV** issues that weren't addressed in official patches.
+## Development and reporting issues
 
-If you can think of one, submit it [here](https://github.com/GTAmodding/GTAIV-Issues-List/issues).
+Use the [GitHub issue tracker](https://github.com/bordplate/GTA4VR/issues) for bugs and missing interactions. Include the game version/episode, headset, controllers, OpenXR runtime, graphics backend and reproduction steps. State whether the problem also occurs with VR disabled.
 
-If you've encountered an issue, caused by this fix, report it [here](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/issues).
+See [ROADMAP.md](ROADMAP.md) for scope and remaining work. Short showcase clips demonstrate individual features; they should not be taken as evidence of a complete playable campaign.
+
+## Credits and license
+
+- [FusionFix and its contributors](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix) provide the foundation. Original documentation and acknowledgements are preserved in [readme.fusionfix.md](readme.fusionfix.md).
+- [DXVK](https://github.com/doitsujin/dxvk) provides the D3D9-to-Vulkan backend; [OpenXR](https://github.com/KhronosGroup/OpenXR-SDK) provides the headset/runtime interface.
+- [Animated Weapons](https://www.nexusmods.com/gta4/mods/641) supplies the bundled weapon models/animations. See [dependency attribution](third_party/animated-weapons/NOTICE.md) for the authors and tested asset layout.
+
+Project code retains the **GPL-3.0** license; see [license](license). Third-party dependencies and the credited weapon assets retain their own notices and terms. The GTA IV game itself is not included.

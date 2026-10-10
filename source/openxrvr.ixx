@@ -1498,7 +1498,7 @@ void OpenXRVR::SetEyeImageProvider(void (*provider)())
 void OpenXRVR::Install()
 {
     CIniReader ini("");
-    enabled = ini.ReadInteger("VR", "EnableOpenXR", 0) != 0;
+    enabled = ini.ReadInteger("VR", "DisableOpenXR", 0) == 0;
     vulkanEnabled=enabled && ini.ReadInteger("VR","ExperimentalVulkanBridge",0)!=0;
     controllerEnabled=ini.ReadInteger("VR","ExperimentalControllerInput",0)!=0;
     if (!enabled) return;
@@ -1514,7 +1514,7 @@ void OpenXRVR::Install()
                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    Log("OpenXR enabled by [VR] EnableOpenXR=1; initializing x86 session");
+    Log("OpenXR enabled by default; [VR] DisableOpenXR=1 selects flat screen");
     if(vulkanEnabled)
     {
         if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=1)
@@ -1525,12 +1525,45 @@ void OpenXRVR::Install()
             SetEnvironmentVariableA("DXVK_DEBUG",diagnostic.c_str());
             Log("DXVK diagnostics enabled for this process; do not use for performance comparisons");
         }
-        const auto path=ini.ReadString("VR","VulkanOpenVRBootstrap","");
-        if(!path.empty())
+        auto bootstrap=std::filesystem::path(ini.ReadString("VR","VulkanOpenVRBootstrap",""));
+        if(bootstrap.empty())
         {
-            const auto absolute=std::filesystem::path(path);
-            if(!absolute.is_absolute()) {Fallback("Vulkan bootstrap DLL path must be absolute"); return;}
-            openvrBootstrap=LoadLibraryExW(absolute.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            // SteamVR's manifest lives beneath its installation. Respect the
+            // loader's environment override before inspecting registered runtimes.
+            wchar_t manifest[32768]{};
+            const auto length=GetEnvironmentVariableW(L"XR_RUNTIME_JSON",manifest,_countof(manifest));
+            auto findBootstrap=[](const wchar_t* runtime)->std::filesystem::path
+            {
+                auto directory=std::filesystem::path(runtime).parent_path();
+                if(!directory.is_absolute()) return {};
+                while(!directory.empty())
+                {
+                    auto candidate=directory/L"bin"/L"win32"/L"openvr_api.dll";
+                    const auto attributes=GetFileAttributesW(candidate.c_str());
+                    if(attributes!=INVALID_FILE_ATTRIBUTES && !(attributes&FILE_ATTRIBUTE_DIRECTORY)) return candidate;
+                    const auto parent=directory.parent_path();
+                    if(parent==directory) break;
+                    directory=parent;
+                }
+                return {};
+            };
+            if(length && length<_countof(manifest)) bootstrap=findBootstrap(manifest);
+            if(!length)
+            {
+                for(const auto view:{RRF_SUBKEY_WOW6432KEY,RRF_SUBKEY_WOW6464KEY})
+                {
+                    DWORD bytes=sizeof(manifest);
+                    if(RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Khronos\\OpenXR\\1",L"ActiveRuntime",
+                        RRF_RT_REG_SZ|view,nullptr,manifest,&bytes)==ERROR_SUCCESS)
+                        bootstrap=findBootstrap(manifest);
+                    if(!bootstrap.empty()) break;
+                }
+            }
+        }
+        if(!bootstrap.empty())
+        {
+            if(!bootstrap.is_absolute()) {Fallback("Vulkan bootstrap DLL path must be absolute"); return;}
+            openvrBootstrap=LoadLibraryExW(bootstrap.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
             if(!openvrBootstrap) {Fallback("Vulkan OpenVR bootstrap preload failed"); return;}
         }
         pendingRecreate=true; // Bind the actual game device on first EndScene.

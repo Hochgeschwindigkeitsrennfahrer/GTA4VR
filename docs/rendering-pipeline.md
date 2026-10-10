@@ -1,6 +1,6 @@
 # GTA IV render pipeline notes (issue 003)
 
-Completion update2026-10-04: [#029 is closed](../issues/closed/029-diagnose-free-roam-crashes.md). The user confirms free-roam crashes are fixed after continued #014 gameplay and final flat-screen acceptance. Both model-reference and command-arena corrections remain in the accepted Release7F3520C0 build. Earlier pending/failure statements below are historical investigation records, not the current status of the fixed reproductions.
+Completion update2026-10-04: #029 is closed. The user confirms free-roam crashes are fixed after continued #014 gameplay and final flat-screen acceptance. Both model-reference and command-arena corrections remain in the accepted Release7F3520C0 build. Earlier pending/failure statements below are historical investigation records, not the current status of the fixed reproductions.
 
 ## Scene-dependent command-buffer overflow (#029, 2026-10-02)
 
@@ -156,7 +156,7 @@ The game binary contains RTTI names for `CRenderPhaseFrontEnd`, `CRenderPhaseRad
 
 The first OpenXR renderer can start from the measured `FUN_008f7f00` list boundary. Run `CGameProcessHook` and `FUN_008f7820` once; capture the world parent and phase viewports; build the first world command list; set the G-buffer, deferred-lighting, and DrawScene phase viewports from the runtime's second eye pose/FOV; build the second list; then restore phase state. The command object copies each viewport before render-thread execution, so each queued pass retains its camera even when the game/list thread advances. The one-frame stress test established this sequence with two distinct valid cameras and one observed game-process callback.
 
-This is a **command-generation boundary**, with known work still required before a headset image: route each pass to its eye's render target, use a conservative shared visibility set or independent traversal state, generate complete eye-consistent matrices/frusta, and handle deferred lighting, shadows/reflections, post-processing, and UI. Repeating `FUN_008f7820` after list construction crashed even with the same camera, so the first implementation must not do that. The second-view stress camera was a radar viewport, not a headset pose; no pixel-level stereo correctness was asserted. These requirements are tracked in [#006](../issues/open/006-eye-visibility-and-targets.md), with UI attribution in [#007](../issues/closed/007-ui-composition-order.md).
+This is a **command-generation boundary**, with known work still required before a headset image: route each pass to its eye's render target, use a conservative shared visibility set or independent traversal state, generate complete eye-consistent matrices/frusta, and handle deferred lighting, shadows/reflections, post-processing, and UI. Repeating `FUN_008f7820` after list construction crashed even with the same camera, so the first implementation must not do that. The second-view stress camera was a radar viewport, not a headset pose; no pixel-level stereo correctness was asserted. These requirements are tracked in #006, with UI attribution in #007.
 
 ## Pass treatment for the first VR experiment
 
@@ -171,12 +171,12 @@ This is a **command-generation boundary**, with known work still required before
 | Pause map/menu (`FrontEnd`) | `FrontEnd` appeared with the pause map and carried an origin camera. | Headset-locked layer candidate. | Map pixels and whether paused world passes contribute to the final image. |
 | Subtitles | No phase or draw command has been identified. | Headset-locked layer candidate. | Its source pass and timing. |
 
-These are implementation decisions for a prototype, not measured final-pass classifications. [#007](../issues/closed/007-ui-composition-order.md) preserves the attribution findings. It was superseded on 2026-10-06: remaining UI coverage attribution belongs to #031, phone mapping to #022 and cinematic post-processing dependencies to #026.
+These are implementation decisions for a prototype, not measured final-pass classifications. #007 preserves the attribution findings. It was superseded on 2026-10-06: remaining UI coverage attribution belongs to #031, phone mapping to #022 and cinematic post-processing dependencies to #026.
 
 ## Remaining measurements
 
-1. [#006](../issues/open/006-eye-visibility-and-targets.md): provide conservative or independent per-eye visibility, route the two tested command streams to separate targets, and verify full view/projection/frustum values and final pixels. Characterize shadow/reflection and temporal dependencies before using them in both eyes.
-2. Core UI attribution and presentation were accepted in #020; reuse the findings in [#007](../issues/closed/007-ui-composition-order.md). Remaining UI draw/transition attribution is #031, physical phone mapping is #022 and cinematic post-processing investigation is #026.
+1. #006: provide conservative or independent per-eye visibility, route the two tested command streams to separate targets, and verify full view/projection/frustum values and final pixels. Characterize shadow/reflection and temporal dependencies before using them in both eyes.
+2. Core UI attribution and presentation were accepted in #020; reuse the findings in #007. Remaining UI draw/transition attribution is #031, physical phone mapping is #022 and cinematic post-processing investigation is #026.
 3. During integration, identify the wider queue dispatcher and target ownership. The command snapshots preserve camera state, but the trace does not prove geometry, depth, lighting, post-processing, or temporal history are isolated per eye.
 
 ### Issue 014 body alignment debug view (2026-10-02)

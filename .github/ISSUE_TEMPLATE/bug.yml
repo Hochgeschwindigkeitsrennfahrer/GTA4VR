@@ -61,9 +61,9 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: "Test in the [latest git build](https://ci.appveyor.com/api/projects/ThirteenAG/gtaiv-eflc-fusionfix/artifacts/GTAIV.EFLC.FusionFix.zip) in case it's already fixed."
+        - label: "Test in the [latest git build](https://github.com/bordplate/GTA4VR/actions/workflows/msvc_x86.yml) in case it's already fixed."
           required: true
-        - label: "[Search for other reports](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/search?q=my+issue&type=issues) of the same issue."
+        - label: "[Search for other reports](https://github.com/bordplate/GTA4VR/issues) of the same issue."
           required: true
         - label: "Include logs or screenshots of issue."
           required: true

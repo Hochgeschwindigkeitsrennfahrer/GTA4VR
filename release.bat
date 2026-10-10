@@ -12,12 +12,16 @@ if not exist build\openxr-loader-win32\src\loader\Release\openxr_loader.dll (
 copy /Y build\openxr-loader-win32\src\loader\Release\openxr_loader.dll data\plugins\openxr_loader.dll
 copy /Y external\openxr-sdk\LICENSE data\plugins\openxr_loader.LICENSE.txt
 
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-vr-package.ps1
+if ERRORLEVEL 1 exit /b 1
+
 call buildimg.bat
 call buildwtd.bat
 call buildshaders.bat
 call buildgxt.bat
 
-7z a "GTAIV.EFLC.FusionFix.zip" ".\data\*" ^
+if exist GTA4VR.zip del GTA4VR.zip
+7z a "GTA4VR.zip" ".\data\*" ^
 -x!update\GTAIV.EFLC.FusionFix\GTAIV.EFLC.FusionFix ^
 -x!update\GTAIV.EFLC.FusionFix\GTAIV.FusionFix ^
 -x!update\GTAIV.EFLC.FusionFix\TLAD.FusionFix ^
@@ -26,16 +30,15 @@ call buildgxt.bat
 -x!update\GTAIV.EFLC.FusionFix\FusionLights ^
 -x!update\GTAIV.EFLC.FusionFix\cdimagemake.ims ^
 -xr!*\.gitkeep
+if ERRORLEVEL 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify-vr-package.ps1
+if ERRORLEVEL 1 exit /b 1
 
 copy /Y bin\Release\GTAIV.EFLC.FusionFixInstaller.exe GTAIV.EFLC.FusionFixWebInstaller.exe
-start /B /WAIT GTAIV.EFLC.FusionFixWebInstaller.exe GTAIV.EFLC.FusionFix.zip
-:RETRY
-move /Y GTAIV.EFLC.FusionFixWebInstaller_with_GTAIV.EFLC.FusionFix.exe GTAIV.EFLC.FusionFixOfflineInstaller.exe
-if ERRORLEVEL 1 (
-    echo File locked, retrying...
-    timeout /t 2 > nul
-    goto RETRY
-)
+if ERRORLEVEL 1 exit /b 1
+start /B /WAIT GTAIV.EFLC.FusionFixWebInstaller.exe GTA4VR.zip GTAIV.EFLC.FusionFixOfflineInstaller.exe
+if ERRORLEVEL 1 exit /b 1
+if not exist GTAIV.EFLC.FusionFixOfflineInstaller.exe exit /b 1
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "Sign.ps1" -SearchPaths ".\GTAIV.EFLC.FusionFixOfflineInstaller.exe .\GTAIV.EFLC.FusionFixWebInstaller.exe"
 

@@ -198,7 +198,7 @@ void VRD3D9Ex::Install()
     // FusionFix's backend switch lives in d3d9.cfg, not the ASI INI.
     if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=0)
     {Log("Ex bridge requires system D3D9; DXVK selected",E_NOTIMPL); return;}
-    runtimePacing=ini.ReadInteger("VR","EnableOpenXR",0)!=0 &&
+    runtimePacing=ini.ReadInteger("VR","DisableOpenXR",0)==0 &&
         ini.ReadInteger("VR","ExperimentalStereo",0)!=0 &&
         ini.ReadInteger("VR","ExperimentalSubmit",0)!=0 &&
         ini.ReadInteger("VR","MatchHeadsetRefresh",1)!=0;

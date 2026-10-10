@@ -1,6 +1,6 @@
 # VR spatial audio listener
 
-Issue: [#034](../issues/closed/034-vr-spatial-audio-listener.md).
+Status: accepted spatial-audio correction.
 
 GTA IV CE 1.2.0.59 builds audio listener transforms independently of our per-eye
 viewport overrides. The GTA audio worker at Ghidra VA `008C13B0` calls the audio
