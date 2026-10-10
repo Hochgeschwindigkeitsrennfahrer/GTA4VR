@@ -4,6 +4,7 @@ module;
 #include "includes/vrgrip.hpp"
 #include "includes/vrmelee.hpp"
 #include "includes/vrrecoil.hpp"
+#include "includes/vrwheel.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -18,7 +19,11 @@ import vrreload;
 export namespace VRHands
 {
     void Install();
-    void PublishTrackingTransform(const VRMath::Matrix& trackingToWorld,void* owner,bool active);
+    void PublishTrackingTransform(const VRMath::Matrix& trackingToWorld,void* owner,bool active,bool seated=false);
+    bool WheelSteering(float& steering);
+    bool DrivingWeaponActive();
+    bool HideDrivingWeapon(void* entity);
+    void PrepareObjectRender(void* entity);
     void ConsumeRoomMotion(void* owner,const VRMath::Vector& consumed);
     bool StationaryBodyHeading(void* owner,float current,float& heading);
     bool Active(void* owner);
@@ -45,6 +50,7 @@ namespace
         VRMath::Matrix requested[2]{};
         bool valid[2]{};
         bool supporting[2]{};
+        bool seated=false;
         VRMath::Matrix trackingTransform{};
         uint64_t sampledAt=0;
     } physicsRig;
@@ -64,6 +70,7 @@ namespace
     void* supportModel=nullptr;
     VRMath::Matrix supportRelative{};
     VRMath::Matrix primaryGripInverse=VRMath::Identity();
+    VRMath::Matrix leftGripInverse=VRMath::Identity();
     SRWLOCK recoilLock=SRWLOCK_INIT;
     VRRecoil::Kick recoil{};
     void* recoilOwner=nullptr;void* recoilWeapon=nullptr;
@@ -369,6 +376,44 @@ namespace
     ArmSolver solveArm=nullptr;
     VRMath::Matrix trackingToWorld{};
     VRMath::Vector trackingBodyPosition{};
+    void* trackingVehicle=nullptr;
+    VRMath::Matrix trackingVehicleFrame=VRMath::Identity();
+    struct WheelTracking
+    {
+        void* vehicle=nullptr;
+        VRMath::Vector center{};
+        bool ready=false;
+        uint64_t enteredAt=0;
+        bool held[2]{};
+        float reference[2]{},acquiredAngle[2]{},angle=0;
+        VRMath::Vector palmOffset[2]{};
+        VRMath::Matrix meshFrame=VRMath::Identity();
+        float radius=.17f;
+        bool mesh=false;
+        VRMath::Matrix attachment[2]{};
+    } wheel;
+    std::atomic<float> wheelSteer=0;
+    std::atomic<uint64_t> wheelAt=0;
+    float wheelGripRadius=.18f,wheelSteeringDegrees=180.f;
+    float wheelRadius=.17f,wheelTiltDegrees=20.f;
+    VRMath::Vector wheelCenterOffset{};
+    struct WheelMesh
+    {
+        void* drawable=nullptr;
+        VRWheel::Fit fit{};
+        VRMath::Matrix seatRest=VRMath::Identity();
+        int seat=-1;
+        int model=-1;
+        unsigned vertices=0;
+        bool attempted=false;
+    } wheelMesh;
+    std::vector<WheelMesh> wheelMeshes;
+    SRWLOCK wheelMeshLock=SRWLOCK_INIT;
+    SafetyHookInline vehicleRenderHook{};
+    std::atomic<float> wheelVisualAngle=0;
+    std::atomic<unsigned> wheelVisualCalls=0;
+    std::atomic<bool> wheelReady=false,wheelHeld[2]{};
+    std::atomic<float> wheelDistances[2]{-1.f,-1.f},wheelCenter[3]{};
     void* targetOwner=nullptr;
     uint64_t targetAt=0;
     VRMath::Matrix wristCorrection[2]={VRMath::Identity(),VRMath::Identity()};
@@ -381,6 +426,51 @@ namespace
     std::atomic<unsigned> fingerUpdates[2]{},fingerJointCounts[2]{};
     std::atomic<bool> fingerClosed[2]{};
     std::atomic<bool> weaponGrip{false};
+    std::atomic<bool> drivingWeaponActive=false;
+    std::atomic<bool> drivingHolstered=false;
+    SRWLOCK drivingWeaponLock=SRWLOCK_INIT;
+    struct DrivingWeaponPose
+    {
+        void* owner=nullptr;void* vehicle=nullptr;void* entity=nullptr;
+        VRMath::Matrix frame{},vehicleFrame{};uint64_t at=0;
+    } drivingWeaponPose;
+    bool DriveByWeapon(unsigned type) {return type==7 || type==9 || type==12 || type==13;}
+    bool InventoryWeapon(Ped ped,void* owner,uint32_t& type)
+    {
+        if(Natives::GetCurrentCharWeapon(ped,&type)) return true;
+        // A seated selection can have no CWeapon/CObject (e.g. a shotgun).
+        // Use the same inventory slot/type layout checked by EquippedWeapon,
+        // without requiring the held model to exist before selecting a gun.
+        if(!owner) return false;
+        auto* manager=static_cast<char*>(owner)+0x2B0;
+        const int slot=*reinterpret_cast<int*>(manager);
+        if(slot<0 || slot>10) return false;
+        type=*reinterpret_cast<uint32_t*>(manager+12*(slot+3));
+        return true;
+    }
+    void ProcessDriveByWeapon()
+    {
+        if(!OpenXRVR::HasFocusedViews()) return;
+        OpenXRVR::ControllerInput input{};
+        if(!OpenXRVR::GetControllerInput(input)) return;
+        Ped ped=0;uint32_t type=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+        if(!ped || Natives::IsCharDead(ped)) return;
+        if(!Natives::IsCharInAnyCar(ped))
+        {
+            if(drivingHolstered.exchange(false)) Natives::SetCharCurrentWeaponVisible(ped,true);
+            return;
+        }
+        if(!input.driving || input.phoneActive || Natives::IsPauseMenuActive()) return;
+        void* owner=nullptr;void* vehicle=nullptr;uint64_t at=0;
+        AcquireSRWLockShared(&targetLock);owner=targetOwner;vehicle=trackingVehicle;at=targetAt;ReleaseSRWLockShared(&targetLock);
+        if(!owner || !vehicle || !at || GetTickCount64()-at>100) return;
+        if(drivingHolstered.load())
+        {Natives::SetCharCurrentWeaponVisible(ped,false);drivingWeaponActive=false;return;}
+        if(ped && !Natives::IsCharDead(ped) && Natives::IsCharInAnyCar(ped) &&
+            InventoryWeapon(ped,owner,type) && DriveByWeapon(type) &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::SET_CHAR_CURRENT_WEAPON_VISIBLE)))
+            Natives::SetCharCurrentWeaponVisible(ped,true);
+    }
     SafetyHookInline pistolFireHook{};
     using SniperSpread=void (__stdcall*)(void*,const VRMath::Vector*,VRMath::Vector*);
     SniperSpread sniperSpread=nullptr;
@@ -461,6 +551,7 @@ namespace
     std::atomic<unsigned> triggerAttempts{0},triggerShots{0};
     bool weaponSwapEnabled=false,weaponClickLatched=true;
     std::atomic<unsigned> weaponSwaps{0};
+    std::atomic<unsigned> weaponSwapAttempts{0},weaponSwapStage{0},weaponSwapCandidate{0};
 
     void ProcessWeaponSwap()
     {
@@ -469,9 +560,9 @@ namespace
             !input.gripPoseValid[1]) {weaponClickLatched=true; return;}
         if(!input.cycle && !input.nextWeapon && !input.previousWeapon) {weaponClickLatched=false; return;}
         if(weaponClickLatched) return;
-        weaponClickLatched=true;
         const float horizontal=input.previousWeapon ? -1.f:input.nextWeapon ? 1.f:input.cycleDirection;
         if(!std::isfinite(horizontal) || std::abs(horizontal)<.25f) return;
+        weaponClickLatched=true;++weaponSwapAttempts;weaponSwapStage=1;
         void* owner=nullptr; uint64_t at=0;
         AcquireSRWLockShared(&targetLock); owner=targetOwner; at=targetAt; ReleaseSRWLockShared(&targetLock);
         if(!owner || !at || GetTickCount64()-at>100) return;
@@ -483,9 +574,14 @@ namespace
             if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return;
         Ped ped=0; Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
         if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharDead(ped) ||
-            Natives::IsCharInAnyCar(ped) || Natives::IsPauseMenuActive()) return;
+            Natives::IsPauseMenuActive() || input.phoneActive) return;
+        const bool seated=Natives::IsCharInAnyCar(ped);
+        if(seated && !input.driving) return;
+        weaponSwapStage=2;
         uint32_t current=0;
-        if(!Natives::GetCurrentCharWeapon(ped,&current)) return;
+        if(!InventoryWeapon(ped,owner,current)) return;
+        if(seated && drivingHolstered.load()) current=0;
+        weaponSwapStage=3;
         int32_t slot=0; Natives::GetWeapontypeSlot(static_cast<int32_t>(current),&slot);
         if(slot<0 || slot>10) return;
         const int direction=horizontal<0 ? -1:1;
@@ -497,13 +593,21 @@ namespace
             uint32_t candidate=0,ammo=0,clip=0;
             Natives::GetCharWeaponInSlot(ped,next,&candidate,&ammo,&clip);
             if((candidate==0 && next!=0) || candidate==current ||
+                (seated && candidate!=0 && !DriveByWeapon(candidate)) ||
                 (candidate!=0 && !Natives::HasCharGotWeapon(ped,candidate))) continue;
             Natives::SetCurrentCharWeapon(ped,candidate,true);
+            if(seated)
+            {
+                drivingHolstered=candidate==0;
+                Natives::SetCharCurrentWeaponVisible(ped,candidate!=0);
+                if(candidate==0) drivingWeaponActive=false;
+            }
+            weaponSwapStage=4;weaponSwapCandidate=candidate;
             // Support grip belongs to the old gun. Require a fresh trigger
             // squeeze before a newly selected pistol can fire.
             supportGripping=false; supportWeapon=nullptr; triggerLatched=true;
             uint32_t selected=current;
-            if(Natives::GetCurrentCharWeapon(ped,&selected) && selected==candidate) ++weaponSwaps;
+            if((seated && candidate==0) || (InventoryWeapon(ped,owner,selected) && selected==candidate)) {++weaponSwaps;weaponSwapStage=5;}
             break;
         }
     }
@@ -716,7 +820,7 @@ namespace
         // injection or aiming task; native Fire owns readiness/ammo/cadence.
         OpenXRVR::ControllerInput input{};
         if(!weaponFire || !OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) ||
-            !input.gripPoseValid[1] || !input.fireActive) {triggerLatched=false; return;}
+            !input.gripPoseValid[input.driving ? 0:1] || !input.fireActive) {triggerLatched=false; return;}
         if(input.fire<.3f) {triggerLatched=false; return;}
         if(input.fire<.7f) return;
         void* owner=nullptr; uint64_t at=0;
@@ -732,7 +836,12 @@ namespace
         triggerLatched=true;
         if(input.phoneActive || Natives::IsPauseMenuActive()) return;
         Ped player=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&player);
-        if(!player || Natives::IsCharDead(player) || Natives::IsCharInAnyCar(player)) return;
+        if(!player || Natives::IsCharDead(player)) return;
+        if(Natives::IsCharInAnyCar(player))
+        {
+            if(!input.driving || !DriveByWeapon(type) || !drivingWeaponActive.load()) return;
+            VRHands::PrepareObjectRender(entity);
+        }
         if(!VRReloadRuntime::CanFire(owner,weapon)) {if(first) VRReloadRuntime::EmptyTrigger(owner,weapon);return;}
         auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!gun) return;
@@ -984,6 +1093,7 @@ namespace
         }
         if(primary<0 || secondary<0) return false;
         primaryGripInverse=VRMath::InverseRigid(VRMath::AffineXYZ(locals[primary]));
+        leftGripInverse=VRMath::InverseRigid(VRMath::AffineXYZ(locals[secondary]));
         auto support=VRMath::AffineXYZ(locals[secondary]);
         const auto correction=VRReloadRuntime::SupportRotation(type);
         const auto position=support[3];
@@ -1021,6 +1131,148 @@ namespace
         return rotation;
     }
 
+    void PrepareWheelMesh(void* vehicle)
+    {
+        const auto index=*reinterpret_cast<short*>(static_cast<char*>(vehicle)+0x2E);
+        if(index<0) return;
+        auto** models=reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0xE95CD8);
+        auto* model=static_cast<char*>(models[index]);
+        auto* fragment=model ? *reinterpret_cast<char**>(model+8):nullptr;
+        auto* drawable=fragment ? *reinterpret_cast<char**>(fragment+0xB4):nullptr;
+        if(!drawable) return;
+        if(wheelMesh.drawable!=drawable)
+        {
+            if(wheelMesh.drawable && wheelMesh.vertices) wheelMeshes.push_back(wheelMesh);
+            wheelMesh={};wheelMesh.drawable=drawable;wheelMesh.model=index;
+            for(const auto& saved:wheelMeshes) if(saved.drawable==drawable) {wheelMesh=saved;break;}
+        }
+        if(wheelMesh.attempted) return;
+        wheelMesh.attempted=true;
+        auto* definition=*reinterpret_cast<char**>(drawable+0xC);
+        if(!definition) return;
+        auto* bones=*reinterpret_cast<char**>(definition);
+        auto* locals=*reinterpret_cast<VRMath::Matrix**>(definition+0x10);
+        const unsigned count=*reinterpret_cast<unsigned short*>(definition+0x14);
+        if(!bones || !locals || count>512) return;
+        for(unsigned b=0;b<count;++b)
+        {
+            const auto* name=*reinterpret_cast<const char**>(bones+b*0xE0);
+            if(name && std::strcmp(name,"seat_dside_f")==0)
+            {wheelMesh.seat=b;wheelMesh.seatRest=VRMath::AffineXYZ(locals[b]);break;}
+        }
+        if(wheelMesh.seat<0) return;
+        // Developer-only experiment: palette capacity/ownership still needs
+        // lifecycle verification. Observed CDCD padding is not an allocation
+        // capacity guarantee; ordinary runs do not install this hook.
+        auto* lod=*reinterpret_cast<char**>(drawable+0x40);
+        if(!lod) return;
+        const unsigned modelCount=*reinterpret_cast<unsigned short*>(lod+4);
+        auto** items=*reinterpret_cast<char***>(lod);
+        if(!items || modelCount>128) return;
+        struct Candidate {char* geometry;char* vb;VRWheel::Fit fit;};
+        Candidate best{};
+        for(unsigned item=0;item<modelCount;++item)
+        {
+            auto* sub=items[item];if(!sub) continue;
+            const unsigned geos=*reinterpret_cast<unsigned short*>(sub+8);
+            auto** list=*reinterpret_cast<char***>(sub+4);
+            if(!list || geos>128) return;
+            for(unsigned g=0;g<geos;++g)
+            {
+                auto* geo=list[g];if(!geo) continue;
+                auto* palette=*reinterpret_cast<unsigned short**>(geo+0x38);
+                const unsigned size=*reinterpret_cast<unsigned short*>(geo+0x3E);
+                if(!palette || size>64) return;
+                for(unsigned b=0;b<size;++b) if(palette[b]==wheelMesh.seat) return;
+                auto* vb=*reinterpret_cast<char**>(geo+0xC);
+                if(!vb || size==0 || size>=8 || palette[size]!=0xCDCD) continue;
+                const unsigned vertices=*reinterpret_cast<unsigned short*>(vb+4);
+                const unsigned stride=*reinterpret_cast<unsigned short*>(vb+0xC);
+                auto* data=*reinterpret_cast<char**>(vb+8);
+                if(!data || vertices<40 || (stride!=44 && stride!=52 && stride!=60 && stride!=68)) continue;
+                std::vector<VRMath::Vector> points;points.reserve(vertices);
+                for(unsigned v=0;v<vertices;++v)
+                {
+                    VRMath::Vector p{0,0,0,1};std::memcpy(p.data(),data+v*stride,12);
+                    if(!std::isfinite(p[0]+p[1]+p[2])) {points.clear();break;}
+                    points.push_back(p);
+                }
+                const auto fit=VRWheel::FindRim(points,wheelMesh.seatRest[3]);
+                if(fit.support>best.fit.support) best={geo,vb,fit};
+            }
+        }
+        if(!best.geometry) return;
+        auto* palette=*reinterpret_cast<unsigned short**>(best.geometry+0x38);
+        const unsigned size=*reinterpret_cast<unsigned short*>(best.geometry+0x3E);
+        const unsigned vertices=*reinterpret_cast<unsigned short*>(best.vb+4);
+        const unsigned stride=*reinterpret_cast<unsigned short*>(best.vb+0xC);
+        auto* source=*reinterpret_cast<unsigned char**>(best.vb+8);
+        // CE grcVertexBufferD3D: +1C is the D3D9 interface; +20 is raw
+        // mapped/backing vertex data. Verified on live model164 using DXVK's
+        // vtable GetType (returns VERTEXBUFFER) and GetDesc implementation.
+        auto* buffer=*reinterpret_cast<IDirect3DVertexBuffer9**>(best.vb+0x1C);
+        if(!buffer) return;
+        D3DVERTEXBUFFER_DESC desc{};
+        if(FAILED(buffer->GetDesc(&desc)) || desc.Type!=D3DRTYPE_VERTEXBUFFER || desc.Size<vertices*stride) return;
+        std::vector<unsigned char> data(source,source+vertices*stride);
+        unsigned selected=0;
+        for(unsigned v=0;v<vertices;++v)
+        {
+            auto* bytes=data.data()+v*stride;
+            VRMath::Vector p{0,0,0,1};std::memcpy(p.data(),bytes,12);
+            if(!VRWheel::OnWheel(p,best.fit)) continue;
+            // The selected vertices must be rigidly bound to chassis. Preserve
+            // unsupported skinning rather than accidentally deforming a car.
+            if(bytes[12]!=0 || bytes[13]!=0 || bytes[14]!=255 || bytes[15]!=0 ||
+                bytes[18]>=size || palette[bytes[18]]!=0) return;
+            // Native skinning supplies inverse bind matrices. These vertices
+            // remain in their original model-space bind pose.
+            bytes[18]=static_cast<unsigned char>(size);
+            ++selected;
+        }
+        if(selected<40) return;
+        void* mapped=nullptr;
+        if(FAILED(buffer->Lock(0,vertices*stride,&mapped,0))) return;
+        std::memcpy(mapped,data.data(),data.size());
+        const auto result=buffer->Unlock();
+        if(FAILED(result)) return;
+        // Keep the native CPU backing copy coherent for later native uploads.
+        std::memcpy(source,data.data(),data.size());
+        palette[size]=static_cast<unsigned short>(wheelMesh.seat);
+        *reinterpret_cast<unsigned short*>(best.geometry+0x3E)=static_cast<unsigned short>(size+1);
+        wheelMesh.fit=best.fit;wheelMesh.vertices=selected;
+    }
+
+    uint32_t __fastcall RenderVehicleWheel(void* self,void* edx,uint32_t shader,uint32_t flags,uint32_t alpha,uint32_t unknown)
+    {
+        AcquireSRWLockShared(&targetLock);
+        const bool selected=trackingVehicle==self && targetAt && GetTickCount64()-targetAt<250;
+        ReleaseSRWLockShared(&targetLock);
+        if(!selected || !OpenXRVR::HasFocusedViews())
+            return vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
+        AcquireSRWLockExclusive(&wheelMeshLock);
+        PrepareWheelMesh(self);
+        const auto mesh=wheelMesh;
+        ReleaseSRWLockExclusive(&wheelMeshLock);
+        auto* instance=*reinterpret_cast<char**>(static_cast<char*>(self)+0x38);
+        auto* payload=instance ? *reinterpret_cast<char**>(instance+0x64):nullptr;
+        auto* skeleton=payload ? *reinterpret_cast<char**>(payload+0x160):nullptr;
+        auto* matrices=skeleton ? *reinterpret_cast<VRMath::Matrix**>(skeleton+0x14):nullptr;
+        const unsigned count=skeleton ? *reinterpret_cast<unsigned short*>(skeleton+0x10):0;
+        auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(self)+0x20);
+        if(!mesh.vertices || !matrices || !root || mesh.seat<0 || unsigned(mesh.seat)>=count)
+            return vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
+        const auto original=matrices[mesh.seat];
+        const float half=wheelVisualAngle.load()*.5f,p[3]{},q[4]{0,0,std::sin(half),std::cos(half)};
+        auto rotation=VRMath::Multiply(VRMath::InverseRigid(mesh.fit.frame),VRMath::Pose(p,q));
+        rotation=VRMath::Multiply(rotation,mesh.fit.frame);
+        matrices[mesh.seat]=VRMath::Multiply(VRMath::Multiply(mesh.seatRest,rotation),VRMath::AffineXYZ(*root));
+        const auto result=vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
+        matrices[mesh.seat]=original;
+        ++wheelVisualCalls;
+        return result;
+    }
+
     void __fastcall UpdateIK(void* manager,void*)
     {
 
@@ -1049,9 +1301,11 @@ namespace
         // arms on this native skeleton callback, never once per rendered eye.
         updateHook.thiscall<void>(manager);
         if(!enabled || !solveArm || !OpenXRVR::HasFocusedViews()) {supportGripping=false; return;}
-        VRMath::Matrix transform{},correction[2]{}; void* owner=nullptr; uint64_t at=0;
+        VRMath::Matrix transform{},correction[2]{},vehicleFrame{};
+        void* owner=nullptr; void* vehicle=nullptr; uint64_t at=0;
         AcquireSRWLockShared(&targetLock);
         transform=trackingToWorld; owner=targetOwner; at=targetAt;
+        vehicle=trackingVehicle; vehicleFrame=trackingVehicleFrame;
         correction[0]=wristCorrection[0]; correction[1]=wristCorrection[1];
         ReleaseSRWLockShared(&targetLock);
         if(!owner || !at || GetTickCount64()-at>100 ||
@@ -1065,22 +1319,32 @@ namespace
 
         auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(owner)+0x20);
         if(!root) return;
+        // Only the camera's confirmed seated vehicle may supply this frame.
+        // Entry/exit and vehicle changes drop ownership before following it.
+        if(vehicle && *reinterpret_cast<void**>(static_cast<char*>(owner)+0xB30)!=vehicle) return;
         // The camera publishes at render time. Include subsequent native
         // locomotion before solving this simulation pose, without integrating
         // controller deltas or inheriting animated shoulder motion.
         AcquireSRWLockShared(&targetLock);
-        if(targetOwner==owner)
+        if(vehicle)
+        {
+            auto* carRoot=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(vehicle)+0x20);
+            if(!carRoot) {ReleaseSRWLockShared(&targetLock); return;}
+            transform=VRMath::Multiply(VRMath::Multiply(transform,VRMath::InverseRigid(vehicleFrame)),VRMath::AffineXYZ(*carRoot));
+            vehicleFrame=VRMath::AffineXYZ(*carRoot);
+        }
+        else if(targetOwner==owner)
             transform=VRMath::RebaseTrackingFrame(transform,trackingBodyPosition,(*root)[3]);
         ReleaseSRWLockShared(&targetLock);
         ResolveBodyHeight(skeleton,owner);
         float scale=1,bottom=0;
         AcquireSRWLockShared(&targetLock);
-        if(fitBodyHeight && owner==bodyDimensionsOwner) {scale=bodyScale; bottom=bodyBottom;}
+        if(!vehicle && fitBodyHeight && owner==bodyDimensionsOwner) {scale=bodyScale; bottom=bodyBottom;}
         ReleaseSRWLockShared(&targetLock);
         VRMath::Vector pivot=(*root)[3];
         for(unsigned axis=0;axis<3;++axis) pivot[axis]+=bottom*(*root)[2][axis];
         const unsigned boneCount=*reinterpret_cast<unsigned short*>(static_cast<char*>(skeleton)+0x10);
-        if((scale!=1 || trackedBody) && boneCount && boneCount<=255)
+        if(!vehicle && (scale!=1 || trackedBody) && boneCount && boneCount<=255)
         {
             scaledPose.owner=owner; scaledPose.matrices=matrices; scaledPose.count=boneCount;
             scaledPose.pending=true;
@@ -1113,9 +1377,12 @@ namespace
         void* held=nullptr;
         void* weapon=EquippedWeapon(owner,held);
         physicsRig={}; physicsRig.owner=owner; physicsRig.held=held; physicsRig.matrices=matrices;
+        physicsRig.seated=vehicle!=nullptr;
         physicsRig.trackingTransform=transform; physicsRig.sampledAt=input.sampledAt;
         finish.publish=true;
         const bool holdingWeapon=weapon && *reinterpret_cast<int*>(static_cast<char*>(weapon)+0x18)!=0;
+        const bool leftWeapon=vehicle && holdingWeapon && !drivingHolstered.load() && DriveByWeapon(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18));
+        drivingWeaponActive=leftWeapon && !input.phoneActive;
         weaponGrip=holdingWeapon;
         ++updates;
         alignas(16) const VRMath::Vector offset{0,0,0,0};
@@ -1139,11 +1406,130 @@ namespace
             target=VRMath::Multiply(correction[hand],target);
             targets[hand]=target;
         }
+        wheelAt=0;
+        wheelReady=false;
+        for(unsigned hand=0;hand<2;++hand) {wheelHeld[hand]=false;wheelDistances[hand]=-1.f;}
+        if(vehicle)
+        {
+            const auto inverse=VRMath::InverseRigid(vehicleFrame);
+            if(wheel.vehicle!=vehicle)
+            {
+                wheel={}; wheel.vehicle=vehicle;wheel.enteredAt=GetTickCount64();
+            }
+            AcquireSRWLockShared(&wheelMeshLock);
+            const auto mesh=wheelMesh;
+            ReleaseSRWLockShared(&wheelMeshLock);
+            if(mesh.vertices && mesh.model==*reinterpret_cast<short*>(static_cast<char*>(vehicle)+0x2E) && !wheel.mesh)
+            {
+                wheel.mesh=true;wheel.ready=true;wheel.meshFrame=mesh.fit.frame;
+                wheel.center=mesh.fit.frame[3];wheel.radius=mesh.fit.radius;
+                for(unsigned axis=0;axis<3;++axis) wheel.center[axis]+=wheelCenterOffset[axis];
+                wheel.held[0]=wheel.held[1]=false;wheel.angle=0;
+            }
+            // Contact is at the palm, not the tracking origin at the wrist.
+            // Measure the actual rig's finger-base offset in wrist space.
+            VRMath::Vector palmOffset[2]{};
+            VRMath::Vector nativePalm[2]{};
+            bool palmsValid=true;
+            for(unsigned hand=0;hand<2;++hand)
+            {
+                const int wrist=mapper(model,hand==0 ? 15:11);
+                if(wrist<0 || unsigned(wrist)>=boneCount || fingerRig.count[hand]!=15)
+                {palmsValid=false;break;}
+                unsigned bases=0;
+                for(const auto& finger:fingerRig.joints[hand])
+                    if(finger.joint==0 && finger.finger!=0)
+                    {
+                        for(unsigned axis=0;axis<3;++axis) nativePalm[hand][axis]+=matrices[finger.bone][3][axis];
+                        ++bases;
+                    }
+                if(!bases) {palmsValid=false;break;}
+                for(unsigned axis=0;axis<3;++axis) nativePalm[hand][axis]/=bases;
+                for(unsigned axis=0;axis<3;++axis) palmsValid &= std::isfinite(nativePalm[hand][axis]);
+                nativePalm[hand][3]=1;
+                palmOffset[hand]=VRMath::Transform(nativePalm[hand],VRMath::InverseRigid(VRMath::AffineXYZ(matrices[wrist])));
+            }
+            // The first car-camera frame can still contain the entry pose.
+            // Capture native seated contacts after entry has settled, before
+            // replacing them with tracked IK. Phone poses are not wheel poses.
+            if(!wheel.ready && palmsValid && !input.phoneActive && GetTickCount64()-wheel.enteredAt>=500)
+            {
+                const int left=mapper(model,15),right=mapper(model,11);
+                if(left>=0 && right>=0 && unsigned(left)<boneCount && unsigned(right)<boneCount)
+                {
+                    auto midpoint=nativePalm[0];
+                    for(unsigned axis=0;axis<3;++axis) midpoint[axis]=(midpoint[axis]+nativePalm[1][axis])*.5f;
+                    midpoint[3]=1; wheel.center=VRMath::Transform(midpoint,inverse);
+                    for(unsigned axis=0;axis<3;++axis) wheel.center[axis]+=wheelCenterOffset[axis];
+                    wheel.ready=true;
+                }
+            }
+            auto localWheel=wheel.mesh ? wheel.meshFrame:VRMath::Identity();
+            const float tilt=wheelTiltDegrees*.017453293f;
+            if(!wheel.mesh)
+            {
+                localWheel[1]={0,std::sin(tilt),std::cos(tilt),0};
+                localWheel[2]={0,-std::cos(tilt),std::sin(tilt),0};
+                wheel.radius=wheelRadius;
+            }
+            localWheel[3]=wheel.center;localWheel[3][3]=1;
+            const auto wheelWorld=VRMath::Multiply(localWheel,vehicleFrame);
+            const auto toWheel=VRMath::InverseRigid(wheelWorld);
+            wheelReady=wheel.ready;
+            for(unsigned axis=0;axis<3;++axis) wheelCenter[axis]=wheelWorld[3][axis];
+            float angles[2]{}; unsigned hands=0;
+            for(unsigned hand=0;hand<2;++hand)
+            {
+                const auto palm=VRMath::Transform(wheel.held[hand] ? wheel.palmOffset[hand]:palmOffset[hand],targets[hand]);
+                const auto point=VRMath::Transform(palm,toWheel);
+                const float radius=std::hypot(point[0],point[1]);
+                const float angle=std::atan2(point[1],point[0]);
+                angles[hand]=angle;
+                const float distance=std::hypot(radius-wheel.radius,point[2]);
+                wheelDistances[hand]=input.gripPoseValid[hand] && wheel.ready ? distance:-1.f;
+                if(!wheel.ready || !palmsValid || !input.gripPoseValid[hand] || !input.gripped[hand] || input.phoneActive || (leftWeapon && hand==0))
+                    wheel.held[hand]=false;
+                else if(!wheel.held[hand] && radius>1.e-5f && distance<wheelGripRadius)
+                {
+                    wheel.held[hand]=true;wheel.reference[hand]=angle;
+                    wheel.palmOffset[hand]=palmOffset[hand];
+                    wheel.acquiredAngle[hand]=wheel.angle;
+                    wheel.attachment[hand]=VRMath::Multiply(targets[hand],toWheel);
+                    auto palmDirection=palmOffset[hand];palmDirection[3]=0;
+                    const auto palmInWheel=VRMath::Transform(palmDirection,wheel.attachment[hand]);
+                    wheel.attachment[hand][3]={wheel.radius*std::cos(angle)-palmInWheel[0],
+                        wheel.radius*std::sin(angle)-palmInWheel[1],-palmInWheel[2],1};
+                }
+                if(wheel.held[hand])
+                {
+                    ++hands;
+                }
+                wheelHeld[hand]=wheel.held[hand];
+            }
+            if(hands)
+            {
+                wheel.angle=VRGrip::WheelAngle(angles,wheel.reference,wheel.acquiredAngle,wheel.held,
+                    wheel.angle,wheelSteeringDegrees*.017453293f);
+                wheelSteer=-wheel.angle/(wheelSteeringDegrees*.017453293f);
+                wheelVisualAngle=wheel.angle;
+                wheelAt=GetTickCount64();
+                for(unsigned hand=0;hand<2;++hand)
+                    if(wheel.held[hand])
+                    {
+                        const float half=(wheel.angle-wheel.acquiredAngle[hand])*.5f;
+                        const float origin[3]{},quaternion[4]{0,0,std::sin(half),std::cos(half)};
+                        targets[hand]=VRMath::Multiply(VRMath::Multiply(wheel.attachment[hand],
+                            VRMath::Pose(origin,quaternion)),wheelWorld);
+                    }
+            }
+            else wheel.angle=0;
+        }
+        else wheel={};
         bool supporting=false;
         supportDistance=-1.f;
         if(supportOwner!=owner || supportWeapon!=held) supportGripping=false;
         supportOwner=owner; supportWeapon=held;
-        if(supportGripEnabled && holdingWeapon && input.gripPoseValid[0] && input.gripPoseValid[1] &&
+        if(!vehicle && supportGripEnabled && holdingWeapon && input.gripPoseValid[0] && input.gripPoseValid[1] &&
             SupportedFirearm(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)))
         {
             const auto weaponModelIndex=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
@@ -1178,7 +1564,7 @@ namespace
         else kick=recoil.Sample(GetTickCount64(),recoilSettings[2]);
         recoilDegrees=kick;
         ReleaseSRWLockExclusive(&recoilLock);
-        if(kick>.001f && input.gripPoseValid[1])
+        if(!vehicle && kick>.001f && input.gripPoseValid[1])
         {
             const auto weaponModelIndex=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
             if(weaponModelIndex>=0 && models[weaponModelIndex] && ResolveSupportGrip(models[weaponModelIndex],recoilType))
@@ -1199,7 +1585,7 @@ namespace
         VRMath::Matrix solvedRight{};
         bool rightSolved=false;
         VRMath::Matrix slideRelative{};
-        const bool sliding=VRReloadRuntime::SlideGrip(owner,held,slideRelative);
+        const bool sliding=!vehicle && VRReloadRuntime::SlideGrip(owner,held,slideRelative);
         physicsRig.supporting[0]=supporting || sliding;
         for(unsigned order=0;order<2;++order)
         {
@@ -1210,7 +1596,7 @@ namespace
             // The final wrist position remains exactly at the tracked Wand.
             for(unsigned axis=0;axis<3;++axis)
                 target[3][axis]=pivot[axis]+(target[3][axis]-pivot[axis]-
-                    (trackedBody ? (axis==2 ? bodyVerticalOffset:scaledPose.placement[axis]):0.f))/scale;
+                    (!vehicle && trackedBody ? (axis==2 ? bodyVerticalOffset:scaledPose.placement[axis]):0.f))/scale;
             if(hand==0 && (supporting || sliding))
             {
                 if(!rightSolved) {supportGripping=false; continue;}
@@ -1225,7 +1611,7 @@ namespace
             const int wrist=mapper(model,hand==0 ? 15 : 11);
             if(wrist<0 || wrist>=255) continue;
             VRMath::Matrix nativePose[15];
-            const bool preserveGrip=hand==1 && holdingWeapon && fingerRig.count[hand]==15;
+            const bool preserveGrip=((hand==1 && holdingWeapon && !leftWeapon) || (vehicle && wheel.held[hand])) && fingerRig.count[hand]==15;
             if(preserveGrip)
                 for(unsigned joint=0;joint<15;++joint) nativePose[joint]=matrices[fingerRig.joints[hand][joint].bone];
             const auto nativeWrist=matrices[wrist];
@@ -1267,7 +1653,7 @@ namespace
                     for(const auto& row:solvedRight) for(float value:row)
                         rightSolved &= std::isfinite(value);
                 }
-                UpdateFingers(matrices,hand,wrist,input,preserveGrip ? nativePose : nullptr,nativeWrist,hand==0 && supporting,hand==0 && sliding);
+                UpdateFingers(matrices,hand,wrist,input,preserveGrip ? nativePose : nullptr,nativeWrist,hand==0 && (supporting || leftWeapon),hand==0 && sliding);
             }
         }
     }
@@ -1334,13 +1720,38 @@ namespace
             points[VRHandPhysics::ContactNodeCount]=gripWrist[3];
             VRHandPhysics::Publish(physicsRig.owner,physicsRig.held,hand,points,gripWrist,physicsRig.supporting[hand]);
         }
-        if(physicsRig.valid[0] && physicsRig.valid[1])
+        if(physicsRig.valid[0] && physicsRig.valid[1] && !physicsRig.seated)
             VRReloadRuntime::Publish(physicsRig.owner,physicsRig.trackingTransform,physicsRig.requested,renderedWrists);
         // Use the rendered equipped entity, not a gun-muzzle semantic (the
         // knife has none). Transform back to tracking space for motion gating
         // so locomotion with a stationary blade cannot become an attack.
         void* held=nullptr;
         void* weapon=EquippedWeapon(physicsRig.owner,held);
+        DrivingWeaponPose drive{};
+        if(physicsRig.seated && physicsRig.valid[0] && held && weapon && drivingWeaponActive.load())
+        {
+            const auto type=*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18);
+            const auto index=*reinterpret_cast<short*>(static_cast<char*>(held)+0x2E);
+            auto** models=reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0xE95CD8);
+            if(DriveByWeapon(type) && index>=0 && models[index] && ResolveSupportGrip(models[index],type))
+            {
+                // The asset supplies distinct right/left anatomical grip frames.
+                // Use the authored left grip directly; controller calibration is
+                // already included in the rendered left wrist. Keep on-foot
+                // support tuning independent from this weapon attachment.
+                drive.owner=physicsRig.owner;drive.entity=held;
+                drive.vehicle=*reinterpret_cast<void**>(static_cast<char*>(physicsRig.owner)+0xB30);
+                auto* root=drive.vehicle ? *reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(drive.vehicle)+0x20):nullptr;
+                if(root)
+                {
+                    drive.vehicleFrame=VRMath::AffineXYZ(*root);
+                    drive.frame=VRMath::Multiply(leftGripInverse,renderedWrists[0]);
+                    if(VRGrip::Rigid(drive.frame)) drive.at=GetTickCount64();
+                }
+            }
+        }
+        AcquireSRWLockExclusive(&drivingWeaponLock);drivingWeaponPose=drive;ReleaseSRWLockExclusive(&drivingWeaponLock);
+        if(drive.at) VRHands::PrepareObjectRender(held);
         AcquireSRWLockExclusive(&wristLock);
         publishedScopeAt=0;
         if(physicsRig.valid[1] && held && weapon && supportReady &&
@@ -1371,11 +1782,16 @@ namespace
     }
 }
 
-void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* owner,bool active)
+void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* owner,bool active,bool seated)
 {
     if(!enabled) return;
+    if(!active || !seated) drivingWeaponActive=false;
     AcquireSRWLockExclusive(&targetLock);
     trackingToWorld=transform; targetOwner=active ? owner : nullptr;
+    trackingVehicle=active && seated && owner ? *reinterpret_cast<void**>(static_cast<char*>(owner)+0xB30):nullptr;
+    if(trackingVehicle)
+        if(auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(trackingVehicle)+0x20))
+            trackingVehicleFrame=VRMath::AffineXYZ(*root);
     if(active && owner)
         if(auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(owner)+0x20))
             trackingBodyPosition=(*root)[3];
@@ -1388,6 +1804,51 @@ void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* own
         recoil={};recoilOwner=nullptr;recoilWeapon=nullptr;recoilDegrees=0;
         ReleaseSRWLockExclusive(&recoilLock);
     }
+}
+
+bool VRHands::WheelSteering(float& steering)
+{
+    const auto at=wheelAt.load();
+    if(!at || GetTickCount64()-at>100 || !OpenXRVR::HasFocusedViews())
+    {wheelVisualAngle=-steering*wheelSteeringDegrees*.017453293f;return false;}
+    steering=wheelSteer.load(); return true;
+}
+
+bool VRHands::DrivingWeaponActive() {return drivingWeaponActive.load() && OpenXRVR::HasFocusedViews();}
+bool VRHands::HideDrivingWeapon(void* entity)
+{
+    if(!entity || !drivingHolstered.load() || !OpenXRVR::HasFocusedViews()) return false;
+    void* owner=nullptr;void* car=nullptr;
+    AcquireSRWLockShared(&targetLock);owner=targetOwner;car=trackingVehicle;ReleaseSRWLockShared(&targetLock);
+    void* held=nullptr;
+    return owner && car && EquippedWeapon(owner,held) && held==entity;
+}
+void VRHands::PrepareObjectRender(void* entity)
+{
+    if(!entity || !DrivingWeaponActive()) return;
+    DrivingWeaponPose pose;
+    AcquireSRWLockShared(&drivingWeaponLock);pose=drivingWeaponPose;ReleaseSRWLockShared(&drivingWeaponLock);
+    if(entity!=pose.entity || !pose.at || GetTickCount64()-pose.at>100) return;
+    AcquireSRWLockShared(&targetLock);
+    const bool current=targetOwner==pose.owner && trackingVehicle==pose.vehicle && targetAt && GetTickCount64()-targetAt<100;
+    ReleaseSRWLockShared(&targetLock);
+    if(!current) return;
+    void* actual=nullptr;auto* weapon=EquippedWeapon(pose.owner,actual);
+    if(actual!=entity || !weapon || !DriveByWeapon(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18))) return;
+    auto* carRoot=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(pose.vehicle)+0x20);
+    auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
+    if(!root || !carRoot) return;
+    auto old=VRMath::AffineXYZ(*root);
+    if(!VRGrip::Rigid(old)) return;
+    auto frame=VRMath::Multiply(VRMath::Multiply(pose.frame,VRMath::InverseRigid(pose.vehicleFrame)),VRMath::AffineXYZ(*carRoot));
+    if(!VRGrip::Rigid(frame)) return;
+    const auto delta=VRMath::Multiply(VRMath::InverseRigid(old),frame);
+    auto* skeleton=*reinterpret_cast<char**>(static_cast<char*>(entity)+0x100);
+    auto* matrices=skeleton ? *reinterpret_cast<VRMath::Matrix**>(skeleton+0x14):nullptr;
+    const unsigned count=skeleton ? *reinterpret_cast<unsigned short*>(skeleton+0x10):0;
+    if(matrices && count && count<=64)
+        for(unsigned bone=0;bone<count;++bone) matrices[bone]=VRMath::Multiply(VRMath::AffineXYZ(matrices[bone]),delta);
+    *root=frame;
 }
 
 void VRHands::ConsumeRoomMotion(void* owner,const VRMath::Vector& consumed)
@@ -1528,10 +1989,20 @@ std::string VRHands::Status()
     sprintf_s(support,",\"supportReady\":%s,\"supportGripping\":%s,\"supportDistance\":%.4f}",
         supportReady.load() ? "true":"false",supportGripping.load() ? "true":"false",supportDistance.load());
     result.pop_back(); result+=support;
-    char swapping[100];
-    sprintf_s(swapping,",\"weaponSwapEnabled\":%s,\"weaponSwaps\":%u}",
-        weaponSwapEnabled ? "true":"false",weaponSwaps.load());
+    char swapping[320];
+    sprintf_s(swapping,",\"weaponSwapEnabled\":%s,\"weaponSwaps\":%u,\"weaponSwapAttempts\":%u,\"weaponSwapStage\":%u,\"weaponSwapCandidate\":%u,\"drivingWeaponActive\":%s,\"drivingHolstered\":%s}",
+        weaponSwapEnabled ? "true":"false",weaponSwaps.load(),weaponSwapAttempts.load(),weaponSwapStage.load(),weaponSwapCandidate.load(),drivingWeaponActive.load() ? "true":"false",drivingHolstered.load() ? "true":"false");
     result.pop_back(); result+=swapping;
+    AcquireSRWLockShared(&wheelMeshLock);
+    const auto meshVertices=wheelMesh.vertices,meshSupport=wheelMesh.fit.support;
+    const int meshModel=wheelMesh.model;
+    ReleaseSRWLockShared(&wheelMeshLock);
+    char wheelText[480];
+    sprintf_s(wheelText,",\"wheel\":{\"ready\":%s,\"held\":[%s,%s],\"palmDistance\":[%.4f,%.4f],\"center\":[%.4f,%.4f,%.4f],\"steering\":%.4f,\"meshModel\":%d,\"meshVertices\":%u,\"rimSupport\":%u,\"visualCalls\":%u,\"visualHook\":%s}}",
+        wheelReady.load() ? "true":"false",wheelHeld[0].load() ? "true":"false",wheelHeld[1].load() ? "true":"false",
+        wheelDistances[0].load(),wheelDistances[1].load(),wheelCenter[0].load(),wheelCenter[1].load(),wheelCenter[2].load(),wheelSteer.load(),
+        meshModel,meshVertices,meshSupport,wheelVisualCalls.load(),vehicleRenderHook ? "true":"false");
+    result.pop_back(); result+=wheelText;
     result.pop_back();result+=",\"throwReady\":"+std::string(throwVelocityHook ? "true":"false")+
         ",\"throwAttempts\":"+std::to_string(throwableAttempts.load())+
         ",\"throws\":"+std::to_string(throwableShots.load())+
@@ -1598,6 +2069,20 @@ bool VRHands::Calibrate(unsigned hand)
 void VRHands::Install()
 {
     CIniReader ini("");
+    wheelGripRadius=ini.ReadFloat("VR","WheelGripRadius",.18f);
+    wheelSteeringDegrees=ini.ReadFloat("VR","WheelSteeringDegrees",180.f);
+    wheelRadius=ini.ReadFloat("VR","WheelRadius",.17f);
+    wheelTiltDegrees=ini.ReadFloat("VR","WheelTiltDegrees",20.f);
+    wheelCenterOffset[0]=ini.ReadFloat("VR","WheelCenterRight",0.f);
+    wheelCenterOffset[1]=ini.ReadFloat("VR","WheelCenterForward",0.f);
+    wheelCenterOffset[2]=ini.ReadFloat("VR","WheelCenterUp",0.f);
+    if(!std::isfinite(wheelGripRadius)) wheelGripRadius=.18f;
+    if(!std::isfinite(wheelRadius) || wheelRadius<=0) wheelRadius=.17f;
+    if(!std::isfinite(wheelTiltDegrees)) wheelTiltDegrees=20.f;
+    if(!std::isfinite(wheelCenterOffset[0])) wheelCenterOffset[0]=0;
+    if(!std::isfinite(wheelCenterOffset[1])) wheelCenterOffset[1]=0;
+    if(!std::isfinite(wheelCenterOffset[2])) wheelCenterOffset[2]=0;
+    if(!std::isfinite(wheelSteeringDegrees) || wheelSteeringDegrees<=0) wheelSteeringDegrees=180.f;
     throwableVelocityScale=ini.ReadFloat("VR","ThrowableVelocityScale",4.f);
     if(!std::isfinite(throwableVelocityScale)) throwableVelocityScale=4.f;
     if(!ini.ReadInteger("VR","ExperimentalHandIK",0) ||
@@ -1609,6 +2094,15 @@ void VRHands::Install()
     updateHook=safetyhook::create_inline(update.get_first(),UpdateIK);
     enabled=static_cast<bool>(updateHook);
     if(!enabled) return;
+    // #019: car-entry crash in the mesh rebinding experiment. Keep this
+    // diagnostic path out of ordinary seated-hand/steering iterations until
+    // the native resource interface and palette ownership are verified.
+    if(ini.ReadInteger("DEVELOPMENT","ExperimentalWheelMesh",0)!=0)
+    {
+        // CE CVehicle virtual +8C (A3D980), four stack args, RET10.
+        auto carRender=hook::pattern("83 EC 44 A1 ? ? ? ? 33 C4 89 44 24 40 8A 44 24 50 53 8B 5C 24 4C 55 8B 6C 24 54 57 8B F9");
+        if(carRender.size()==1) vehicleRenderHook=safetyhook::create_inline(carRender.get_first(),RenderVehicleWheel);
+    }
     VRHandPhysics::Install();
     configuredHeight=ini.ReadFloat("VR","PlayerHeight",1.75f);
     if(!std::isfinite(configuredHeight) || configuredHeight<1.f || configuredHeight>2.5f) configuredHeight=1.75f;
@@ -1629,6 +2123,7 @@ void VRHands::Install()
     VRReloadRuntime::Install();
     weaponSwapEnabled=ini.ReadInteger("VR","ExperimentalWeaponSwap",0)!=0;
     if(weaponSwapEnabled) FusionFix::onGameProcessEvent() += ProcessWeaponSwap;
+    FusionFix::onGameProcessEvent() += ProcessDriveByWeapon;
     if(ini.ReadInteger("VR","ExperimentalPistolAim",0))
     {
         // Fixed native delayed-fire call sites, verified on CE1.2.0.59.

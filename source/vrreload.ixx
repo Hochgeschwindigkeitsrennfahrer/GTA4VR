@@ -40,6 +40,7 @@ export namespace VRReloadRuntime
 namespace
 {
     bool enabled=false;
+    std::atomic<bool> vehicleMode=false;
     SafetyHookInline poseHook{},worldPoseHook{},reloadHook{},completionHook{},decisionHook{},taskHook{};
     std::atomic<void*> nativeRocketVisual=nullptr;
     std::atomic<unsigned> nativeRocketSkips=0,rocketRenderUpdates=0;
@@ -327,10 +328,10 @@ namespace
         }
         return 0;
     }
-    void PlayFireAnimation()
+    void PlayFireAnimation(void* entity=nullptr,unsigned weaponType=0)
     {
-        const auto object=WeaponObjectHandle(gunEntity);
-        const unsigned type=currentType.load();
+        const auto object=WeaponObjectHandle(entity ? entity:gunEntity);
+        const unsigned type=weaponType ? weaponType:currentType.load();
         const char* dictionary=type==10 ? "gun@shotgun":(type==11 ? "gun@baretta":((type==16 || type==17) ? "gun@rifle":((type==14 || type==15) ? "gun@ak47":(type==9 ? "gun@deagle":(type==12 ? "gun@uzi":(type==13 ? "gun@mp5k":"gun@handgun"))))));
         // Play only the weapon object's authored clip, never a ped fire task.
         // Missing animation assets must not prevent an otherwise valid shot.
@@ -567,6 +568,30 @@ namespace
     void Process()
     {
         if(configPending.exchange(false)) LoadProfile();
+        if(enabled && OpenXRVR::IsSessionRunning())
+        {
+            Ped local=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&local);
+            vehicleMode=local && Natives::DoesCharExist(local) && !Natives::IsCharDead(local) && Natives::IsCharInAnyCar(local);
+        }
+        else vehicleMode=false;
+        if(enabled && vehicleMode.load() && OpenXRVR::IsSessionRunning())
+        {
+            // First drive-by pass uses the game's clip/reload controller.
+            // Transfer the actual partial clip, never create ammunition.
+            Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+            if(initialized && ped && Natives::DoesCharExist(ped) && !Natives::IsCharDead(ped))
+            {
+                ammo.ReturnHeld();currentWeapon=nullptr;
+                if(Natives::HasCharGotWeapon(ped,currentType.load())) WriteAmmo(ped);
+            }
+            initialized=false;guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;
+            racking=false;slideDistance=0;leftBusy=false;
+            if(magazineObject) DeleteMagazine();
+            void* entity=nullptr;void* local=FindPlayerPed ? FindPlayerPed(0):nullptr;
+            void* weapon=local ? Equipped(local,entity):nullptr;
+            if(weapon) savedAmmo[AmmoIndex(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18))]={};
+            return;
+        }
         if(enabled && initialized && !OpenXRVR::IsSessionRunning())
         {
             // Overlay focus loss is not session loss. Only a stopped session
@@ -801,9 +826,17 @@ void VRReloadRuntime::EmptyTrigger(void* ped,void* weapon)
     PlayPistolSound("GENERAL_GUNS_AK47_DRY_CLICK");
     ++emptyClicks;
 }
-void VRReloadRuntime::Fired(void*,void* weapon)
+void VRReloadRuntime::Fired(void* ped,void* weapon)
 {
-    if(weapon!=guardedWeapon.load()) return;
+    if(weapon!=guardedWeapon.load())
+    {
+        if(vehicleMode.load() && ped && FindPlayerPed && ped==FindPlayerPed(0))
+        {
+            void* entity=nullptr;
+            if(Equipped(ped,entity)==weapon) PlayFireAnimation(entity,*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18));
+        }
+        return;
+    }
     ammo.Fired();previousNativeTotal=ammo.NativeTotal();chamberReady=ammo.Ready();
     if(currentType!=18) PlayFireAnimation();
 }

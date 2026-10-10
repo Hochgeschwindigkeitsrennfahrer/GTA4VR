@@ -45,7 +45,7 @@ namespace
     SafetyHookInline controllerPadUpdate{};
     using PadGetter=void* (__cdecl*)();
     PadGetter localPad=nullptr;
-    bool previousJump=false,previousEnter=false,previousHandbrake=false,previousRun=false,previousHangGrip[2]{true,true};
+    bool previousJump=false,previousEnter=false,previousHandbrake=false,previousRun=false,previousHorn=false,previousHangGrip[2]{true,true};
     bool buttonsArmed=false;
     std::atomic<unsigned> padButtonUpdates{0},padJumpPresses{0},padEnterPresses{0},padDrivingUpdates{0},padHangDrops{0};
     std::atomic<unsigned> phoneDelivered[6]{};
@@ -641,7 +641,7 @@ namespace
         const bool menu=fresh && (vehicleView ? input.exitVehicle:input.interact);
         if(!fresh)
         {
-            buttonsArmed=false; previousJump=previousEnter=previousHandbrake=previousRun=false;
+            buttonsArmed=false; previousJump=previousEnter=previousHandbrake=previousRun=previousHorn=false;
             previousHangGrip[0]=previousHangGrip[1]=true;
             padSteering=padThrottle=padBrake=0;
             return; // The freshly updated native values already cleared VR input.
@@ -687,6 +687,9 @@ namespace
         button(43,enter && driving,previousEnter && driving); // INPUT_VEH_EXIT
         button(44,handbrake,previousHandbrake); // INPUT_VEH_HANDBRAKE
         button(45,handbrake,previousHandbrake); // alternate handbrake
+        const bool horn=buttonsArmed && driving && input.horn;
+        button(54,horn,previousHorn); // native vehicle horn
+        previousHorn=horn;
         if(jump && !previousJump) ++padJumpPresses;
         if(enter && !previousEnter) ++padEnterPresses;
         if(drop) ++padHangDrops;
@@ -718,9 +721,10 @@ namespace
         else previousRun=false;
         if(driving && input.gripPoseValid[0])
         {
-            const float steering=input.steer;
+            float steering=input.steer;
+            VRHands::WheelSteering(steering);
             const float throttle=input.accelerate;
-            const float brake=input.brake;
+            const float brake=VRHands::DrivingWeaponActive() && !input.phoneActive ? input.weaponBrake:input.brake;
             const auto encodedSteer=static_cast<unsigned char>(std::lround(127.5f+127.5f*steering));
             for(unsigned id:{30u,31u,111u}) analog(id,encodedSteer);
             analog(40,static_cast<unsigned char>(std::lround(throttle*255.f)));
@@ -1475,7 +1479,8 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
             for(float value:row)
                 if(!std::isfinite(value)) throw std::invalid_argument("Invalid game camera");
         VRHands::PublishTrackingTransform(VRMath::Multiply(referenceInverse,gameCamera),
-            FindPlayerPed ? FindPlayerPed(0) : nullptr,useFirstPerson && !vehicle && !animated && OpenXRVR::HasFocusedViews());
+            FindPlayerPed ? FindPlayerPed(0) : nullptr,useFirstPerson && !animated && !exiting && !ragdoll &&
+            (!vehicle || seatIsCar) && OpenXRVR::HasFocusedViews(),vehicle!=0);
         // Eye translation comes only from the native anchor and OpenXR pose.
         // VRHands applies configured head/body placement to the visible rig;
         // head yaw must never rotate a positional offset around these eyes.

@@ -1,4 +1,5 @@
 #include "../../source/includes/vrgrip.hpp"
+#include "../../source/includes/vrwheel.hpp"
 #include <cstdio>
 #include <cstdlib>
 
@@ -13,6 +14,25 @@ static void PoseNear(const VRMath::Matrix& a,const VRMath::Matrix& b)
 int main()
 {
     constexpr float pi=3.141592654f;
+    {
+        const VRMath::Vector seat{-.4f,-.2f,-.2f,1};
+        auto frame=VRMath::Identity();
+        frame[1]={0,std::sin(pi/9),std::cos(pi/9),0};
+        frame[2]={0,-std::cos(pi/9),std::sin(pi/9),0};frame[3]={-.4f,.04f,.19f,1};
+        std::vector<VRMath::Vector> points;
+        for(unsigned i=0;i<128;++i)
+        {
+            const float a=2*pi*i/128;
+            points.push_back(VRMath::Transform({.16f*std::cos(a),.16f*std::sin(a),0,1},frame));
+        }
+        // Nearby dashboard geometry must not replace the complete circular rim.
+        for(unsigned i=0;i<30;++i) points.push_back({-.6f+i*.01f,.4f,.3f,1});
+        const auto fit=VRWheel::FindRim(points,seat);
+        if(fit.support<100) return 1;
+        for(unsigned a=0;a<3;++a) Near(fit.frame[3][a],frame[3][a],.01f);
+        Near(fit.radius,.16f,.01f);
+        if(!VRWheel::OnWheel(points[0],fit) || VRWheel::OnWheel({-.4f,.4f,.3f,1},fit))return 1;
+    }
     const float origin[3]{};
     {
         auto primary=VRMath::Identity(),support=primary,relative=primary;
@@ -118,5 +138,21 @@ int main()
         {v+=VRGrip::Spring(1-x,v,0,.5f,12,dt)*dt/.5f;x+=v*dt;}
         Near(x,1,.001f);Near(v,0,.001f);
     }
-    std::puts("VR grip: full-pose capture, rotation, two-hand composition, bounded spring and tracked throws passed");
+    {
+        float current[2]{.8f,-1.f},reference[2]{.8f,-1.f},acquired[2]{};
+        bool held[2]{true,true};float angle=0;
+        for(unsigned pass=0;pass<1000;++pass)
+        {
+            current[0]+=.4f;current[1]+=.4f;
+            angle=VRGrip::WheelAngle(current,reference,acquired,held,angle,pi);Near(angle,.4f);
+            current[0]-=.4f;current[1]-=.4f;
+            angle=VRGrip::WheelAngle(current,reference,acquired,held,angle,pi);Near(angle,0);
+        }
+        // A hard stop does not redefine the reference. Returning the hand
+        // returns the wheel, even after motion beyond the steering range.
+        held[1]=false;current[0]=reference[0]+2.f;
+        angle=VRGrip::WheelAngle(current,reference,acquired,held,angle,1.f);Near(angle,1);
+        current[0]=reference[0];Near(VRGrip::WheelAngle(current,reference,acquired,held,angle,1.f),0);
+    }
+    std::puts("VR grip: pose, wheel return/stop, two-hand composition, spring and throws passed");
 }

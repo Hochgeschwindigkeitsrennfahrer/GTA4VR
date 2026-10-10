@@ -6,6 +6,21 @@
 // controller deltas into an attachment, which would permit accumulated drift.
 namespace VRGrip
 {
+    // Absolute circular grab reference. Evaluate each physical hand against
+    // its acquisition ray, then fit one common hinge angle. In particular,
+    // clamping at a stop must not consume controller motion or move the zero.
+    inline float WheelAngle(const float* current,const float* reference,
+        const float* acquired,const bool* held,float previous,float limit)
+    {
+        float sum=0; unsigned count=0;
+        for(unsigned hand=0;hand<2;++hand) if(held[hand])
+        {
+            float candidate=acquired[hand]+std::remainder(current[hand]-reference[hand],6.283185307f);
+            candidate=previous+std::remainder(candidate-previous,6.283185307f);
+            sum+=candidate; ++count;
+        }
+        return count ? std::clamp(sum/count,-limit,limit):0.f;
+    }
     // Project a tracked grasp onto a native one-axis hinge. Only motion in
     // the hinge plane contributes; pulling along its axis cannot open it.
     inline bool HingeTarget(const VRMath::Vector& origin,const VRMath::Vector& axis,

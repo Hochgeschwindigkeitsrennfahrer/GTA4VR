@@ -2532,7 +2532,9 @@ namespace
         // Physical RPG reload owns its rocket visual; omit the separate
         // native held projectile only for the guarded local VR weapon.
         if(VRReloadRuntime::HideNativeRocket(self)) return 0;
+        if(VRHands::HideDrivingWeapon(self)) return 0;
         VRReloadRuntime::PrepareObjectRender(self);
+        VRHands::PrepareObjectRender(self);
         // CE CObject virtual +8C, B12E80: thiscall, four arguments, RET10.
         // Skip the owned rifle/magazine before generating scope draw commands.
         // Main eyes and shared shadow/reflection builds retain these objects.

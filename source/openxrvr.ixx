@@ -48,8 +48,8 @@ export namespace OpenXRVR
         float trigger[2]{};
         // Gameplay actions are independent of the finger/pose observations above.
         bool moveActive=false,moveEnabled=false,sprint=false,jump=false,interact=false;
-        float move[2]{},fire=0,steer=0,accelerate=0,brake=0;
-        bool fireActive=false,support=false,handbrake=false,exitVehicle=false;
+        float move[2]{},fire=0,steer=0,accelerate=0,brake=0,weaponBrake=0;
+        bool fireActive=false,support=false,handbrake=false,exitVehicle=false,driving=false,horn=false;
         bool grab[2]{},grabActive[2]{};
         bool cycle=false,nextWeapon=false,previousWeapon=false;
         float cycleDirection=0;
@@ -168,7 +168,8 @@ namespace
     XrActionSet gameplayActions=XR_NULL_HANDLE,drivingActions=XR_NULL_HANDLE,menuActions=XR_NULL_HANDLE,systemActions=XR_NULL_HANDLE,phoneActions=XR_NULL_HANDLE;
     enum class Action {Move,MoveEnable,Sprint,Jump,Interact,Fire,Support,Cycle,CycleDirection,Next,Previous,
         Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
-        PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,Count};
+        PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,
+        DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
     OpenXRVR::PanelPointer panelPointer{};
@@ -499,6 +500,13 @@ namespace
             !game(Action::Brake,drivingActions,"brake","Brake / reverse",scalar,0,"/input/trigger/value") ||
             !game(Action::Handbrake,drivingActions,"handbrake","Handbrake",boolean,1,"/input/trackpad/click") ||
             !game(Action::Exit,drivingActions,"exit_vehicle","Exit vehicle",boolean,1,"/input/menu/click") ||
+            !game(Action::DriveFire,drivingActions,"fire_left_weapon","Fire left-hand weapon",scalar,0,"/input/trigger/value") ||
+            !game(Action::DriveArmedBrake,drivingActions,"brake_with_weapon","Brake / reverse with weapon equipped",boolean,0,"/input/trackpad/click") ||
+            !game(Action::DriveCycle,drivingActions,"cycle_weapon","Activate weapon selection",boolean,1,"/input/trackpad/click") ||
+            !game(Action::DriveDirection,drivingActions,"weapon_direction","Weapon selection direction",vector,1,"/input/trackpad") ||
+            !game(Action::DriveNext,drivingActions,"next_weapon","Next drive-by weapon",boolean,1,nullptr) ||
+            !game(Action::DrivePrevious,drivingActions,"previous_weapon","Previous drive-by weapon",boolean,1,nullptr) ||
+            !game(Action::DriveHorn,drivingActions,"horn","Car horn",boolean,1,"/input/trackpad/click") ||
             !game(Action::Pause,systemActions,"pause","Pause menu (tap)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneOpen,systemActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneDirection,phoneActions,"phone_direction","Phone navigation direction",vector,1,"/input/trackpad") ||
@@ -580,6 +588,19 @@ namespace
                 sample.steer=steering ? VRMath::TouchpadMovement(steer[0],steer[1])[0]:0;
                 sample.accelerate=getFloat(Action::Accelerate);sample.brake=getFloat(Action::Brake);
                 sample.handbrake=getBool(Action::Handbrake);sample.exitVehicle=getBool(Action::Exit);
+                sample.driving=drivingInput.load();
+                if(sample.driving)
+                {
+                    sample.fire=getFloat(Action::DriveFire,&sample.fireActive);
+                    sample.weaponBrake=getBool(Action::DriveArmedBrake) ? 1.f:0.f;
+                    const auto direction=getVector(Action::DriveDirection);
+                    sample.cycleDirection=direction[0];sample.cycle=getBool(Action::DriveCycle);
+                    sample.nextWeapon=getBool(Action::DriveNext);sample.previousWeapon=getBool(Action::DrivePrevious);
+                    sample.horn=getBool(Action::DriveHorn) && (!sample.cycle ||
+                        (direction[1]>.5f && std::abs(direction[1])>std::abs(direction[0])));
+                    // Default side clicks select; the centre remains handbrake.
+                    sample.handbrake &= !sample.cycle || std::hypot(direction[0],direction[1])<.35f;
+                }
                 sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
                 sample.phoneOpen=getBool(Action::PhoneOpen);sample.phoneActive=phone;
                 if(phone)
@@ -591,7 +612,7 @@ namespace
                     sample.phoneLeft=getBool(Action::PhoneLeft);sample.phoneRight=getBool(Action::PhoneRight);
                     sample.phoneAccept=getBool(Action::PhoneAccept);
                     sample.jump=sample.cycle=sample.nextWeapon=sample.previousWeapon=sample.interact=false;
-                    sample.exitVehicle=sample.handbrake=sample.fireActive=false;sample.fire=sample.accelerate=0;
+                    sample.exitVehicle=sample.handbrake=sample.horn=sample.fireActive=false;sample.fire=sample.accelerate=0;
                 }
                 for(unsigned hand=0;hand<2;++hand)sample.select[hand]=getBool(Action::Select,nullptr,handPaths[hand]);
                 for(unsigned hand=0;hand<2;++hand)
@@ -1275,6 +1296,12 @@ std::string OpenXRVR::InputStatus()
         input.pause ? "true":"false",input.select[0] ? "true":"false",input.select[1] ? "true":"false",input.back ? "true":"false",
         pointer.active ? "true":"false",pointer.hit ? "true":"false",pointer.u,pointer.v,pointer.down ? "true":"false");
     result+=semantic;
+    result.pop_back();
+    char driving[220];
+    sprintf_s(driving,",\"driving\":{\"active\":%s,\"cycle\":%s,\"direction\":%.3f,\"next\":%s,\"previous\":%s,\"fireActive\":%s,\"horn\":%s}}",
+        input.driving ? "true":"false",input.cycle ? "true":"false",input.cycleDirection,
+        input.nextWeapon ? "true":"false",input.previousWeapon ? "true":"false",input.fireActive ? "true":"false",input.horn ? "true":"false");
+    result+=driving;
     result.pop_back();
     char phone[300];
     sprintf_s(phone,",\"phone\":{\"active\":%s,\"open\":%s,\"click\":%s,\"direction\":[%.3f,%.3f],\"buttons\":[%s,%s,%s,%s,%s],\"back\":%s}}",
