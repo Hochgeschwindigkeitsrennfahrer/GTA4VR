@@ -7,6 +7,7 @@ module;
 #include <atomic>
 export module vrhud;
 import common;
+import vrdiagnostics;
 import comvars;
 import openxrvr;
 import d3dx9_43;
@@ -67,6 +68,7 @@ namespace
     std::atomic<unsigned> phoneCaptureTargets[3][6]{};
     void ObservePhoneTarget(unsigned kind)
     {
+        if(!VRDiagnostics::counters) return;
         if(!CPhoneMgr::bDisplayMobile || !*CPhoneMgr::bDisplayMobile || replayingOverlay || !RageDirect3DDevice9::m_pRealDevice) return;
         auto* device=*RageDirect3DDevice9::m_pRealDevice;
         ComPtr<IDirect3DSurface9> target;
@@ -154,13 +156,13 @@ namespace
                     device->SetRenderState(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD);
                     replayingOverlay=true;draw();replayingOverlay=false;
                     fresh=true;
-                    if(sms) {smsAt=GetTickCount64();++smsCaptures;} else ++textCaptures;
+                    if(sms) {smsAt=GetTickCount64();VRDiagnostics::Increment(smsCaptures);} else VRDiagnostics::Increment(textCaptures);
                 }
             }
             for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
             device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
         }
-        if(!bound) ++failures;
+        if(!bound) VRDiagnostics::Increment(failures);
         overlayRouting(false);
     }
 
@@ -200,7 +202,7 @@ namespace
     uint64_t nativeRadarAt=0;
     void __cdecl RadarDraw()
     {
-        ++calls;
+        VRDiagnostics::Increment(calls);
         radarDraw.unsafe_ccall();
         if(Allowed() && RageDirect3DDevice9::m_pRealDevice)
         {
@@ -255,7 +257,7 @@ namespace
         ComPtr<ID3DXBuffer> compiled,errors;
         if(FAILED(D3DXCompileShader(code,sizeof(code)-1,nullptr,nullptr,"main","ps_3_0",0,&compiled,&errors,nullptr)) ||
             FAILED(device->CreatePixelShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&shader)))
-        {++failures; return false;}
+        {VRDiagnostics::Increment(failures); return false;}
         return true;
     }
 }
@@ -263,7 +265,7 @@ namespace
 void VRHud::CaptureRadar(IDirect3DDevice9* device,IDirect3DSurface9* source)
 {
     if(!Allowed() || !nativeRadarAt || GetTickCount64()-nativeRadarAt>250) return;
-    ++queued; ++executed;
+    VRDiagnostics::Increment(queued); VRDiagnostics::Increment(executed);
     D3DSURFACE_DESC desc{}; if(FAILED(source->GetDesc(&desc))) return;
     RECT rect{static_cast<LONG>(lastBounds[0].load()),static_cast<LONG>(lastBounds[1].load()),
         static_cast<LONG>(lastBounds[2].load()),static_cast<LONG>(lastBounds[3].load())};
@@ -274,10 +276,10 @@ void VRHud::CaptureRadar(IDirect3DDevice9* device,IDirect3DSurface9* source)
     {
         radar.Reset();
         if(FAILED(device->CreateTexture(512,512,1,D3DUSAGE_RENDERTARGET,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&radar,nullptr)) ||
-            FAILED(radar->GetSurfaceLevel(0,&radarSurface))) {++failures;return;}
+            FAILED(radar->GetSurfaceLevel(0,&radarSurface))) {VRDiagnostics::Increment(failures);return;}
     }
     if(SUCCEEDED(device->StretchRect(source,&rect,radarSurface.Get(),nullptr,D3DTEXF_LINEAR)))
-    {capturedAt=GetTickCount64();++captures;} else ++failures;
+    {capturedAt=GetTickCount64();VRDiagnostics::Increment(captures);} else VRDiagnostics::Increment(failures);
 }
 
 void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Vector& eyePosition,const VRMath::Matrix* wristPose,const VRMath::Matrix* dashboardPose)
@@ -315,7 +317,7 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
             // Viewed from the -Y mount face, increasing local Z goes left.
             clip[2]*rhw,rhw,inCar ? u:1.f-u,v};
     }
-    for(unsigned i=0;i<4;++i) lastPanel[i]=(i&1) ? vertices[i/2].y:vertices[i/2].x;
+    for(unsigned i=0;i<4;++i) {if(VRDiagnostics::counters) lastPanel[i]=(i&1) ? vertices[i/2].y:vertices[i/2].x;}
     ComPtr<IDirect3DStateBlock9> state;
     ComPtr<IDirect3DSurface9> targets[4],depth;
     D3DVIEWPORT9 viewport{};
@@ -350,7 +352,7 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
     device->SetSamplerState(1,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);device->SetSamplerState(1,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
     device->SetSamplerState(1,D3DSAMP_MIPFILTER,D3DTEXF_NONE);device->SetSamplerState(1,D3DSAMP_SRGBTEXTURE,FALSE);
     device->SetSamplerState(1,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);device->SetSamplerState(1,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);
-    if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) {++draws;if(inCar)++dashboardDraws;} else ++failures;
+    if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) {VRDiagnostics::Increment(draws);if(inCar)VRDiagnostics::Increment(dashboardDraws);} else VRDiagnostics::Increment(failures);
     for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
     device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
     if(captureRequested.exchange(false))
@@ -359,7 +361,7 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
         auto* name=wcsrchr(path,L'\\'); if(name) name[1]=0;
         const auto folder=std::wstring(path)+L"plugins\\";
         if(FAILED(D3DXSaveSurfaceToFileW((folder+L"GTAIV.VR.wrist-radar.png").c_str(),D3DXIFF_PNG,radarSurface.Get(),nullptr,nullptr)) ||
-            FAILED(D3DXSaveSurfaceToFileW((folder+L"GTAIV.VR.wrist-eye.png").c_str(),D3DXIFF_PNG,eye,nullptr,nullptr))) ++failures;
+            FAILED(D3DXSaveSurfaceToFileW((folder+L"GTAIV.VR.wrist-eye.png").c_str(),D3DXIFF_PNG,eye,nullptr,nullptr))) VRDiagnostics::Increment(failures);
     }
 }
 
@@ -376,7 +378,7 @@ void VRHud::DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VR
         constexpr char code[]="sampler2D image:register(s0); float4 main(float2 uv:TEXCOORD0):COLOR0{return tex2D(image,uv);}";
         ComPtr<ID3DXBuffer> compiled,errors;
         if(FAILED(D3DXCompileShader(code,sizeof(code)-1,nullptr,nullptr,"main","ps_3_0",0,&compiled,&errors,nullptr)) ||
-            FAILED(device->CreatePixelShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&overlayShader))) {++failures;return;}
+            FAILED(device->CreatePixelShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&overlayShader))) {VRDiagnostics::Increment(failures);return;}
     }
     D3DSURFACE_DESC desc{};
     ComPtr<IDirect3DStateBlock9> state;
@@ -417,7 +419,7 @@ void VRHud::DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VR
     device->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);device->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
     device->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_NONE);device->SetSamplerState(0,D3DSAMP_SRGBTEXTURE,FALSE);
     device->SetSamplerState(0,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);device->SetSamplerState(0,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);
-    if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) ++textDraws;else ++failures;
+    if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) VRDiagnostics::Increment(textDraws);else VRDiagnostics::Increment(failures);
     for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
     device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
 }
@@ -445,14 +447,14 @@ bool VRHud::PublishScreen(IDirect3DDevice9* device,bool loading)
     {
         if(FAILED(device->CreateTexture(desc.Width,desc.Height+4,1,D3DUSAGE_RENDERTARGET,D3DFMT_A8R8G8B8,
             D3DPOOL_DEFAULT,&screenTexture,OpenXRVR::UsesVulkan() ? nullptr:&screenShared)) ||
-            FAILED(screenTexture->GetSurfaceLevel(0,&screenSurface))) {++failures;return true;}
+            FAILED(screenTexture->GetSurfaceLevel(0,&screenSurface))) {VRDiagnostics::Increment(failures);return true;}
         screenWidth=desc.Width;screenHeight=desc.Height;
     }
-    if(desc.Width!=screenWidth || desc.Height!=screenHeight) {++failures;return true;}
+    if(desc.Width!=screenWidth || desc.Height!=screenHeight) {VRDiagnostics::Increment(failures);return true;}
     const RECT imageRect{0,4,static_cast<LONG>(screenWidth),static_cast<LONG>(screenHeight+4)};
     const RECT colorRect{0,0,static_cast<LONG>(screenWidth),4};
     device->ColorFill(screenSurface.Get(),&colorRect,D3DCOLOR_ARGB(255,64,220,255));
-    if(FAILED(device->StretchRect(source.Get(),nullptr,screenSurface.Get(),&imageRect,D3DTEXF_NONE))) {++failures;return true;}
+    if(FAILED(device->StretchRect(source.Get(),nullptr,screenSurface.Get(),&imageRect,D3DTEXF_NONE))) {VRDiagnostics::Increment(failures);return true;}
     OpenXRVR::PanelPointer pointer{};
     if(OpenXRVR::GetPanelPointer(pointer) && pointer.active && pointer.hit)
     {
@@ -468,9 +470,9 @@ bool VRHud::PublishScreen(IDirect3DDevice9* device,bool loading)
         HRESULT result;
         do {result=fence->GetData(nullptr,0,D3DGETDATA_FLUSH);if(result==S_FALSE)Sleep(0);}
         while(result==S_FALSE && GetTickCount64()<deadline);
-        if(result!=S_OK) {++failures;return true;}
+        if(result!=S_OK) {VRDiagnostics::Increment(failures);return true;}
     }
-    if(!OpenXRVR::SetPanelImage(screenTexture.Get(),screenShared,screenWidth,screenHeight+4)) ++failures;
+    if(!OpenXRVR::SetPanelImage(screenTexture.Get(),screenShared,screenWidth,screenHeight+4)) VRDiagnostics::Increment(failures);
     return true;
 }
 
@@ -570,8 +572,8 @@ void VRHud::Install()
     if(headingStore.size()==1) radarHeadingHook=safetyhook::create_mid(headingStore.get_first(),[](SafetyHookContext& regs){
         const auto stamp=carRadarAt.load();
         if(!Allowed() || !dashboard || !stamp || GetTickCount64()-stamp>250)return;
-        originalRadarHeading=regs.xmm0.f32[0];
+        {if(VRDiagnostics::counters) originalRadarHeading=regs.xmm0.f32[0];}
         regs.xmm0.f32[0]=carRadarHeading.load();
-        appliedRadarHeading=regs.xmm0.f32[0];++radarHeadingOverrides;
+        {if(VRDiagnostics::counters) appliedRadarHeading=regs.xmm0.f32[0];}VRDiagnostics::Increment(radarHeadingOverrides);
     });
 }

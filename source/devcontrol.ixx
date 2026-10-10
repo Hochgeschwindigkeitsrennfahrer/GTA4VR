@@ -13,6 +13,7 @@ module;
 export module devcontrol;
 
 import common;
+import vrdiagnostics;
 import comvars;
 import openxrvr;
 import vrstereo;
@@ -320,6 +321,13 @@ namespace
         else if(command=="aim-status")
         {
             response="{\"ok\":true,\"aim\":"+VRCamera::AimStatus()+"}";
+        }
+        else if(command=="diagnostics-status")
+        {
+            response=std::string("{\"ok\":true,\"counters\":")+(VRDiagnostics::counters ? "true":"false")+
+                ",\"logging\":"+(VRDiagnostics::logging ? "true":"false")+
+                ",\"observationHooks\":"+(VRDiagnostics::observationHooks ? "true":"false")+
+                ",\"automaticCaptures\":"+(VRDiagnostics::automaticCaptures ? "true":"false")+"}";
         }
         else if(command=="audio-status")
         {

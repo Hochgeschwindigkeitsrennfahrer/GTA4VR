@@ -9,6 +9,7 @@ module;
 #include <intrin.h>
 export module vrcamera;
 import common;
+import vrdiagnostics;
 import comvars;
 import openxrvr;
 import natives;
@@ -55,7 +56,7 @@ namespace
         vrAudioUpdate=audioHeadAt && now-audioHeadAt<=250 && OpenXRVR::HasFocusedViews();
         if(vrAudioUpdate) audioFrame=audioHead;
         ReleaseSRWLockShared(&audioLock);
-        ++audioUpdates;
+        VRDiagnostics::Increment(audioUpdates);
         audioUpdate.unsafe_fastcall<void>(self,edx);
         vrAudioUpdate=previous;
     }
@@ -67,14 +68,14 @@ namespace
         // inputs while the native GTA listener update owns this thread.
         // Preserve its double buffering, weights and world-to-listener math.
         auto** matrix=reinterpret_cast<const VRMath::Matrix**>(regs.esp+4);
-        if(route==0 && *reinterpret_cast<int*>(regs.esp+8)==0)
+        if(VRDiagnostics::counters && route==0 && *reinterpret_cast<int*>(regs.esp+8)==0)
         {
             AcquireSRWLockExclusive(&audioLock);
             audioNative=VRMath::AffineXYZ(**matrix);
             ReleaseSRWLockExclusive(&audioLock);
         }
         *matrix=&audioFrame;
-        ++audioOverrides[route];
+        VRDiagnostics::Increment(audioOverrides[route]);
     }
     void AudioListenerSpatial(SafetyHookContext& regs) {AudioListenerInput(regs,0);}
     void AudioListenerDistance(SafetyHookContext& regs) {AudioListenerInput(regs,1);}
@@ -96,7 +97,7 @@ namespace
     std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
     std::atomic<bool> firstPersonActive{false};
     bool visibilityAvailable=false;
-    bool debugBody=false;
+    bool showBody=true;
     std::atomic<bool> headlessBodyAvailable{false};
     VRMath::Matrix trackingBasis{};
     float headHeight=0;
@@ -291,7 +292,7 @@ namespace
             // transform, without clearing ped contact/motor/IK history.
             positionSetter(owner,position,1,0);
             physicsSync(owner,1);
-            ++roomMotorCalls;
+            VRDiagnostics::Increment(roomMotorCalls);
         }
         for(unsigned axis=0;axis<3;++axis) body[axis]=matrix[12+axis];
         body[3]=1;
@@ -513,11 +514,11 @@ namespace
             ReleaseSRWLockExclusive(&headingLock);
             return original;
         }
-        ++headingQueries;
+        VRDiagnostics::Increment(headingQueries);
         lastOriginalHeading=original;
         const bool apply=focused && headingValid && GetTickCount64()-headingSampledAt<=250;
         const float result=apply ? headHeading : original;
-        if(apply) ++headingOverrides;
+        if(apply) VRDiagnostics::Increment(headingOverrides);
         lastAppliedHeading=result;
         ReleaseSRWLockExclusive(&headingLock);
         return result;
@@ -572,7 +573,7 @@ namespace
             const float degrees=bodyHeading*180.f/3.14159265358979323846f;
             Natives::SetCharHeading(ped,degrees);
             Natives::SetCharDesiredHeading(ped,degrees);
-            ++directionalWalkCalls;
+            VRDiagnostics::Increment(directionalWalkCalls);
             // Same task layout/thiscall ABI as ordinary walk; preserves native
             // collision and selects signed forward/lateral animation blends.
             directionalWalk(task,owner);
@@ -592,9 +593,9 @@ namespace
             !OpenXRVR::HasFocusedViews() || GetTickCount64()-phoneRawSampledAt.load()>250) return 0;
         for(unsigned i=0;i<6;++i) if(button==ids[i])
         {
-            ++phoneRawQueries;
+            VRDiagnostics::Increment(phoneRawQueries);
             const bool pressed=((rising ? phoneRawRising.load():phoneRawDown.load()) & (1u<<i))!=0;
-            if(pressed) ++phoneRawMatches;
+            if(pressed) VRDiagnostics::Increment(phoneRawMatches);
             return pressed ? 1:0;
         }
         return 0;
@@ -660,7 +661,7 @@ namespace
         {
             const bool wasDown=phonePulses[i].down;
             directions[i]=phonePulses[i].Update(input.phonePresses[i],held[i],phone,now);
-            if(directions[i] && !wasDown) ++phoneDelivered[i];
+            if(directions[i] && !wasDown) VRDiagnostics::Increment(phoneDelivered[i]);
             if(directions[i]) rawDown|=1u<<i;
             if(directions[i] && !wasDown) rawRising|=1u<<i;
         }
@@ -731,11 +732,11 @@ namespace
         const bool horn=buttonsArmed && driving && input.horn;
         button(54,horn,previousHorn); // native vehicle horn
         previousHorn=horn;
-        if(jump && !previousJump) ++padJumpPresses;
-        if(enter && !previousEnter) ++padEnterPresses;
-        if(drop) ++padHangDrops;
+        if(jump && !previousJump) VRDiagnostics::Increment(padJumpPresses);
+        if(enter && !previousEnter) VRDiagnostics::Increment(padEnterPresses);
+        if(drop) VRDiagnostics::Increment(padHangDrops);
         previousJump=jump; previousEnter=enter; previousHandbrake=handbrake;
-        ++padButtonUpdates;
+        VRDiagnostics::Increment(padButtonUpdates);
         auto analog=[&](unsigned id,unsigned char decoded)
         {
             writeValue(static_cast<unsigned char*>(pad)+0x2698+16*id,decoded);
@@ -771,7 +772,7 @@ namespace
             analog(40,static_cast<unsigned char>(std::lround(throttle*255.f)));
             analog(41,static_cast<unsigned char>(std::lround(brake*255.f)));
             padSteering=steering; padThrottle=throttle; padBrake=brake;
-            ++padDrivingUpdates;
+            VRDiagnostics::Increment(padDrivingUpdates);
         }
         else padSteering=padThrottle=padBrake=0;
     }
@@ -803,8 +804,8 @@ namespace
         // Sprint's native tap accumulator sees a fresh press while click is
         // held. The original speed routine still owns stamina/exhaustion.
         padRunControl[7]=static_cast<unsigned char>((padGait==1 ? 255 : 0)^key);
-        if(padGait==2) ++padSprintReads;
-        else if(padGait==1) ++padJogReads;
+        if(padGait==2) VRDiagnostics::Increment(padSprintReads);
+        else if(padGait==1) VRDiagnostics::Increment(padJogReads);
         return padRunControl;
     }
 
@@ -829,7 +830,7 @@ namespace
 
     void RecordControllerAxisCaller(uintptr_t caller)
     {
-        ++controllerAxisCalls;
+        VRDiagnostics::Increment(controllerAxisCalls);
         for(auto& recorded:controllerAxisCallers)
         {
             auto existing=recorded.load();
@@ -848,10 +849,10 @@ namespace
         std::array<float,2> axes{};
         if(horizontal || vertical)
         {
-            ++controllerMotorReads;
+            VRDiagnostics::Increment(controllerMotorReads);
             if(ControllerMoveAxes(axes))
             {
-                ++controllerMoveReads;
+                VRDiagnostics::Increment(controllerMoveReads);
                 return horizontal ? axes[0] : -axes[1];
             }
         }
@@ -867,11 +868,11 @@ namespace
         // Other control reads (camera, menus, vehicles, NPCs) remain native.
         const bool horizontal=caller==0x00CD4B54 || caller==0x00CD4EB8 || caller==0x00A74701;
         const bool vertical=caller==0x00CD4B73 || caller==0x00CD4ED7 || caller==0x00A7471E;
-        if(horizontal || vertical) ++controllerMotorReads;
+        if(horizontal || vertical) VRDiagnostics::Increment(controllerMotorReads);
         std::array<float,2> axes{};
         if((horizontal || vertical) && ControllerMoveAxes(axes))
         {
-                ++controllerMoveReads;
+                VRDiagnostics::Increment(controllerMoveReads);
                 // Native motors negate vertical input; OpenXR pad +Y is forward.
                 return static_cast<int>(std::lround((horizontal ? axes[0] : -axes[1])*127.5f));
         }
@@ -889,10 +890,10 @@ namespace
         auto* result=moveBlendOutput.unsafe_fastcall<float*>(self,edx,output,dt);
         if(caller-reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0x400000==0x009E3337)
             ProbeRoomCollision(owner);
-        if(owner && owner==localPed.load() && result)
+        if((probeAnchor || VRDiagnostics::counters) && owner && owner==localPed.load() && result)
         {
             AcquireSRWLockExclusive(&motionLock);
-            ++moveBlendCalls;
+            VRDiagnostics::Increment(moveBlendCalls);
             moveBlendCaller=caller;
             lastMoveDt=dt;
             std::memcpy(lastMoveBlend,result,sizeof(lastMoveBlend));
@@ -904,10 +905,10 @@ namespace
 
     void __fastcall ObserveVelocity(void* self,void* edx,const float* velocity)
     {
-        if(self==localCollider.load() && velocity)
+        if((probeAnchor || VRDiagnostics::counters) && self==localCollider.load() && velocity)
         {
             AcquireSRWLockExclusive(&motionLock);
-            ++velocityCalls;
+            VRDiagnostics::Increment(velocityCalls);
             std::memcpy(lastVelocity,velocity,sizeof(lastVelocity));
             ReleaseSRWLockExclusive(&motionLock);
         }
@@ -1205,12 +1206,12 @@ bool VRCamera::RestartAnchorProbe()
 bool VRCamera::HideLocalCharacter(const void* entity)
 {
     return firstPersonActive && visibilityAvailable && FindPlayerPed && entity==FindPlayerPed(0) &&
-        !(debugBody && headlessBodyAvailable.load());
+        !(showBody && headlessBodyAvailable.load());
 }
 
 bool VRCamera::ShowLocalBody(const void* entity)
 {
-    return firstPersonActive && visibilityAvailable && debugBody && headlessBodyAvailable.load() &&
+    return firstPersonActive && visibilityAvailable && showBody && headlessBodyAvailable.load() &&
         FindPlayerPed && entity==FindPlayerPed(0);
 }
 void VRCamera::SetHeadlessBodyAvailable(bool available) {headlessBodyAvailable=available;}
@@ -1233,7 +1234,7 @@ std::string VRCamera::AudioStatus()
 void VRCamera::Install()
 {
     CIniReader ini("");
-    debugBody=ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0)!=0 || ini.ReadInteger("VR","ExperimentalHandIK",0)!=0;
+    showBody=ini.ReadInteger("VR","ShowFirstPersonBody",1)!=0;
     probeAnchor=ini.ReadInteger("DEVELOPMENT","ProbeFirstPersonAnchor",0)!=0;
     probeSamples=std::clamp(ini.ReadInteger("DEVELOPMENT","FirstPersonProbeSamples",8),1,240);
     firstPerson=ini.ReadInteger("VR","ExperimentalFirstPerson",0)!=0;
@@ -1364,9 +1365,9 @@ void VRCamera::Install()
         auto lookup=hook::pattern("8B 41 38 85 C0 74 38 0F B7 40 08 B9 FF FF 00 00 66 3B C1 74 2A 8B C8 A1 ? ? ? ? 8B 50 04");
         auto velocity=hook::pattern("8B 54 24 04 8B 02 89 81 10 01 00 00 8B 42 04 89 81 14 01 00 00");
         auto moveBlend=hook::pattern("55 8B EC 83 E4 F0 83 EC 48 56 8B F1 57 8B 46 24 0F 57 C9 8B 88 B0 0A 00 00 F3 0F 10 98 90 0A 00 00");
-        if(moveBlend.size()==1)
+        if((probeAnchor || VRDiagnostics::observationHooks) && moveBlend.size()==1)
             moveBlendOutput=safetyhook::create_inline(moveBlend.get_first(),ObserveMoveBlend);
-        if(lookup.size()==1 && velocity.size()==1)
+        if((probeAnchor || VRDiagnostics::observationHooks) && lookup.size()==1 && velocity.size()==1)
         {
             colliderLookup=reinterpret_cast<ColliderLookup>(lookup.get_first());
             colliderVelocity=safetyhook::create_inline(velocity.get_first(),ObserveVelocity);
@@ -1607,11 +1608,14 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
             ReleaseSRWLockExclusive(&aimLock);
         }
         else InvalidateHeading();
-        AcquireSRWLockExclusive(&roomLock);
-        diagnosticBody=bodyAnchor;
-        for(unsigned axis=0;axis<3;++axis)
-            diagnosticView[axis]=(output[0].mViewInverseMatrix[3][axis]+output[1].mViewInverseMatrix[3][axis])*.5f;
-        ReleaseSRWLockExclusive(&roomLock);
+        if(VRDiagnostics::counters)
+        {
+            AcquireSRWLockExclusive(&roomLock);
+            diagnosticBody=bodyAnchor;
+            for(unsigned axis=0;axis<3;++axis)
+                diagnosticView[axis]=(output[0].mViewInverseMatrix[3][axis]+output[1].mViewInverseMatrix[3][axis])*.5f;
+            ReleaseSRWLockExclusive(&roomLock);
+        }
         VRMath::Matrix listener=VRMath::Identity();
         for(unsigned axis=0;axis<3;++axis)
         {

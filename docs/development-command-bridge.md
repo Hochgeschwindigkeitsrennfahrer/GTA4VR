@@ -362,3 +362,6 @@ OpenXR status now reports panelActive and panelFrames for the loading/pause scre
 For #034, `audio-status` reads listener hook readiness, native-update/setter counts,
 head-pose age and head/native position and forward vectors. Counters establish
 callback coverage, not audible direction or acceptance.
+See [VR diagnostic controls](vr-diagnostics.md) for `diagnostics-status`, passive
+counter availability and the startup toggles. Explicit profiling/capture commands
+remain available with passive diagnostics disabled.

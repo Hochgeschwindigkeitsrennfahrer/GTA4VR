@@ -25,6 +25,7 @@ module;
 #include <unordered_set>
 export module vrstereo;
 import common;
+import vrdiagnostics;
 import comvars;
 import settings;
 import openxrvr;
@@ -172,7 +173,7 @@ namespace
         // Positive dimensions and a perspective FOV are structural requirements.
         if(next.radius<=0 || next.eyeRelief<=0 || next.eyeBox<=0 ||
             next.verticalFov<=0 || next.verticalFov>=180) valid=false;
-        if(valid) scopeSettings=next;else ++scopeFailures;
+        if(valid) scopeSettings=next;else VRDiagnostics::Increment(scopeFailures);
     }
 
     bool CreateScopeResources(IDirect3DDevice9* device)
@@ -505,6 +506,7 @@ namespace
     } scopeState;
     void Log(const char* message)
     {
+        if(!VRDiagnostics::logging) return;
         wchar_t path[MAX_PATH]{};
         if(!GetModuleFileNameW(nullptr,path,MAX_PATH)) return;
         auto* name=wcsrchr(path,L'\\');
@@ -1764,7 +1766,7 @@ namespace
     {
         if(composingHud || GetCurrentThreadId()!=routingThread || !resources)
             return setVertexShader.unsafe_stdcall<HRESULT>(self,shader);
-        if(renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
+        if(constantProbeActive && renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
         // Restore the engine's register before another lighting shader uses
         // c209 for a different purpose (for example local-light position).
         if(rayShaderBound)
@@ -1848,7 +1850,7 @@ namespace
             start<=209 && count>209-start)
         {
             std::memcpy(originalRayConstants,data+(209-start)*4,sizeof(originalRayConstants));
-            if(renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
+            if(constantProbeActive && renderEye>=0) constantProbes[renderEye][0].observer.Invalidate(209);
             return setVertexConstants.unsafe_stdcall<HRESULT>(self,209,eyeRayConstants,1);
         }
         return result;
@@ -2014,7 +2016,7 @@ namespace
     {
         if(composingHud || GetCurrentThreadId()!=routingThread || !resources)
             return setPixelShader.unsafe_stdcall<HRESULT>(device,shader);
-        if(renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
+        if(constantProbeActive && renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
         if(cascadeShaderBound)
         {
             setPixelConstants.unsafe_stdcall<HRESULT>(device,14,originalCascadeForward,1);
@@ -2078,7 +2080,7 @@ namespace
         if(SUCCEEDED(result) && cascadeShaderBound && start<=14 && count>14-start)
         {
             std::memcpy(originalCascadeForward,data+(14-start)*4,sizeof(originalCascadeForward));
-            if(renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
+            if(constantProbeActive && renderEye>=0) constantProbes[renderEye][1].observer.Invalidate(14);
             return setPixelConstants.unsafe_stdcall<HRESULT>(device,14,cascadeForward,1);
         }
         return result;
@@ -2144,18 +2146,18 @@ namespace
             if(!device) return;
             if(optical)
             {
-                if(scopeRenders.load()<3)
+                if(VRDiagnostics::logging && VRDiagnostics::counters && scopeRenders.load()<3)
                 {
                     char line[120];sprintf_s(line,"scope execute frame=%u stage=%u begin=%u",frame,stage,begin);Log(line);
                 }
                 if(begin && stage==1)
                 {
-                    if(!scopeState.Capture(device)) {++scopeFailures;return;}
+                    if(!scopeState.Capture(device)) {VRDiagnostics::Increment(scopeFailures);return;}
                     // Switch only on the command executor, after returning
                     // bound eye surfaces to their native identities.
                     Rebind(device,-1);
                     mainResources=resources;
-                    if(!CreateScopeResources(device)) {++scopeFailures;mainResources=nullptr;scopeState.Restore(device);return;}
+                    if(!CreateScopeResources(device)) {VRDiagnostics::Increment(scopeFailures);mainResources=nullptr;scopeState.Restore(device);return;}
                     scopeResources->symmetricRayShader=resources->symmetricRayShader;
                     scopeResources->asymmetricRayShader=resources->asymmetricRayShader;
                     scopeResources->cascadeShaders=resources->cascadeShaders;
@@ -2185,7 +2187,7 @@ namespace
                 {
                     scopeCompletedFrame=frame;
                     completedScopeCamera=lensSnapshot; // Physical aperture, independent of bore-aligned optical view.
-                    ++scopeRenders;
+                    VRDiagnostics::Increment(scopeRenders);
                     if(scopeCaptureRequested.exchange(false))
                     {
                         captureNextPair=true; // Include one scene-depth/lens comparison.
@@ -2335,7 +2337,7 @@ namespace
                 stateProbeActive=stateHooksReady && VRProfile::StateObservationEnabled();
                 stateProbeEpoch=stateProbeActive ? phaseStart[eye][0].epoch:0;
                 stateProbeOffset=(frame+eye*17)&63;
-                for(auto& counters:stateProbeCounters) counters={};
+                if(stateProbeActive) for(auto& counters:stateProbeCounters) counters={};
             }
             if(!begin && stage==3)
             {
@@ -2349,7 +2351,7 @@ namespace
                 drawProbeActive=drawPrimitive && drawIndexedPrimitive && stage>=1 && stage<=3 && VRProfile::DrawObservationEnabled();
                 drawProbeEpoch=drawProbeActive ? phaseStart[eye][stage-1].epoch:0;
                 drawProbeOffset=(frame+eye*17+stage*7)&63;
-                drawProbeCounters={};
+                if(drawProbeActive) drawProbeCounters={};
             }
             else
             {
@@ -2378,7 +2380,7 @@ namespace
                 routingGeneration.load(std::memory_order_relaxed) : 0;
             if(begin)
             {
-                for(auto& probe:constantProbes[eye])
+                if(constantProbeActive) for(auto& probe:constantProbes[eye])
                 {
                     if(stage==1) probe.Reset(); else probe.observer.Reset();
                 }
@@ -2395,7 +2397,7 @@ namespace
                 VRProfile::End(phaseMetrics[eye][stage-1],phaseStart[eye][stage-1]);
             if(!begin && stage==3)
             {
-                for(unsigned kind=0;kind<2;++kind)
+                if(VRProfile::ConstantObservationEnabled()) for(unsigned kind=0;kind<2;++kind)
                 {
                     auto& probe=constantProbes[eye][kind];
                     VRProfile::ConstantWrites(eye,kind==0,probe.time.epoch,probe.calls,probe.vectors,probe.repeatedCandidates);
@@ -2472,17 +2474,17 @@ namespace
         const unsigned count=*reinterpret_cast<uint16_t*>(manager+0x2050+slot*8);
         AcquireSRWLockExclusive(&modelReferencesLock);
         auto& batch=modelReferences[slot];
-        if(!batch.NeedsHold(self,data,count,static_cast<unsigned>(model))) ++duplicateModelReferences;
+        if(!batch.NeedsHold(self,data,count,static_cast<unsigned>(model))) VRDiagnostics::Increment(duplicateModelReferences);
         else
         {
             retainModel.unsafe_fastcall(self,edx,model);
         }
         batch.Recorded(static_cast<unsigned>(model),*reinterpret_cast<uint16_t*>(manager+0x2050+slot*8));
-        if(batch.count>retainedModelPeak)
+        if(VRDiagnostics::counters && batch.count>retainedModelPeak)
         {
             const bool first=retainedModelPeak==0;
             retainedModelPeak=batch.count;
-            if(first || retainedModelPeak%1024==0)
+            if(VRDiagnostics::logging && (first || retainedModelPeak%1024==0))
             {
                 char line[160];
                 sprintf_s(line,"VR model lifetime list peak=%u capacity=%u duplicates=%u",retainedModelPeak,
@@ -2512,7 +2514,7 @@ namespace
             *table=components.data();
             playerDrawExecute.unsafe_fastcall(self,edx);
             *table=original;
-            if(++headlessBodyCalls[renderEye]==1) Log("Headless local-player body command executed in an eye stream");
+            if(VRDiagnostics::Increment(headlessBodyCalls[renderEye])==1) Log("Headless local-player body command executed in an eye stream");
             return;
         }
         playerDrawExecute.unsafe_fastcall(self,edx);
@@ -2539,7 +2541,7 @@ namespace
         // Skip the owned rifle/magazine before generating scope draw commands.
         // Main eyes and shared shadow/reflection builds retain these objects.
         if(buildingScope && buildingStage && VRReloadRuntime::IsScopeOccluder(self))
-        {++scopeHiddenObjects;return 0;}
+        {VRDiagnostics::Increment(scopeHiddenObjects);return 0;}
         const auto result=scopeObjectRender.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
         // The attachment can update after SceneSetup. Capture the object
         // transform at the actual main-eye command-building call, so the
@@ -2570,7 +2572,7 @@ namespace
         if(buildingEye>=0 && buildingStage && (VRCamera::HideLocalCharacter(self) ||
             (buildingScope && VRCamera::ShowLocalBody(self))))
         {
-            ++hiddenPlayerCalls[buildingEye];
+            VRDiagnostics::Increment(hiddenPlayerCalls[buildingEye]);
             return 0;
         }
         const bool previous=buildingLocalBody;
@@ -2818,7 +2820,7 @@ namespace
             ComPtr<ID3DXBuffer> compiled,errors;
             if(FAILED(D3DXCompileShader(code,sizeof(code)-1,nullptr,nullptr,"main","ps_3_0",0,&compiled,&errors,nullptr)) ||
                 FAILED(device->CreatePixelShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&scopeLensShader)))
-                {++scopeFailures;return;}
+                {VRDiagnostics::Increment(scopeFailures);return;}
         }
         if(!scopeLensVertexShader)
         {
@@ -2830,7 +2832,7 @@ namespace
             ComPtr<ID3DXBuffer> compiled,errors;
             if(FAILED(D3DXCompileShader(code,sizeof(code)-1,nullptr,nullptr,"main","vs_3_0",0,&compiled,&errors,nullptr)) ||
                 FAILED(device->CreateVertexShader(static_cast<const DWORD*>(compiled->GetBufferPointer()),&scopeLensVertexShader)))
-                {++scopeFailures;return;}
+                {VRDiagnostics::Increment(scopeFailures);return;}
         }
         ComPtr<IDirect3DStateBlock9> state;
         ComPtr<IDirect3DSurface9> targets[4],depth,lensDepth;
@@ -2865,7 +2867,7 @@ namespace
                 {lensDepth=target.surface[eye];break;}
         }
         // The lens obeys scene depth rather than displaying over walls.
-        if(!lensDepth && scopeSettings.depthTest) {++scopeFailures;return;}
+        if(!lensDepth && scopeSettings.depthTest) {VRDiagnostics::Increment(scopeFailures);return;}
         struct Vertex {float x,y,z,u,v;};Vertex vertices[4]{};
         for(unsigned i=0;i<4;++i)
         {
@@ -2882,7 +2884,7 @@ namespace
         device->SetDepthStencilSurface(nullptr);device->SetRenderTarget(0,resources->finalSurface[eye].Get());
         if(FAILED(device->SetDepthStencilSurface(lensDepth.Get())))
         {
-            ++scopeFailures;
+            VRDiagnostics::Increment(scopeFailures);
             for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
             device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
             return;
@@ -2915,7 +2917,7 @@ namespace
         device->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);device->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
         device->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_NONE);device->SetSamplerState(0,D3DSAMP_SRGBTEXTURE,FALSE);
         device->SetSamplerState(0,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);device->SetSamplerState(0,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);
-        if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) ++scopeLensDraws;else ++scopeFailures;
+        if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) VRDiagnostics::Increment(scopeLensDraws);else VRDiagnostics::Increment(scopeFailures);
         device->SetDepthStencilSurface(nullptr);
         for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
         device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
@@ -3270,7 +3272,7 @@ namespace
             }
             return sphereCull.unsafe_fastcall<int>(self,edx,x,y,z,radius,distance);
         }
-        ++sphereQueries[owner];
+        VRDiagnostics::Increment(sphereQueries[owner]);
         const float center[]{x,y,z};
         const bool fast=sphereClassificationFast && std::isfinite(x) && std::isfinite(y) &&
             std::isfinite(z) && std::isfinite(radius) && radius>=0;
@@ -3310,7 +3312,7 @@ namespace
         // Only narrow entity tests; streaming/portal traversal keeps its broad
         // bounds, and auxiliary viewports are excluded by the owner checks.
         if(tightVisibility && result && VRMath::OutsideBothEyes(eyeVisibilityPlanes,center,radius)) result=0;
-        if(!fast && !original && result) ++sphereCorrections[owner];
+        if(!fast && !original && result) VRDiagnostics::Increment(sphereCorrections[owner]);
         return result;
     }
 
@@ -3353,8 +3355,8 @@ namespace
             // The broad-phase grid uses camera corners, not viewport clip
             // planes. Rasterize the same conservative eye union there before
             // the per-entity tests; preserve cell callbacks and phase bits.
-            ++visibilityRasterQueries;
-            if(streaming) ++streamingRasterQueries;
+            VRDiagnostics::Increment(visibilityRasterQueries);
+            if(streaming) VRDiagnostics::Increment(streamingRasterQueries);
             visibilityRaster.unsafe_ccall(bounds,4u,data,cell,1,1,0,0);
             return;
         }
@@ -3372,7 +3374,7 @@ namespace
             *currentVisibilityPhase==scenePhase)
         {
             const bool outside=VRMath::SphereOutside(visibilityPlanes,center,radius);
-            if(original && !outside) ++cameraVolumeCorrections;
+            if(original && !outside) VRDiagnostics::Increment(cameraVolumeCorrections);
             return outside;
         }
         return original;
@@ -3421,7 +3423,8 @@ namespace
             const float highY=std::min(visibilityPlanes[3][3],position[1]+detailRadius)*scale+origin;
             float bounds[]{lowX,lowY,highX,lowY,highX,highY,lowX,highY};
             visibilityRaster.unsafe_ccall(bounds,4u,self,HeadsetFineCell,1,1,0,0);
-            if(++headsetFineRasterQueries==1 || gameFrame%120==0)
+            VRDiagnostics::Increment(headsetFineRasterQueries);
+            if(VRDiagnostics::logging && ((VRDiagnostics::counters && headsetFineRasterQueries==1) || gameFrame%120==0))
             {
                 char line[160];
                 sprintf_s(line,"VR headset fine-grid pass frame=%u phase=%p phaseBit=%u count=%u",
@@ -3431,7 +3434,7 @@ namespace
         }
         for(unsigned slot=0;slot<2;++slot)
             std::memcpy(static_cast<char*>(self)+(slot ? 0x4A0 : 0xB0),&saved[slot],sizeof(saved[slot]));
-        ++sceneVisibilityCorrections;
+        VRDiagnostics::Increment(sceneVisibilityCorrections);
     }
 
     void __fastcall SceneSetup(void* self,void* edx,void* parent)
@@ -3547,7 +3550,7 @@ namespace
         {
             std::memcpy(&saved,shared,sizeof(saved));
             std::memcpy(shared,&generated[0],sizeof(*shared));
-            ++sharedCameraCorrections;
+            VRDiagnostics::Increment(sharedCameraCorrections);
         }
         renderFrame.unsafe_fastcall(self,edx);
         if(override) std::memcpy(shared,&saved,sizeof(saved));
@@ -3635,7 +3638,7 @@ namespace
             phaseArray=eyeWorldPhases.data();phaseCount=static_cast<uint16_t>(eyeWorldPhases.size());
             buildingEye=0;buildingScope=true;
             buildFrame.unsafe_fastcall(self,edx);
-            buildingScope=false;++scopeBuilds;
+            buildingScope=false;VRDiagnostics::Increment(scopeBuilds);
             eyeViewports[0]=ordinaryEye;eyeViewports[1]=ordinaryOtherEye;
             visibilityPlanes=ordinaryPlanes;eyeVisibilityPlanes[0]=ordinaryEyePlanes;
         }
@@ -3664,9 +3667,12 @@ namespace
                 std::memcpy(static_cast<char*>(phases[phase])+(slot ? 0x4A0 : 0xB0),&saved[phase][slot],sizeof(rage::grcViewport));
         ++stereoFrames;
         char line[160];
-        sprintf_s(line,"built frame=%u two world lists displayTime=%lld process counter before=%u after=%u",gameFrame,viewTime,preparedFrame,gameFrame);
-        if(stereoFrames==1 || stereoFrames==maxFrames || gameFrame%120==0) Log(line);
-        if(gameFrame%120==0)
+        if(VRDiagnostics::logging && (stereoFrames==1 || stereoFrames==maxFrames || gameFrame%120==0))
+        {
+            sprintf_s(line,"built frame=%u two world lists displayTime=%lld process counter before=%u after=%u",gameFrame,viewTime,preparedFrame,gameFrame);
+            Log(line);
+        }
+        if(VRDiagnostics::logging && gameFrame%120==0)
         {
             sprintf_s(line,"first-person filtered local character commands eye0=%u eye1=%u",hiddenPlayerCalls[0],hiddenPlayerCalls[1]);
             Log(line);
@@ -3735,7 +3741,7 @@ void VRStereo::Shutdown()
     constantProbeActive=false;
     lightingProbeMask=0;
     completedEyes=0;
-    captured=false;
+    captured=!VRDiagnostics::automaticCaptures;
     publishedFrame=0;
     delete resources;
     resources=nullptr;
@@ -3892,6 +3898,7 @@ void VRStereo::Install()
     });
     CIniReader ini("");
     if(!ini.ReadInteger("VR","ExperimentalStereo",0)) return;
+    captured=!VRDiagnostics::automaticCaptures;
     if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=0 && !OpenXRVR::UsesVulkan())
     {Log("Stereo sharing requires system D3D9Ex; DXVK selected, retaining desktop"); return;}
     if(ini.ReadInteger("DEVELOPMENT","ProbeEyeViewport",0) || ini.ReadInteger("DEVELOPMENT","ProbeRenderBindings",0))
@@ -3991,7 +3998,7 @@ void VRStereo::Install()
         if(object.size()==1) scopeObjectRender=safetyhook::create_inline(object.get_first(),ScopeObjectRender);
         Log(scopeObjectRender ? "Scope owned-object filter installed" : "Scope owned-object filter unavailable");
         VRCamera::SetVisibilityAvailable(static_cast<bool>(pedRender));
-        if(ini.ReadInteger("DEVELOPMENT","DebugFirstPersonBody",0) || ini.ReadInteger("VR","ExperimentalHandIK",0))
+        if(ini.ReadInteger("VR","ShowFirstPersonBody",1))
         {
             auto ctor=hook::pattern("53 8B D9 56 8B 43 04 C7 03 ? ? ? ? 33 05 ? ? ? ? 57 25 FF 3F 00 00");
             auto execute=hook::pattern("51 56 8B F1 57 0F B7 46 08 8B 3C 85 ? ? ? ? 8B 47 08 85 C0");
@@ -4004,7 +4011,7 @@ void VRStereo::Install()
             }
             const bool bodyReady=playerDrawCtor && playerDrawExecute && playerDrawDestroy;
             VRCamera::SetHeadlessBodyAvailable(bodyReady);
-            Log(bodyReady ? "Debug headless body filter installed" : "Debug body unavailable; whole-player hiding retained");
+            Log(bodyReady ? "First-person headless body filter installed" : "First-person body unavailable; whole-player hiding retained");
         }
         Log(pedRender ? "First-person per-eye character filter installed" : "Character filter unavailable; first-person camera disabled");
     }

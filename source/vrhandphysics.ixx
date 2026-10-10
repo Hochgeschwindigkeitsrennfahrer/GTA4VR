@@ -9,6 +9,7 @@ module;
 #include <cstring>
 export module vrhandphysics;
 import common;
+import vrdiagnostics;
 import comvars;
 import natives;
 import openxrvr;
@@ -238,21 +239,21 @@ namespace
             if(!counterpart) continue;
             auto* entity=*reinterpret_cast<void**>(static_cast<char*>(counterpart)+0xC);
             if(IsProxy(counterpart) || (entity && (entity==release.owner.load() || entity==release.held.load())))
-            {++excludedThrowPairs;return false;}
+            {VRDiagnostics::Increment(excludedThrowPairs);return false;}
         }
         if(IsHeld(self) || IsHeld(other))
         {
             auto* counterpart=IsHeld(self) ? other:self;
             auto* entity=counterpart ? *reinterpret_cast<void**>(static_cast<char*>(counterpart)+0xC):nullptr;
             if(entity && entity==player.load(std::memory_order_relaxed))
-            {++excludedPairs;return false;}
+            {VRDiagnostics::Increment(excludedPairs);return false;}
         }
         const bool selfProxy=IsProxy(self),otherProxy=IsProxy(other);
         if(selfProxy || otherProxy)
         {
             auto* counterpart=selfProxy ? other:self;
             for(auto& value:doorInstances) if(counterpart && counterpart==value.load(std::memory_order_relaxed))
-            {++excludedPairs;return false;}
+            {VRDiagnostics::Increment(excludedPairs);return false;}
             auto* entity=counterpart ? *reinterpret_cast<void**>(static_cast<char*>(counterpart)+0xC):nullptr;
             const bool ped=entity && ((*reinterpret_cast<uint32_t*>(static_cast<char*>(entity)+0x28)>>6)&15)==3;
             // All owned shapes ignore a held entity, including vehicle child
@@ -260,9 +261,9 @@ namespace
             for(unsigned hand=0;hand<2;++hand)
                 if(counterpart==grabInstances[hand].load(std::memory_order_relaxed) ||
                     (entity && entity==grabEntities[hand].load(std::memory_order_relaxed)))
-                {++excludedPairs;return false;}
+                {VRDiagnostics::Increment(excludedPairs);return false;}
             if((selfProxy && otherProxy) || entity==player.load() || (entity && entity==weapon.load()) || ped)
-            {++excludedPairs; return false;}
+            {VRDiagnostics::Increment(excludedPairs); return false;}
         }
         return pairHook.thiscall<bool>(self,other);
     }
@@ -274,7 +275,7 @@ namespace
         // sweeps or native pedestrian/vehicle-entry placement queries. Reject
         // the candidate BEFORE writing any hit, so the query still finds walls
         // and props behind it. Physical prop contacts retain CanCollide above.
-        if(IsProxy(instance)) {++excludedQueries;if(selectingGrab) ++grabProxyQueryRejections;return false;}
+        if(IsProxy(instance)) {VRDiagnostics::Increment(excludedQueries);if(selectingGrab) VRDiagnostics::Increment(grabProxyQueryRejections);return false;}
         // The all-category punch sweep can encounter the owner's alternate
         // ped collision root as well as its primary root. Ignore both before
         // a closest hit is written; keep other NPCs and world blockers.
@@ -293,7 +294,7 @@ namespace
             auto* bytes=static_cast<unsigned char*>(instance);
             void* entity=(bytes[0xA]&0x40) ? *reinterpret_cast<void**>(bytes+0xC):nullptr;
             if(IsProxy(instance) || entity==shotOwner || (entity && entity==shotWeapon))
-            {++excludedShotQueries;return false;}
+            {VRDiagnostics::Increment(excludedShotQueries);return false;}
         }
         return rayHook.thiscall<bool>(query,bound,instance);
     }
@@ -305,7 +306,7 @@ namespace
         // Outside our grab search, preserve the native query unchanged.
         if(selectingGrab && (IsProxy(instance) ||
             std::find(grabCandidates.begin(),grabCandidates.end(),instance)==grabCandidates.end()))
-        {++grabOverlapRejections;return false;}
+        {VRDiagnostics::Increment(grabOverlapRejections);return false;}
         return overlapHook.thiscall<bool>(query,bound,instance);
     }
 
@@ -319,7 +320,7 @@ namespace
                 ragdollEntities[hand].load(std::memory_order_relaxed)==entity;
         if(held)
         {
-            ++ragdollDeactivations;
+            VRDiagnostics::Increment(ragdollDeactivations);
             ragdollDeactivateCaller=unsigned(reinterpret_cast<uintptr_t>(_ReturnAddress())-
                 reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0x400000);
             ragdollDeactivateFlags=unsigned(a)|(unsigned(b)<<1)|(unsigned(c)<<2);
@@ -346,7 +347,7 @@ namespace
                 !(static_cast<unsigned char>(ped[0x24])&0x1C) &&
                 *reinterpret_cast<int*>(ped+0x7B8)==6 &&
                 *reinterpret_cast<void**>(ped+0x38)==*reinterpret_cast<void**>(ped+0x7B4))
-            {++ragdollSettleDeferrals;return;}
+            {VRDiagnostics::Increment(ragdollSettleDeferrals);return;}
         }
         ragdollSettleHook.thiscall<void>(task,entity,alternate);
     }
@@ -364,17 +365,17 @@ namespace
             if(instances[hand][i].exchange(nullptr)) --active;
             auto* entity=Entity(node.handle);
             if(entity && *reinterpret_cast<void**>(static_cast<char*>(entity)+0x38)==node.instance && Natives::DoesObjectExist(node.handle))
-            {Natives::DeleteObject(&node.handle); ++removed;}
+            {Natives::DeleteObject(&node.handle); VRDiagnostics::Increment(removed);}
             node={};
         }
         haveTarget[hand]=false;
-        strikes[hand]={};fists[hand]=false;fistSpeed[hand]=0;
+        strikes[hand]={};fists[hand]=false;{if(VRDiagnostics::counters) fistSpeed[hand]=0;}
         AcquireSRWLockExclusive(&poseLock); feedback.at[hand]=0; ReleaseSRWLockExclusive(&poseLock);
     }
 
     void Clear()
     {
-        bladeStrike={};bladeEntity=nullptr;bladeReady=false;bladeSpeed=0;meleeType=0;meleeSamples=0;meleeRadius=0;
+        bladeStrike={};bladeEntity=nullptr;bladeReady=false;{if(VRDiagnostics::counters) bladeSpeed=0;}meleeType=0;{if(VRDiagnostics::counters) meleeSamples=0;}{if(VRDiagnostics::counters) meleeRadius=0;}
         ClearHand(0); ClearHand(1);
         active=0; currentOwner=nullptr; player=nullptr; weapon=nullptr;
         haveTarget[0]=haveTarget[1]=false;
@@ -404,7 +405,7 @@ namespace
         Natives::SetObjectPhysicsParams(node.handle,i==VRHandPhysics::ContactNodeCount ? 2.f:NodeMass,-1.f,-1.f,-1.f,-1.f,-1.f,-1.f,-1.f,0xbf800000,0xbf800000);
         if(*reinterpret_cast<uint16_t*>(static_cast<char*>(node.instance)+8)==0xffff) return false;
         node.target=target; node.at=GetTickCount64();
-        ++created;
+        VRDiagnostics::Increment(created);
         return true;
     }
 
@@ -496,7 +497,7 @@ namespace
     void ReleaseDoor(unsigned hand)
     {
         if(!doorGrabbing[hand].exchange(false)) return;
-        const auto grab=doorGrabs[hand];doorGrabs[hand]={};doorInstances[hand]=nullptr;++grabReleases;
+        const auto grab=doorGrabs[hand];doorGrabs[hand]={};doorInstances[hand]=nullptr;VRDiagnostics::Increment(grabReleases);
         if(doorGrabbing[1-hand] && doorGrabs[1-hand].record==grab.record)
         {doorGrabs[1-hand].controlled|=grab.controlled;return;}
         if(!grab.controlled) return; // Locked acquisition never changes hinge/latch state.
@@ -518,11 +519,11 @@ namespace
         // clears the closed latch without CONTROL_CAR_DOOR's bit9/17 re-latch.
         // This is door-local state, not the vehicle lock at CVehicle+0x12D0.
         auto& flags=*reinterpret_cast<uint32_t*>(state.record+0x10);
-        doorFlagsBefore=flags;doorHasPhysicsChild=state.child!=nullptr;
+        {if(VRDiagnostics::counters) doorFlagsBefore=flags;}{if(VRDiagnostics::counters) doorHasPhysicsChild=state.child!=nullptr;}
         flags&=~0x30000u;
         requestDoor(state.record,std::clamp(target,0.f,1.f),0x400);
-        doorFlagsAfter=flags;
-        if(flags&0x30100u) ++doorLatchClearFailures;
+        {if(VRDiagnostics::counters) doorFlagsAfter=flags;}
+        if(flags&0x30100u) VRDiagnostics::Increment(doorLatchClearFailures);
     }
 
     void ReleaseGrab(unsigned hand)
@@ -532,7 +533,7 @@ namespace
         if(!grabbing[hand].exchange(false)) return;
         // Safety/lifecycle releases retain solver momentum. Intentional final
         // releases may transfer recent tracked velocity in ReleaseThrows.
-        grabs[hand]={};grabInstances[hand]=nullptr;grabEntities[hand]=nullptr;++grabReleases;
+        grabs[hand]={};grabInstances[hand]=nullptr;grabEntities[hand]=nullptr;VRDiagnostics::Increment(grabReleases);
     }
 
     void ReleaseThrows(const Pose& pose,const OpenXRVR::ControllerInput& input,uint64_t now)
@@ -565,7 +566,7 @@ namespace
             // CE A06B00->B25F10 accepts world XYZ without angular setter's
             // frameTime*50 scaling. One write at release; contacts stay native.
             Natives::SetObjectInitialVelocity(grab.handle,released[0],released[1],released[2]);
-            throwSpeed=VRMath::Length3(released);++throws;
+            throwSpeed=VRMath::Length3(released);VRDiagnostics::Increment(throws);
         }
     }
 
@@ -589,16 +590,16 @@ namespace
         selectingGrab=true;
         const bool found=grabQuery(palm.data(),palm.data(),radius,owner,hit,0x8E,0xffffffff,1,1);
         selectingGrab=false;
-        if(!found) {++doorQueryNoHit;return false;}
+        if(!found) {VRDiagnostics::Increment(doorQueryNoHit);return false;}
         const auto instance=*reinterpret_cast<void**>(hit);
-        const unsigned part=*reinterpret_cast<uint16_t*>(hit+0x52);lastDoorQueryPart=part;
+        const unsigned part=*reinterpret_cast<uint16_t*>(hit+0x52);{if(VRDiagnostics::counters) lastDoorQueryPart=part;}
         // Native 767070 writes the actual compound collision-part index to
         // hit+52. Match that result, not a cumulative leaf-query boolean.
         // An independently simulated child already identifies this door.
         const bool childHit=door.child && door.child!=door.root && instance==door.child;
         const bool rootHit=instance==door.root && part>=door.firstPart && part-door.firstPart<door.partCount;
         if(childHit || rootHit) {door.hitPart=part;return true;}
-        ++doorQueryWrongPart;return false;
+        VRDiagnostics::Increment(doorQueryWrongPart);return false;
     }
 
     template<class Query>
@@ -610,7 +611,7 @@ namespace
         for(unsigned tip=2;tip<=6;++tip)
             for(unsigned axis=0;axis<3;++axis) centers[2][axis]+=pose.points[hand][tip][axis]*.2f;
         for(unsigned i=0;i<centers.size();++i)
-            if(query(centers[i],radius)) {++handSearchHits[i];return true;}
+            if(query(centers[i],radius)) {VRDiagnostics::Increment(handSearchHits[i]);return true;}
         return false;
     }
 
@@ -688,15 +689,15 @@ namespace
                 }
                 const auto now=GetTickCount64();
                 if(!withinReach || (lastWakePed[hand]==handle && now-lastWakeAt[hand]<2000)) continue;
-                lastWakePed[hand]=handle;lastWakeAt[hand]=now;++ragdollWakeAttempts;
+                lastWakePed[hand]=handle;lastWakeAt[hand]=now;VRDiagnostics::Increment(ragdollWakeAttempts);
                 if(!ragdollPermission(entity,2,pose.owner,grabForce)) continue;
                 ragdollActivate(entity,true,true);
                 // Do not trust the wrapper's return alone: require actual
                 // native root replacement before querying/applying force.
                 if(!ReadRagdoll(handle,entity,root,parts,mass)) continue;
-                ++ragdollWakeSuccesses;
+                VRDiagnostics::Increment(ragdollWakeSuccesses);
             }
-            ++ragdollCandidates;unsigned part=~0u;
+            VRDiagnostics::Increment(ragdollCandidates);unsigned part=~0u;
             auto overlap=[&](const auto& point,float radius)
             {
                 alignas(16) unsigned char hit[0x60]{};
@@ -711,11 +712,11 @@ namespace
                 part=foundPart;return true;
             };
             if(!HandOverlap(pose,hand,nearest,overlap)) continue;
-            ++ragdollHits;float low=0,high=nearest;
+            VRDiagnostics::Increment(ragdollHits);float low=0,high=nearest;
             for(unsigned pass=0;pass<4;++pass)
             {float middle=(low+high)*.5f;if(HandOverlap(pose,hand,middle,overlap)) high=middle;else low=middle;}
             VRMath::Matrix frame{};
-            if(!RagdollFrame(entity,part,frame)) {++ragdollRejected;continue;}
+            if(!RagdollFrame(entity,part,frame)) {VRDiagnostics::Increment(ragdollRejected);continue;}
             selected={};selected.handle=handle;selected.entity=entity;selected.root=root;selected.part=part;
             selected.wristInPart=VRMath::Multiply(wrist,VRMath::InverseRigid(frame));
             selected.anchor=selected.wristInPart[3];selected.previous=wrist[3];selected.previousTarget=wrist[3];selected.at=GetTickCount64();
@@ -723,7 +724,7 @@ namespace
         }
         if(!selected.handle) return false;
         ragdollGrabs[hand]=selected;ragdollEntities[hand]=selected.entity;ragdollGrabbing[hand]=true;
-        gripArmed[hand]=false;ragdollMass=selectedMass;ragdollPart=int(selected.part);++ragdollStarts;
+        gripArmed[hand]=false;{if(VRDiagnostics::counters) ragdollMass=selectedMass;}{if(VRDiagnostics::counters) ragdollPart=int(selected.part);}VRDiagnostics::Increment(ragdollStarts);
         return true;
     }
 
@@ -743,18 +744,18 @@ namespace
                 void* cached=nullptr;unsigned count=0;float registeredMass=0;
                 const bool retry=ReadRagdoll(grab.handle,grab.entity,cached,count,registeredMass,true) &&
                     cached==grab.root && Natives::IsCharDead(grab.handle);
-                ++ragdollLostPhysics;ReleaseGrab(hand);if(retry) gripArmed[hand]=true;continue;
+                VRDiagnostics::Increment(ragdollLostPhysics);ReleaseGrab(hand);if(retry) gripArmed[hand]=true;continue;
             }
-            if(!RagdollFrame(grab.entity,grab.part,frame)) {++ragdollLostFrame;ReleaseGrab(hand);continue;}
+            if(!RagdollFrame(grab.entity,grab.part,frame)) {VRDiagnostics::Increment(ragdollLostFrame);ReleaseGrab(hand);continue;}
             auto actual=VRMath::Multiply(grab.wristInPart,frame);
             const auto target=pose.wrists[hand][3],delta=VRMath::Difference3(target,actual[3]);
             const float distance=VRMath::Length3(delta);
-            if(!std::isfinite(distance) || distance>recoveryDistance) {ReleaseGrab(hand);++grabUnsafeReleases;continue;}
+            if(!std::isfinite(distance) || distance>recoveryDistance) {ReleaseGrab(hand);VRDiagnostics::Increment(grabUnsafeReleases);continue;}
             VRMath::Vector velocity{},targetVelocity{},force{};
             if(now>grab.at && now-grab.at<=100)
                 for(unsigned axis=0;axis<3;++axis)
                 {velocity[axis]=(actual[3][axis]-grab.previous[axis])/dt;targetVelocity[axis]=(target[axis]-grab.previousTarget[axis])/dt;}
-            if(VRMath::Length3(velocity)>20.f) {ReleaseGrab(hand);++grabUnsafeReleases;continue;}
+            if(VRMath::Length3(velocity)>20.f) {ReleaseGrab(hand);VRDiagnostics::Increment(grabUnsafeReleases);continue;}
             targetVelocity=VRGrip::Bounded(targetVelocity,5.f);
             const bool shared=ragdollGrabbing[1-hand] && ragdollGrabs[1-hand].root==root;
             // Gain uses a bounded share of total native mass, not a replacement
@@ -771,7 +772,7 @@ namespace
                 // Refresh existing state6 through native9F29E0 only while a
                 // valid dead-body grip is active; release retains its normal
                 // one-second grace. Recovery/teardown paths are not bypassed.
-                ragdollActivity(grab.entity,6,false);++ragdollKeepAlive;
+                ragdollActivity(grab.entity,6,false);VRDiagnostics::Increment(ragdollKeepAlive);
             }
             const auto offset=VRMath::Difference3(actual[3],(*entityMatrix)[3]);
             // Native continuous WORLD force at the captured grip, on the
@@ -779,9 +780,9 @@ namespace
             Natives::ApplyForceToPed(grab.handle,0,force[0],force[1],force[2],offset[0],offset[1],offset[2],grab.part,false,false,false);
             result.wrists[hand]=actual;result.rotation[hand]=true;result.at[hand]=now;
             grab.previous=actual[3];grab.previousTarget=target;grab.at=now;
-            maxDistance=std::max(maxDistance,distance);ragdollMass=mass;++ragdollUpdates;
+            maxDistance=std::max(maxDistance,distance);{if(VRDiagnostics::counters) ragdollMass=mass;}VRDiagnostics::Increment(ragdollUpdates);
         }
-        ragdollError=maxDistance;
+        {if(VRDiagnostics::counters) ragdollError=maxDistance;}
     }
 
     bool AcquireDoor(unsigned hand,const Pose& pose,const VRMath::Matrix& wrist)
@@ -816,7 +817,7 @@ namespace
                 selected.entity=state.entity;selected.root=state.root;selected.record=state.record;
             }
         }
-        if(!selected.handle) {++doorMisses;return false;}
+        if(!selected.handle) {VRDiagnostics::Increment(doorMisses);return false;}
         // A second hand inherits the original policy, not the temporarily
         // disabled latch state, so either hand can be the last to release.
         selected.automaticLatch=doorGrabbing[1-hand] && doorGrabs[1-hand].record==selected.record
@@ -830,12 +831,12 @@ namespace
         // Closed parts can initially share the vehicle root. Never exclude
         // that whole car from player contact to simulate holding its door.
         doorInstances[hand]=best.child!=best.root ? best.child:nullptr;
-        ++doorStarts;++grabStarts;
-        selectedDoorIndex=selected.index;selectedDoorRecordId=*reinterpret_cast<int*>(best.record);
-        selectedDoorCollisionPart=best.hitPart;
-        uint32_t lock=~0u;Natives::GetCarDoorLockStatus(selected.handle,&lock);doorLockState=lock;
+        VRDiagnostics::Increment(doorStarts);VRDiagnostics::Increment(grabStarts);
+        {if(VRDiagnostics::counters) selectedDoorIndex=selected.index;}{if(VRDiagnostics::counters) selectedDoorRecordId=*reinterpret_cast<int*>(best.record);}
+        {if(VRDiagnostics::counters) selectedDoorCollisionPart=best.hitPart;}
+        uint32_t lock=~0u;Natives::GetCarDoorLockStatus(selected.handle,&lock);{if(VRDiagnostics::counters) doorLockState=lock;}
         if(lock<=1) {RequestGrabbedDoor(best,best.fraction);doorGrabs[hand].controlled=true;}
-        else {++doorLocked;doorFlagsBefore=*reinterpret_cast<uint32_t*>(best.record+0x10);doorFlagsAfter=doorFlagsBefore.load();}
+        else {VRDiagnostics::Increment(doorLocked);{if(VRDiagnostics::counters) doorFlagsBefore=*reinterpret_cast<uint32_t*>(best.record+0x10);}{if(VRDiagnostics::counters) doorFlagsAfter=doorFlagsBefore.load();}}
         return true;
     }
 
@@ -848,7 +849,7 @@ namespace
             if(!ReadDoor(grab.handle,grab.index,state) || state.entity!=grab.entity || state.root!=grab.root || state.record!=grab.record)
             {ReleaseDoor(hand);continue;}
             uint32_t lock=~0u;Natives::GetCarDoorLockStatus(grab.handle,&lock);
-            doorLockState=lock;
+            {if(VRDiagnostics::counters) doorLockState=lock;}
             const auto palm=VRMath::Transform(grab.palmInDoor,state.frame);
             auto requested=pose.points[hand][1];
             const bool shared=doorGrabbing[1-hand] && doorGrabs[1-hand].record==grab.record;
@@ -859,7 +860,7 @@ namespace
                     requested[axis]=(requested[axis]+pose.points[1-hand][1][axis]+palm[axis]-otherPalm[axis])*.5f;
             }
             if(VRMath::Length3(VRMath::Difference3(palm,pose.points[hand][1]))>recoveryDistance)
-            {ReleaseDoor(hand);++grabUnsafeReleases;continue;}
+            {ReleaseDoor(hand);VRDiagnostics::Increment(grabUnsafeReleases);continue;}
             if(lock>1)
             {
                 // A locked car remains a valid contact/grasp. Do not send an
@@ -874,8 +875,8 @@ namespace
                     grab.controlled=false;
                     if(shared) doorGrabs[1-hand].controlled=false;
                 }
-                doorFlagsBefore=*reinterpret_cast<uint32_t*>(state.record+0x10);doorFlagsAfter=doorFlagsBefore.load();
-                doorFraction=state.fraction;doorTarget=state.fraction;++doorLocked;
+                {if(VRDiagnostics::counters) doorFlagsBefore=*reinterpret_cast<uint32_t*>(state.record+0x10);}{if(VRDiagnostics::counters) doorFlagsAfter=doorFlagsBefore.load();}
+                {if(VRDiagnostics::counters) doorFraction=state.fraction;}{if(VRDiagnostics::counters) doorTarget=state.fraction;}VRDiagnostics::Increment(doorLocked);
                 result.wrists[hand]=VRMath::Multiply(grab.wristInDoor,state.frame);
                 result.rotation[hand]=true;result.at[hand]=now;continue;
             }
@@ -887,7 +888,7 @@ namespace
                 // The native capped 1DOF motor retains contacts and angle limits.
                 RequestGrabbedDoor(state,target);
                 grab.controlled=true;if(shared) doorGrabs[1-hand].controlled=true;
-                doorFraction=state.fraction;doorTarget=target;++doorUpdates;
+                {if(VRDiagnostics::counters) doorFraction=state.fraction;}{if(VRDiagnostics::counters) doorTarget=target;}VRDiagnostics::Increment(doorUpdates);
             }
             doorInstances[hand]=state.child!=state.root ? state.child:nullptr;
             result.wrists[hand]=VRMath::Multiply(grab.wristInDoor,state.frame);
@@ -898,7 +899,7 @@ namespace
     void ProcessGrab(unsigned hand,const Pose& pose,const OpenXRVR::ControllerInput& input)
     {
         const bool down=input.grab[hand];
-        if(down) ++gripSamples[hand];
+        if(down) VRDiagnostics::Increment(gripSamples[hand]);
         if(!down) {gripArmed[hand]=true;ReleaseGrab(hand);}
         VRMath::Matrix body{};
         if(grabbing[hand] && (!BodyPose(grabs[hand].handle,grabs[hand].instance,body) ||
@@ -907,7 +908,7 @@ namespace
         if(doorGrabbing[hand] && (hand==1 && pose.held)) ReleaseDoor(hand);
         if(ragdollGrabbing[hand] && (hand==1 && pose.held)) ReleaseGrab(hand);
         if(!down || !gripArmed[hand] || grabbing[hand] || doorGrabbing[hand] || ragdollGrabbing[hand] || (hand==1 && pose.held) || GetTickCount64()<nextGrabQuery[hand]) return;
-        nextGrabQuery[hand]=GetTickCount64()+50;++grabAttempts;
+        nextGrabQuery[hand]=GetTickCount64()+50;VRDiagnostics::Increment(grabAttempts);
         auto wrist=pose.wrists[hand];if(!VRGrip::Rigid(wrist)) return;
         const auto& palm=pose.points[hand][1];
         auto* pool=CObject::GetObjectsPool();
@@ -927,7 +928,7 @@ namespace
                 !Natives::DoesObjectHavePhysics(handle) || Natives::IsObjectAttached(handle) || Natives::IsObjectStatic(handle)) continue;
             float mass=0;Natives::GetObjectMass(handle,&mass);
             if(!std::isfinite(mass) || mass<=0 || !HandOverlap(pose,hand,nearest,[&](const auto& point,float r){return PalmOverlap(point,pose.owner,instance,r);})) continue;
-            ++grabHits;
+            VRDiagnostics::Increment(grabHits);
             // Rank by actual collision-surface proximity, not model origin.
             // Bisection also works when the palm is already inside a collider.
             float low=0,high=nearest;
@@ -939,8 +940,8 @@ namespace
             if(selected && high>=nearest) continue;
             selected=handle;selectedBody=instance;selectedMass=mass;nearest=high;
         }
-        if(!selected) {if(!AcquireRagdoll(hand,pose,wrist) && !AcquireDoor(hand,pose,wrist)) ++grabRejected;return;}
-        if(!BodyPose(selected,selectedBody,body)) {++grabRejected;return;}
+        if(!selected) {if(!AcquireRagdoll(hand,pose,wrist) && !AcquireDoor(hand,pose,wrist)) VRDiagnostics::Increment(grabRejected);return;}
+        if(!BodyPose(selected,selectedBody,body)) {VRDiagnostics::Increment(grabRejected);return;}
         auto& grab=grabs[hand];grab={};grab.handle=selected;grab.instance=selectedBody;grab.mass=selectedMass;
         grab.offset=VRGrip::Capture(body,wrist);
         grab.wristInBody=VRMath::Multiply(wrist,VRMath::InverseRigid(body));
@@ -952,9 +953,9 @@ namespace
         for(unsigned axis=0;axis<3;++axis)
             size[axis]=std::isfinite(size[axis]) ? std::clamp(std::abs(size[axis]),.04f,6.f):.2f;
         grab.inertia=VRGrip::BoxInertia(size,grab.mass);grab.radius=std::clamp(VRMath::Length3(size)*.5f,.04f,2.f);
-        grabRadius=grab.radius;grabInertia=std::max({grab.inertia[0],grab.inertia[1],grab.inertia[2]});
+        {if(VRDiagnostics::counters) grabRadius=grab.radius;}{if(VRDiagnostics::counters) grabInertia=std::max({grab.inertia[0],grab.inertia[1],grab.inertia[2]});}
         grabInstances[hand]=selectedBody;grabEntities[hand]=Entity(selected);
-        grabbing[hand]=true;gripArmed[hand]=false;grabMass=selectedMass;++grabStarts;
+        grabbing[hand]=true;gripArmed[hand]=false;{if(VRDiagnostics::counters) grabMass=selectedMass;}VRDiagnostics::Increment(grabStarts);
         Natives::SetObjectDynamic(selected,true);
     }
 
@@ -976,13 +977,13 @@ namespace
             {
                 auto other=pose.wrists[1-hand];
                 if(!VRGrip::Rigid(other)) {ReleaseGrab(1-hand);continue;}
-                target=VRGrip::Combine(target,VRGrip::Target(grabs[1-hand].offset,other));++twoHandUpdates;
+                target=VRGrip::Combine(target,VRGrip::Target(grabs[1-hand].offset,other));VRDiagnostics::Increment(twoHandUpdates);
             }
             const auto delta=VRMath::Difference3(target[3],actual[3]);
             const float distance=VRMath::Length3(delta);
             // No accumulated catch-up/teleport when tracking or physics diverges.
             if(!std::isfinite(distance) || distance>recoveryDistance)
-            {ReleaseGrab(hand);if(shared)ReleaseGrab(1-hand);++grabUnsafeReleases;continue;}
+            {ReleaseGrab(hand);if(shared)ReleaseGrab(1-hand);VRDiagnostics::Increment(grabUnsafeReleases);continue;}
             VRMath::Vector velocity{},angular{},targetVelocity{},targetAngular{};
             // Read motion from successive rigid poses rather than assuming the
             // native rotation getter's frame-scaled units are radians/second.
@@ -996,7 +997,7 @@ namespace
                 {velocity[axis]/=dt;targetVelocity[axis]/=dt;angular[axis]/=dt;targetAngular[axis]/=dt;}
             }
             if(VRMath::Length3(velocity)>20.f || VRMath::Length3(angular)>60.f)
-            {ReleaseGrab(hand);if(shared)ReleaseGrab(1-hand);++grabUnsafeReleases;continue;}
+            {ReleaseGrab(hand);if(shared)ReleaseGrab(1-hand);VRDiagnostics::Increment(grabUnsafeReleases);continue;}
             targetVelocity=VRGrip::Bounded(targetVelocity,5.f);targetAngular=VRGrip::Bounded(targetAngular,12.f);
             VRMath::Vector force{},torque{};
             const auto rotationError=VRGrip::RotationError(actual,target);
@@ -1026,8 +1027,11 @@ namespace
                 Natives::ApplyForceToObject(grab.handle,0,push[0],push[1],push[2],lever[0],lever[1],lever[2],0,0,0,0);
                 Natives::ApplyForceToObject(grab.handle,0,-push[0],-push[1],-push[2],-lever[0],-lever[1],-lever[2],0,0,0,0);
             }
-            positionError=std::max(positionError,distance);angleError=std::max(angleError,VRMath::Length3(rotationError));
-            angularSpeed=std::max(angularSpeed,VRMath::Length3(angular));appliedTorque=std::max(appliedTorque,VRMath::Length3(torque));
+            if(VRDiagnostics::counters)
+            {
+                positionError=std::max(positionError,distance);angleError=std::max(angleError,VRMath::Length3(rotationError));
+                angularSpeed=std::max(angularSpeed,VRMath::Length3(angular));appliedTorque=std::max(appliedTorque,VRMath::Length3(torque));
+            }
             for(unsigned h=0;h<2;++h) if(grabbing[h] && grabs[h].instance==grab.instance)
             {
                 result.wrists[h]=VRMath::Multiply(grabs[h].wristInBody,actual);result.rotation[h]=true;result.at[h]=now;
@@ -1035,7 +1039,8 @@ namespace
                 grabs[h].motion.Add(target[3],now);
             }
         }
-        grabPositionError=positionError;grabAngleError=angleError;grabAngularSpeed=angularSpeed;grabTorque=appliedTorque;
+        if(VRDiagnostics::counters)
+        {grabPositionError=positionError;grabAngleError=angleError;grabAngularSpeed=angularSpeed;grabTorque=appliedTorque;}
     }
 
     bool ApplyMeleeHit(const Pose& pose,const VRMath::Vector& origin,void* hit,uint32_t type,float damage,unsigned hand,bool* nativeRejected=nullptr)
@@ -1061,10 +1066,10 @@ namespace
             const float modifiers[3]={1,1,1};
             const float applied=weaponDispatch(context,pose.owner,frame[0].data(),hit,1,damage,0,modifiers);
             weaponDtor(context);
-            ++worldMeleeCalls;
-            if(entityType==2) ++vehicleMeleeCalls;
-            if(entityType==4) ++objectMeleeCalls;
-            lastWorldMeleeDamage=std::isfinite(applied) ? applied:0;
+            VRDiagnostics::Increment(worldMeleeCalls);
+            if(entityType==2) VRDiagnostics::Increment(vehicleMeleeCalls);
+            if(entityType==4) VRDiagnostics::Increment(objectMeleeCalls);
+            {if(VRDiagnostics::counters) lastWorldMeleeDamage=std::isfinite(applied) ? applied:0;}
             // Zero native damage may still produce an impact (e.g. protected
             // objects); never substitute synthetic damage or another hit.
             return true;
@@ -1092,7 +1097,7 @@ namespace
             // No attacker animation owns the response. Native victim reaction,
             // blocking, damage protections and fatal/NM response remain intact.
             const float applied=meleeDamage(pose.owner,entity,type,damage,origin.data(),hit,context,0,false);
-            lastPunchDamage=std::isfinite(applied) ? applied:0;lastPunchTarget=victim;
+            {if(VRDiagnostics::counters) lastPunchDamage=std::isfinite(applied) ? applied:0;}{if(VRDiagnostics::counters) lastPunchTarget=victim;}
             if(!std::isfinite(applied) || applied<=0)
             {if(nativeRejected) *nativeRejected=true;weaponDtor(context);return false;}
             // B5DF50 invokes this separately after damage. It selects native
@@ -1100,13 +1105,13 @@ namespace
             // hit part and weapon group; the damage routine never does this.
             auto frame=VRMath::Identity();frame[3]=origin;frame[3][3]=1;
             weaponImpact(context,pose.owner,frame[0].data(),hit,applied,false);
-            ++meleeImpacts;
+            VRDiagnostics::Increment(meleeImpacts);
             weaponDtor(context);
             if(auto* group=globalEventGroup())
             {
                 alignas(16) unsigned char event[0x24]{};
                 meleeEventCtor(event,pose.owner,entity,true);
-                if(addEvent(group,event,false,true)) ++meleeEvents;
+                if(addEvent(group,event,false,true)) VRDiagnostics::Increment(meleeEvents);
                 meleeEventDtor(event);
             }
             return true;
@@ -1122,18 +1127,18 @@ namespace
             !pose.bladeAt || now-pose.bladeAt>50 || !input.sampledAt || now-input.sampledAt>50 ||
             !input.gripPoseValid[1] || VRHandPhysics::IsGrabbing(1) || !pose.held ||
             pose.held!=pose.bladeEntity || *reinterpret_cast<void**>(static_cast<char*>(pose.owner)+0x2C4)!=pose.held)
-        {bladeStrike={};bladeEntity=nullptr;bladeReady=false;bladeSpeed=0;meleeType=0;return;}
+        {bladeStrike={};bladeEntity=nullptr;bladeReady=false;{if(VRDiagnostics::counters) bladeSpeed=0;}meleeType=0;return;}
         if(bladeEntity!=pose.bladeEntity || meleeType!=selected) {bladeStrike={};bladeEntity=pose.bladeEntity;}
-        meleeType=selected;meleeSamples=pose.meleeProfile.samples;meleeRadius=pose.meleeProfile.radius;
+        meleeType=selected;{if(VRDiagnostics::counters) meleeSamples=pose.meleeProfile.samples;}{if(VRDiagnostics::counters) meleeRadius=pose.meleeProfile.radius;}
         bladeReady=true;
         const bool sweep=bladeStrike.Sample(pose.bladeTracked,pose.bladeWorld,pose.bladeSample,
             selected==3 ? knifeSpeed:clubSpeed,pose.meleeProfile.samples);
-        bladeSpeed=bladeStrike.speed;
+        {if(VRDiagnostics::counters) bladeSpeed=bladeStrike.speed;}
         if(!sweep)
         {
-            if(bladeStrike.gate==VRMelee::Strike::Gate::Rearm) ++bladeRearmBlocks;
-            if(bladeStrike.gate==VRMelee::Strike::Gate::Cooldown) ++bladeCooldownBlocks;
-            if(bladeStrike.gate==VRMelee::Strike::Gate::Discontinuity) ++bladeTrackingResets;
+            if(bladeStrike.gate==VRMelee::Strike::Gate::Rearm) VRDiagnostics::Increment(bladeRearmBlocks);
+            if(bladeStrike.gate==VRMelee::Strike::Gate::Cooldown) VRDiagnostics::Increment(bladeCooldownBlocks);
+            if(bladeStrike.gate==VRMelee::Strike::Gate::Discontinuity) VRDiagnostics::Increment(bladeTrackingResets);
             return;
         }
         // Every blade sample sweeps against the full world. Keep the earliest
@@ -1147,7 +1152,7 @@ namespace
             alignas(16) unsigned char hit[0x60]{};
             const uint32_t invalid=0xffffffff;
             std::memcpy(hit+0x50,&invalid,4);std::memcpy(hit+0x54,&invalid,4);
-            ++bladeSweeps;
+            VRDiagnostics::Increment(bladeSweeps);
             if(!grabQuery(bladeStrike.begin[i].data(),pose.bladeWorld[i].data(),pose.meleeProfile.radius,
                 pose.owner,hit,0xFF,0xffffffff,1,0)) continue;
             VRMath::Vector point{};std::memcpy(point.data(),hit+0x10,16);
@@ -1156,12 +1161,12 @@ namespace
             if(fraction<earliest) {earliest=fraction;origin=bladeStrike.begin[i];std::memcpy(closest,hit,sizeof(hit));}
         }
         punchOwner=nullptr;strikeWeapon=nullptr;
-        if(earliest>1.f) {++bladeMisses;return;}
-        bladeStrike.Contact();++bladeContacts;
+        if(earliest>1.f) {VRDiagnostics::Increment(bladeMisses);return;}
+        bladeStrike.Contact();VRDiagnostics::Increment(bladeContacts);
         bool rejected=false;
-        if(ApplyMeleeHit(pose,origin,closest,selected,selected==3 ? knifeDamage:clubDamage,1,&rejected)) ++bladeHits;
-        else if(rejected) ++bladeNativeRejects;
-        else ++bladeNonLivingContacts;
+        if(ApplyMeleeHit(pose,origin,closest,selected,selected==3 ? knifeDamage:clubDamage,1,&rejected)) VRDiagnostics::Increment(bladeHits);
+        else if(rejected) VRDiagnostics::Increment(bladeNativeRejects);
+        else VRDiagnostics::Increment(bladeNonLivingContacts);
     }
 
     void ProcessPunches(const Pose& pose,Ped ped,const OpenXRVR::ControllerInput& input,uint64_t now,bool usable)
@@ -1171,7 +1176,7 @@ namespace
         if(!usable || !Natives::GetCurrentCharWeapon(ped,&selected) ||
             !input.sampledAt || now-input.sampledAt>50)
         {
-            for(unsigned h=0;h<2;++h) {strikes[h]={};fists[h]=false;fistSpeed[h]=0;}
+            for(unsigned h=0;h<2;++h) {strikes[h]={};fists[h]=false;{if(VRDiagnostics::counters) fistSpeed[h]=0;}}
             return;
         }
         for(unsigned hand=0;hand<2;++hand)
@@ -1179,28 +1184,28 @@ namespace
             auto& strike=strikes[hand];
             if(!VRPunch::FreeHand(hand,selected,pose.held!=nullptr,pose.supporting[hand]) ||
                 !input.gripPoseValid[hand] || now-pose.at[hand]>50 || VRHandPhysics::IsGrabbing(hand))
-            {strike={};fists[hand]=false;fistSpeed[hand]=0;continue;}
+            {strike={};fists[hand]=false;{if(VRDiagnostics::counters) fistSpeed[hand]=0;}continue;}
             // Same four finger controls as the visible fist. Thumb is free.
             fists[hand]=input.gripActive[hand] && input.gripped[hand] && input.triggerActive[hand] &&
                 input.trigger[hand]>=(fists[hand] ? .4f:.7f);
             VRMath::Vector tracked{input.gripPosition[hand][0],input.gripPosition[hand][1],input.gripPosition[hand][2],1};
             auto palm=pose.points[hand][1];palm[3]=1;
             const bool sweep=strike.Sample(tracked,palm,input.sampledAt,fists[hand],punchSpeed);
-            fistSpeed[hand]=strike.speed;
+            {if(VRDiagnostics::counters) fistSpeed[hand]=strike.speed;}
             if(!sweep) continue;
             alignas(16) unsigned char hit[0x60]{};
             const uint32_t invalid=0xffffffff;
             std::memcpy(hit+0x50,&invalid,4);std::memcpy(hit+0x54,&invalid,4);
             auto begin=strike.begin;begin[3]=1;
-            ++punchSweeps;
+            VRDiagnostics::Increment(punchSweeps);
             // Sweep the actual fist through the whole world. No candidate-only
             // grab filtering: a nearer wall/prop stops a strike through it.
             punchOwner=pose.owner;
             const bool contact=grabQuery(begin.data(),palm.data(),.075f,pose.owner,hit,0xFF,0xffffffff,1,0);
             punchOwner=nullptr;
             if(!contact) continue;
-            strike.Contact();++punchContacts;
-            if(ApplyMeleeHit(pose,begin,hit,0,punchDamage,hand)) ++punchHits[hand];
+            strike.Contact();VRDiagnostics::Increment(punchContacts);
+            if(ApplyMeleeHit(pose,begin,hit,0,punchDamage,hand)) VRDiagnostics::Increment(punchHits[hand]);
         }
     }
 
@@ -1251,7 +1256,7 @@ namespace
         for(unsigned hand=0;hand<2;++hand)
         {
             if(haveTarget[hand] && VRMath::Length3(VRMath::Difference3(pose.points[hand][0],lastTarget[hand]))>recoveryDistance)
-            {ClearHand(hand); ++recoveries;}
+            {ClearHand(hand); VRDiagnostics::Increment(recoveries);}
             lastTarget[hand]=pose.points[hand][0]; haveTarget[hand]=true;
             if(grabbingEnabled) ProcessGrab(hand,pose,input);
             const unsigned nodeLimit=VRHandPhysics::ContactNodeCount;
@@ -1268,7 +1273,7 @@ namespace
                 const float distance=VRMath::Length3(VRMath::Difference3(target,position));
                 if(!std::isfinite(distance)) {failed=true; Clear(); return;}
                 if(distance>recoveryDistance)
-                {ClearHand(hand); ++recoveries; result.at[hand]=0; break;}
+                {ClearHand(hand); VRDiagnostics::Increment(recoveries); result.at[hand]=0; break;}
                 error=std::max(error,distance);
                 VRMath::Vector velocity{},targetVelocity{};
                 Natives::GetObjectVelocity(node.handle,&velocity[0],&velocity[1],&velocity[2]);
@@ -1288,7 +1293,7 @@ namespace
                 if(distance>.04f && VRMath::Length3(velocity)<.1f) ++blocked;
                 const float limit=(grabbing[hand] || doorGrabbing[hand] || ragdollGrabbing[hand]) ? armForce*.2f/nodeLimit:armForce/nodeLimit;
                 if(!std::isfinite(strength)) {failed=true; Clear(); return;}
-                if(strength>limit) {for(unsigned axis=0;axis<3;++axis) force[axis]*=limit/strength; ++limitedDrives;}
+                if(strength>limit) {for(unsigned axis=0;axis<3;++axis) force[axis]*=limit/strength; VRDiagnostics::Increment(limitedDrives);}
                 drivePeak=std::max(drivePeak,std::min(strength,limit));
                 Natives::SetObjectDynamic(node.handle,true);
                 // Mode0 -> B23560 -> collider virtual+80: continuous force,
@@ -1315,7 +1320,9 @@ namespace
         if(grabbingEnabled) DriveRagdolls(pose,dt,now,result);
         ProcessPunches(pose,ped,input,now,gameplayInput);
         ProcessBlade(pose,ped,input,now,gameplayInput);
-        maxError=error;palmColliderError=palmError;contactDrivePeak=drivePeak;blockedContactNodes=blocked; ++updates;
+        if(VRDiagnostics::counters)
+        {maxError=error;palmColliderError=palmError;contactDrivePeak=drivePeak;blockedContactNodes=blocked;}
+        VRDiagnostics::Increment(updates);
         AcquireSRWLockExclusive(&poseLock); feedback=result; ReleaseSRWLockExclusive(&poseLock);
     }
 }
@@ -1357,7 +1364,7 @@ void VRHandPhysics::ProtectThrowRelease(void* projectile,void* owner,void* held)
     release.owner.store(owner,std::memory_order_relaxed);
     release.held.store(held,std::memory_order_relaxed);
     release.active.store(true,std::memory_order_release);
-    ++protectedThrows;
+    VRDiagnostics::Increment(protectedThrows);
 }
 
 void VRHandPhysics::ForgetThrowRelease(void* projectile)
@@ -1569,7 +1576,7 @@ void VRHandPhysics::Install()
             }
         }
         auto deactivate=hook::pattern("55 8B EC 83 E4 F0 81 EC B8 00 00 00 56 57 8B F9 89 7C 24 14 83 BF B8 07 00 00 02 8B 87 B0 07 00 00 89 47 38");
-        if(deactivate.size()==1) ragdollDeactivateHook=safetyhook::create_inline(deactivate.get_first(),TraceRagdollDeactivate);
+        if(VRDiagnostics::observationHooks && deactivate.size()==1) ragdollDeactivateHook=safetyhook::create_inline(deactivate.get_first(),TraceRagdollDeactivate);
         auto door=hook::pattern("8B 41 14 8B 51 10 F3 0F 10 44 24 04 89 41 18 8B C2 C1 E8 12 A8 01 8B 44 24 08 F3 0F 11 41 14 75 44");
         auto doorLayout=hook::pattern("55 8B EC 83 E4 F0 81 EC B8 00 00 00 56 8B 75 08 57 8B F9 81 67 10 FF FF FF FE 8B 86 C4 0D 00 00");
         if(door.size()==1 && doorLayout.size()==1) requestDoor=reinterpret_cast<DoorRequest>(door.get_first());

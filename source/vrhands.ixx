@@ -10,6 +10,7 @@ module;
 #include <cstring>
 export module vrhands;
 import common;
+import vrdiagnostics;
 import comvars;
 import openxrvr;
 import natives;
@@ -225,13 +226,13 @@ namespace
             for(unsigned row=0;row<4;++row) for(unsigned axis=0;axis<3;++axis)
                 matrices[bone][row][axis]=desired[row][axis];
         }
-        ++neutralPoseUpdates;
+        VRDiagnostics::Increment(neutralPoseUpdates);
     }
 
     void LowerTrackedTorso(void* skeleton,VRMath::Matrix* matrices,const VRMath::Matrix& root,
         const VRMath::Vector& pivot,float scale)
     {
-        torsoDrop=0;
+        {if(VRDiagnostics::counters) torsoDrop=0;}
         if(!trackedBody || !fitBodyHeight) return;
         OpenXRVR::EyeView eyes[2]{}; long long time=0;
         if(!OpenXRVR::GetEyeViews(eyes,time) || !eyes[0].floorRelative || !eyes[1].floorRelative) return;
@@ -315,7 +316,7 @@ namespace
                 for(unsigned axis=0;axis<3;++axis) matrices[bone][3][axis]=target[axis]+translated[axis];
             }
         }
-        torsoDrop=drop*scale; ++legUpdates;
+        {if(VRDiagnostics::counters) torsoDrop=drop*scale;} VRDiagnostics::Increment(legUpdates);
     }
 
     void RestoreBodyScale()
@@ -367,7 +368,7 @@ namespace
             deferFinishPose=false;
             auto* context=deferredPose;
             deferredPose=nullptr;
-            if(context) {finishPoseHook.thiscall<void>(context); ++finishPoseUpdates;}
+            if(context) {finishPoseHook.thiscall<void>(context); VRDiagnostics::Increment(finishPoseUpdates);}
             ApplyBodyScale();
             if(publish) PublishPhysicsPose();
         }
@@ -526,7 +527,7 @@ namespace
         VRHandPhysics::ProtectThrowRelease(reinterpret_cast<void*>(context.ecx),throwableOwner,physicalThrowEntity);
         auto* velocity=reinterpret_cast<float*>(context.eax);
         for(unsigned axis=0;axis<3;++axis) velocity[axis]=physicalThrowVelocity[axis];
-        ++throwableVelocityOverrides;
+        VRDiagnostics::Increment(throwableVelocityOverrides);
     }
     SafetyHookInline weaponFireHook{};
     SafetyHookInline bulletHitHook{};
@@ -562,7 +563,7 @@ namespace
         if(weaponClickLatched) return;
         const float horizontal=input.previousWeapon ? -1.f:input.nextWeapon ? 1.f:input.cycleDirection;
         if(!std::isfinite(horizontal) || std::abs(horizontal)<.25f) return;
-        weaponClickLatched=true;++weaponSwapAttempts;weaponSwapStage=1;
+        weaponClickLatched=true;VRDiagnostics::Increment(weaponSwapAttempts);weaponSwapStage=1;
         void* owner=nullptr; uint64_t at=0;
         AcquireSRWLockShared(&targetLock); owner=targetOwner; at=targetAt; ReleaseSRWLockShared(&targetLock);
         if(!owner || !at || GetTickCount64()-at>100) return;
@@ -607,7 +608,7 @@ namespace
             // squeeze before a newly selected pistol can fire.
             supportGripping=false; supportWeapon=nullptr; triggerLatched=true;
             uint32_t selected=current;
-            if((seated && candidate==0) || (InventoryWeapon(ped,owner,selected) && selected==candidate)) {++weaponSwaps;weaponSwapStage=5;}
+            if((seated && candidate==0) || (InventoryWeapon(ped,owner,selected) && selected==candidate)) {VRDiagnostics::Increment(weaponSwaps);weaponSwapStage=5;}
             break;
         }
     }
@@ -634,7 +635,7 @@ namespace
         if(OpenXRVR::HasFocusedViews() && VRHands::Active(shooter) &&
             (weapon=EquippedWeapon(shooter,entity)) &&
             (*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==16 || *reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18)==17))
-        {++sniperPrecisionShots;return;}
+        {VRDiagnostics::Increment(sniperPrecisionShots);return;}
         sniperSpread(shooter,origin,target);
     }
 
@@ -649,7 +650,7 @@ namespace
         {
             EquippedWeapon(shooter,entity);
             VRHandPhysics::WeaponQueryScope scope(shooter,entity);
-            ++delayedShotQueries;
+            VRDiagnostics::Increment(delayedShotQueries);
             return delayedRay(start,end,previous,ignoredShooter,mode,hits,capacity,a,b,categories,flags,c,d);
         }
         return delayedRay(start,end,previous,ignoredShooter,mode,hits,capacity,a,b,categories,flags,c,d);
@@ -675,7 +676,7 @@ namespace
                 if(recoilOwner!=shooter || recoilWeapon!=weapon) recoil={};
                 recoilOwner=shooter;recoilWeapon=weapon;
                 recoil.Shot(GetTickCount64(),settings[0]*(supportGripping ? settings[1]:1.f),settings[2],settings[3]);
-                recoilDegrees=recoil.degrees;++recoilShots;
+                recoilDegrees=recoil.degrees;VRDiagnostics::Increment(recoilShots);
                 ReleaseSRWLockExclusive(&recoilLock);
             }
         }
@@ -703,7 +704,7 @@ namespace
             bulletHealthAfter=health ? health(victim):0;
             bulletShape=hit ? *reinterpret_cast<unsigned short*>(static_cast<char*>(hit)+0x50):~0u;
             bulletPart=hit ? *reinterpret_cast<unsigned short*>(static_cast<char*>(hit)+0x52):~0u;
-            ++bulletHits;
+            VRDiagnostics::Increment(bulletHits);
         }
         return applied;
     }
@@ -720,9 +721,9 @@ namespace
             !SupportedFirearm(*reinterpret_cast<unsigned*>(event+0xC)) || !OpenXRVR::HasFocusedViews()) return;
         auto* shooter=*reinterpret_cast<void**>(event);
         if(!VRHands::Active(shooter)) return;
-        ++aimedHeadshotChecks;
+        VRDiagnostics::Increment(aimedHeadshotChecks);
         constexpr uintptr_t ZeroFlag=0x40;
-        if(regs.eflags & ZeroFlag) {regs.eflags &= ~ZeroFlag;++aimedHeadshotOverrides;}
+        if(regs.eflags & ZeroFlag) {regs.eflags &= ~ZeroFlag;VRDiagnostics::Increment(aimedHeadshotOverrides);}
     }
 
     char __fastcall FirePistol(void* weapon,void* edx,void* shooter,const VRMath::Matrix* frame,
@@ -757,7 +758,7 @@ namespace
                     const float scale=range/std::sqrt(length2);
                     for(unsigned axis=0;axis<3;++axis) end[axis]=muzzle[axis]+(*gun)[0][axis]*scale;
                     end[3]=1;
-                    ++muzzleShots;
+                    VRDiagnostics::Increment(muzzleShots);
                     VRHandPhysics::WeaponQueryScope shotScope(shooter,entity);
                     return pistolFireHook.unsafe_fastcall<char>(weapon,edx,shooter,gun,&muzzle,&end,flag,extra,damage);
                 }
@@ -801,13 +802,13 @@ namespace
         alignas(16) auto end=origin;
         for(unsigned axis=0;axis<3;++axis) end[axis]+=velocity[axis];
         physicalThrowVelocity=velocity;physicalThrowEntity=entity;physicalThrow=true;
-        ++throwableAttempts;throwableSpeed=VRMath::Length3(velocity);
+        VRDiagnostics::Increment(throwableAttempts);{if(VRDiagnostics::counters) throwableSpeed=VRMath::Length3(velocity);}
         VRHandPhysics::WeaponQueryScope query(owner,entity);
         const bool fired=weaponFire(weapon,owner,&frame,&origin,&end,0,0,0,0,-1.f)!=0;
         physicalThrow=false;physicalThrowEntity=nullptr;
         if(fired)
         {
-            ++throwableShots;
+            VRDiagnostics::Increment(throwableShots);
             // Prepare the next owned throwable; never add reserve ammunition.
             uint32_t remaining=0;Natives::GetAmmoInCharWeapon(player,type,&remaining);
             if(remaining) Natives::SetAmmoInClip(player,type,1);
@@ -858,9 +859,9 @@ namespace
             length2<.5f || length2>1.5f || offset2>=4.f) return;
         const float scale=range/std::sqrt(length2);
         for(unsigned axis=0;axis<3;++axis) end[axis]=muzzle[axis]+(*gun)[0][axis]*scale;
-        ++triggerAttempts;
+        VRDiagnostics::Increment(triggerAttempts);
         VRHandPhysics::WeaponQueryScope shotScope(owner,entity);
-        if(weaponFire(weapon,owner,gun,&muzzle,&end,0,0,0,0,-1.f)) ++triggerShots;
+        if(weaponFire(weapon,owner,gun,&muzzle,&end,0,0,0,0,-1.f)) VRDiagnostics::Increment(triggerShots);
     }
 
     void ProcessPistolThreat()
@@ -901,7 +902,7 @@ namespace
             VRHandPhysics::WeaponQueryScope query(owner,entity);
             victim=aimTarget(owner,&muzzle,&end,false,true);
         }
-        ++aimQueries;aimRaised=true;
+        VRDiagnostics::Increment(aimQueries);aimRaised=true;
         auto* ped=static_cast<unsigned char*>(victim);
         if(!ped || victim==owner || (*reinterpret_cast<uint32_t*>(ped+0x28)&0x3C0)!=0xC0 ||
             (ped[0x268]&1) || !*reinterpret_cast<void**>(ped+0x224))
@@ -925,7 +926,7 @@ namespace
         aimEventCtor(event,owner);
         auto* group=static_cast<char*>(*reinterpret_cast<void**>(ped+0x224))+0x84;
         if(aimAddEvent(group,event,false,true))
-        {++aimEvents;if((ped[0x26C]&4) && *reinterpret_cast<void**>(ped+0xB30)) ++aimVehicleEvents;}
+        {VRDiagnostics::Increment(aimEvents);if((ped[0x26C]&4) && *reinterpret_cast<void**>(ped+0xB30)) VRDiagnostics::Increment(aimVehicleEvents);}
         aimEventDtor(event);aimDwell=0;
     }
 
@@ -940,7 +941,7 @@ namespace
         if(fingerRig.definition!=definition)
         {
             fingerRig={}; fingerRig.definition=definition;
-            fingerJointCounts[0]=fingerJointCounts[1]=0;
+            {if(VRDiagnostics::counters) fingerJointCounts[0]=fingerJointCounts[1]=0;}
             for(unsigned side=0;side<2;++side)
             {
                 for(unsigned finger=0;finger<5;++finger)
@@ -980,7 +981,7 @@ namespace
                 }
                 // Partial chains are not a supported rig; retain native fingers.
                 if(fingerRig.count[side]!=15) fingerRig.count[side]=0;
-                fingerJointCounts[side]=fingerRig.count[side];
+                {if(VRDiagnostics::counters) fingerJointCounts[side]=fingerRig.count[side];}
             }
         }
     }
@@ -1036,7 +1037,7 @@ namespace
                 for(unsigned axis=0;axis<3;++axis) matrices[finger.bone][row][axis]=world[row][axis];
             ++index;
         }
-        fingerClosed[hand]=closed; ++fingerUpdates[hand];
+        {if(VRDiagnostics::counters) fingerClosed[hand]=closed;} VRDiagnostics::Increment(fingerUpdates[hand]);
     }
 
     bool ResolveMeleeProfile(void* held,uint32_t type,VRMelee::Profile& profile)
@@ -1269,7 +1270,7 @@ namespace
         matrices[mesh.seat]=VRMath::Multiply(VRMath::Multiply(mesh.seatRest,rotation),VRMath::AffineXYZ(*root));
         const auto result=vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
         matrices[mesh.seat]=original;
-        ++wheelVisualCalls;
+        VRDiagnostics::Increment(wheelVisualCalls);
         return result;
     }
 
@@ -1384,7 +1385,7 @@ namespace
         const bool leftWeapon=vehicle && holdingWeapon && !drivingHolstered.load() && DriveByWeapon(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18));
         drivingWeaponActive=leftWeapon && !input.phoneActive;
         weaponGrip=holdingWeapon;
-        ++updates;
+        VRDiagnostics::Increment(updates);
         alignas(16) const VRMath::Vector offset{0,0,0,0};
         VRMath::Matrix targets[2]{};
         for(unsigned hand=0;hand<2;++hand)
@@ -1408,7 +1409,7 @@ namespace
         }
         wheelAt=0;
         wheelReady=false;
-        for(unsigned hand=0;hand<2;++hand) {wheelHeld[hand]=false;wheelDistances[hand]=-1.f;}
+        for(unsigned hand=0;hand<2;++hand) {wheelHeld[hand]=false;{if(VRDiagnostics::counters) wheelDistances[hand]=-1.f;}}
         if(vehicle)
         {
             const auto inverse=VRMath::InverseRigid(vehicleFrame);
@@ -1476,7 +1477,7 @@ namespace
             const auto wheelWorld=VRMath::Multiply(localWheel,vehicleFrame);
             const auto toWheel=VRMath::InverseRigid(wheelWorld);
             wheelReady=wheel.ready;
-            for(unsigned axis=0;axis<3;++axis) wheelCenter[axis]=wheelWorld[3][axis];
+            for(unsigned axis=0;axis<3;++axis) {if(VRDiagnostics::counters) wheelCenter[axis]=wheelWorld[3][axis];}
             float angles[2]{}; unsigned hands=0;
             for(unsigned hand=0;hand<2;++hand)
             {
@@ -1486,7 +1487,7 @@ namespace
                 const float angle=std::atan2(point[1],point[0]);
                 angles[hand]=angle;
                 const float distance=std::hypot(radius-wheel.radius,point[2]);
-                wheelDistances[hand]=input.gripPoseValid[hand] && wheel.ready ? distance:-1.f;
+                {if(VRDiagnostics::counters) wheelDistances[hand]=input.gripPoseValid[hand] && wheel.ready ? distance:-1.f;}
                 if(!wheel.ready || !palmsValid || !input.gripPoseValid[hand] || !input.gripped[hand] || input.phoneActive || (leftWeapon && hand==0))
                     wheel.held[hand]=false;
                 else if(!wheel.held[hand] && radius>1.e-5f && distance<wheelGripRadius)
@@ -1526,7 +1527,7 @@ namespace
         }
         else wheel={};
         bool supporting=false;
-        supportDistance=-1.f;
+        {if(VRDiagnostics::counters) supportDistance=-1.f;}
         if(supportOwner!=owner || supportWeapon!=held) supportGripping=false;
         supportOwner=owner; supportWeapon=held;
         if(!vehicle && supportGripEnabled && holdingWeapon && input.gripPoseValid[0] && input.gripPoseValid[1] &&
@@ -1542,7 +1543,7 @@ namespace
                     const float difference=targets[0][3][axis]-supportTarget[3][axis];
                     distanceSquared+=difference*difference;
                 }
-                supportDistance=std::sqrt(distanceSquared);
+                {if(VRDiagnostics::counters) supportDistance=std::sqrt(distanceSquared);}
                 // Proximity permits acquisition; the held grip button owns
                 // release. Do not detach when the physical support Wand moves.
                 supporting=input.support && !VRReloadRuntime::UsesLeftHand() && !VRHandPhysics::IsGrabbing(0) &&
@@ -1630,7 +1631,7 @@ namespace
             if(finite)
             {
                 if(solveArm(manager,hand==0 ? 1 : 0,offset.data(),target.data()))
-                    ++solves[hand];
+                    VRDiagnostics::Increment(solves[hand]);
                 // Tracking owns the physics target even if native IK cannot
                 // reach it. A failed solve must not destroy its collider.
                 physicsRig.wrist[hand]=wrist;
@@ -2146,7 +2147,7 @@ void VRHands::Install()
             weaponRange=reinterpret_cast<WeaponRange>(range.get_first());
             pistolFireHook=safetyhook::create_inline(fire.get_first(),FirePistol);
             auto impact=hook::pattern("55 8B EC 83 E4 F0 83 EC 28 8B 45 10 56 57 FF 30 89 4C 24 14 E8 ? ? ? ? 8B 75 08 8B F8 83 C4 04 8B 47 6C");
-            if(impact.size()==1) bulletHitHook=safetyhook::create_inline(impact.get_first(),BulletHit);
+            if(VRDiagnostics::observationHooks && impact.size()==1) bulletHitHook=safetyhook::create_inline(impact.get_first(),BulletHit);
             auto aimedHeadshot=hook::pattern("F6 80 D0 03 00 00 08 75 17 8D 44 24 1C 50 8D 44 24 24 50 51 E8 ? ? ? ? 83 C4 0C 84 C0 74 0B");
             if(aimedHeadshot.size()==1) aimedHeadshotHook=safetyhook::create_mid(aimedHeadshot.get_first(7),AimedPistolHeadshot);
             // CE A6F17D native target query; A6F437 constructs and sends the

@@ -24,6 +24,7 @@ module;
 export module openxrvr;
 
 import common;
+import vrdiagnostics;
 import vrprofile;
 import comvars;
 import settings;
@@ -233,6 +234,7 @@ namespace
 
     void Log(const char* message)
     {
+        if(!VRDiagnostics::logging) return;
         OutputDebugStringA(message);
         OutputDebugStringA("\n");
         if (logFile == INVALID_HANDLE_VALUE) return;
@@ -1168,14 +1170,14 @@ namespace
                 rateWindowStart=now; rateWindowLayers=0;
             }
         }
-        if(copied && (++submittedFrames==1 || submittedFrames%600==0))
+        if(copied && (++submittedFrames==1 || submittedFrames%600==0) && VRDiagnostics::logging)
         {
             char line[180];
             sprintf_s(line,"Submitted stereo layer %u sourcePoseTime=%lld displayTime=%lld size=%ux%u",
                 submittedFrames,imagePoseTime,static_cast<long long>(state.predictedDisplayTime),imageWidth,imageHeight);
             Log(line);
         }
-        if (++frameCount == 1 || frameCount % 600 == 0)
+        if ((++frameCount == 1 || frameCount % 600 == 0) && VRDiagnostics::logging)
         {
             char line[120];
             sprintf_s(line, "OpenXR frame %u predictedDisplayTime=%lld shouldRender=%u",
@@ -1499,7 +1501,7 @@ void OpenXRVR::Install()
     controllerEnabled=ini.ReadInteger("VR","ExperimentalControllerInput",0)!=0;
     if (!enabled) return;
     wchar_t path[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, path, MAX_PATH))
+    if (VRDiagnostics::logging && GetModuleFileNameW(nullptr, path, MAX_PATH))
     {
         wchar_t* name = wcsrchr(path, L'\\');
         if (name)

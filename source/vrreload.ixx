@@ -8,6 +8,7 @@ module;
 #include <string>
 export module vrreload;
 import common;
+import vrdiagnostics;
 import comvars;
 import natives;
 import openxrvr;
@@ -335,12 +336,12 @@ namespace
         const char* dictionary=type==10 ? "gun@shotgun":(type==11 ? "gun@baretta":((type==16 || type==17) ? "gun@rifle":((type==14 || type==15) ? "gun@ak47":(type==9 ? "gun@deagle":(type==12 ? "gun@uzi":(type==13 ? "gun@mp5k":"gun@handgun"))))));
         // Play only the weapon object's authored clip, never a ped fire task.
         // Missing animation assets must not prevent an otherwise valid shot.
-        if(!object) {fireAnimationError=1;++fireAnimationMisses;return;}
+        if(!object) {fireAnimationError=1;VRDiagnostics::Increment(fireAnimationMisses);return;}
         if(!Natives::HaveAnimsLoaded(const_cast<char*>(dictionary)))
-        {Natives::RequestAnims(const_cast<char*>(dictionary));fireAnimationError=2;++fireAnimationMisses;return;}
+        {Natives::RequestAnims(const_cast<char*>(dictionary));fireAnimationError=2;VRDiagnostics::Increment(fireAnimationMisses);return;}
         if(Natives::PlayObjectAnim(object,const_cast<char*>("weapon_fire"),const_cast<char*>(dictionary),1000.f,false,false))
-            {fireAnimationError=0;++fireAnimations;}
-        else {fireAnimationError=3;++fireAnimationMisses;}
+            {fireAnimationError=0;VRDiagnostics::Increment(fireAnimations);}
+        else {fireAnimationError=3;VRDiagnostics::Increment(fireAnimationMisses);}
     }
     void* Equipped(void* ped,void*& entity)
     {
@@ -431,7 +432,7 @@ namespace
                 for(unsigned a=0;a<3;++a) desired[3][a]-=(*root)[0][a]*slideDistance.load();
             for(unsigned row=0;row<4;++row) for(unsigned a=0;a<3;++a) matrices[b][row][a]=desired[row][a];
         }
-        ++poseUpdates;
+        VRDiagnostics::Increment(poseUpdates);
     }
     void ApplyMagazinePose(void* skeleton)
     {
@@ -448,7 +449,7 @@ namespace
             for(unsigned row=0;row<4;++row) for(unsigned a=0;a<3;++a)
                 matrices[b][row][a]=(b!=magazineBone && row<3) ? 0.f:magazine[row][a];
         *reinterpret_cast<unsigned char*>(static_cast<char*>(entity)+0xF4)|=0x28;
-        ++magazineUpdates;
+        VRDiagnostics::Increment(magazineUpdates);
     }
     void __fastcall CalculateWorldPose(void* skeleton,void*)
     {
@@ -461,7 +462,7 @@ namespace
         // CFFDD0 action7 asks to play a timed reload even when weapon state4
         // is set. Blocking only completion leaves that animation looping.
         if(ped==owner && action==7 && guardedWeapon && Equipped(ped,entity)==guardedWeapon.load())
-        {++blockedReloads;return false;}
+        {VRDiagnostics::Increment(blockedReloads);return false;}
         return decisionHook.thiscall<bool>(task,ped,action,a,b,c);
     }
     bool __fastcall ProcessReloadTask(void* task,void*,void* ped)
@@ -472,7 +473,7 @@ namespace
             // TaskSimpleReloadGun starts its animation independently of the
             // generic gun-action decision. Finish only this player's task.
             if(*reinterpret_cast<void**>(static_cast<char*>(task)+0x48)) finishReloadTask(task,ped);
-            ++blockedTaskReloads;return true;
+            VRDiagnostics::Increment(blockedTaskReloads);return true;
         }
         return taskHook.thiscall<bool>(task,ped);
     }
@@ -687,7 +688,7 @@ namespace
         const bool left=input.grabActive[0] && input.grab[0];
         if(type!=18 && type!=10 && type!=11 && right && !rightGrip && ammo.inserted)
         {
-            ammo.Eject();++ejections;
+            ammo.Eject();VRDiagnostics::Increment(ejections);
             if(!ammo.holding && MakeMagazine(gun)) {dropped=true;droppedRoot=gun;dropVelocity=0;dropAt=GetTickCount64();}
         }
         // Shoulder is defined relative to the live HMD, not startup height.
@@ -745,7 +746,7 @@ namespace
                     else for(unsigned a=0;a<3;++a) root[3][a]-=axis[a]*(profile.travel-guide.progress);
                 }
                 insertionProgress=guide.progress;
-                if(seated && left) {ammo.Insert();++insertions;DeleteMagazine();}
+                if(seated && left) {ammo.Insert();VRDiagnostics::Increment(insertions);DeleteMagazine();}
             }
             if(ammo.holding)
             {
@@ -775,20 +776,20 @@ namespace
             const auto local=VRMath::Transform(view.wrist[0][3],VRMath::InverseRigid(gun));
             slideDistance=std::clamp(rackStart[0]-local[0],0.f,profile.rackTravel);
             if(slideDistance>=profile.rackThreshold && !pulled)
-            {pulled=true;PlayPistolSound("HANDGUN_RELOAD_COCK_PULL");++slidePullSounds;}
+            {pulled=true;PlayPistolSound("HANDGUN_RELOAD_COCK_PULL");VRDiagnostics::Increment(slidePullSounds);}
             if(type==10 || type==17)
             {
                 pumpOpen=slideDistance>profile.rackReturnThreshold || pulled;
                 if(left && pulled && slideDistance<=profile.rackReturnThreshold)
                 {
-                    ammo.Rack();++racks;pulled=false;pumpOpen=false;
-                    PlayPistolSound("HANDGUN_RELOAD_COCK_RELEASE");++slideReleaseSounds;
+                    ammo.Rack();VRDiagnostics::Increment(racks);pulled=false;pumpOpen=false;
+                    PlayPistolSound("HANDGUN_RELOAD_COCK_RELEASE");VRDiagnostics::Increment(slideReleaseSounds);
                 }
             }
             if(!left)
             {
                 if(pulled && type!=10 && type!=17)
-                {ammo.Rack();++racks;PlayPistolSound("HANDGUN_RELOAD_COCK_RELEASE");++slideReleaseSounds;}
+                {ammo.Rack();VRDiagnostics::Increment(racks);PlayPistolSound("HANDGUN_RELOAD_COCK_RELEASE");VRDiagnostics::Increment(slideReleaseSounds);}
                 racking=false;slideDistance=0;
             }
         }
@@ -824,7 +825,7 @@ void VRReloadRuntime::EmptyTrigger(void* ped,void* weapon)
     // Native weapon-bank click identified in sounds.dat15. This is audio
     // only: never invoke Fire with an empty clip or start a reload task.
     PlayPistolSound("GENERAL_GUNS_AK47_DRY_CLICK");
-    ++emptyClicks;
+    VRDiagnostics::Increment(emptyClicks);
 }
 void VRReloadRuntime::Fired(void* ped,void* weapon)
 {
@@ -896,12 +897,12 @@ void VRReloadRuntime::PrepareObjectRender(void* entity)
     auto rocket=VRMath::Multiply(VRMath::Pose(position,q),root);
     rocket[3]=VRMath::Transform(RocketSeat(profile.rocketLoadedDepth),root);
     *rocketFrame=rocket;
-    ++rocketRenderUpdates;
+    VRDiagnostics::Increment(rocketRenderUpdates);
 }
 bool VRReloadRuntime::HideNativeRocket(const void* entity)
 {
     if(entity && currentType==18 && guardedWeapon.load() && entity==nativeRocketVisual.load())
-    {++nativeRocketSkips;return true;}
+    {VRDiagnostics::Increment(nativeRocketSkips);return true;}
     return false;
 }
 

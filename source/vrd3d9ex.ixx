@@ -8,6 +8,7 @@ module;
 export module vrd3d9ex;
 import common;
 import settings;
+import vrdiagnostics;
 
 export namespace VRD3D9Ex { void Install(); void InstallDiagnostics(); }
 
@@ -28,6 +29,7 @@ namespace
 
     void Log(const char* step, HRESULT result)
     {
+        if (!VRDiagnostics::logging) return;
         wchar_t path[MAX_PATH]{};
         if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
         auto* name = wcsrchr(path, L'\\');
