@@ -27,19 +27,24 @@ Physical firearm coverage includes the pistol, combat pistol, Micro-SMG, SMG, AK
 
 Short clips of the current build; these demonstrate individual features, not a complete playable campaign.
 
-**Firearms and physical reloads**
+**Firearms and physical reloads**  
+
 ![Tracked shooting and weapon handling](docs/media/firearms.gif)
 
-**Physical combat**
+**Physical combat**  
+
 ![Two fist-fight clips combined](docs/media/fist-fight.gif)
 
-**Grabbing and throwing props**
+**Grabbing and throwing props**  
+
 ![Lifting a chair and throwing a mug](docs/media/physics-grabbing.gif)
 
-**Vehicle interactions**
+**Vehicle interactions**  
+
 ![Breaking car glass and closing a door](docs/media/car-interaction.gif)
 
-**Driving and tracked hands**
+**Driving and tracked hands**  
+
 ![Looking at passengers and driving](docs/media/driving.gif)
 
 ## Known limitations and mission blockers
