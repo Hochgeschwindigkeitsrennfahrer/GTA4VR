@@ -622,6 +622,9 @@ namespace
         // opens the native phone once. Separate semantic bindings still work.
         static bool previousPause=false,leftHeld=false,holdConsumed=false,pauseHeld=false;
         static uint64_t heldAt=0,phonePulseUntil=0;
+        static Ped carPhonePed=0;
+        static uint64_t carPhoneStarted=0;
+        static bool carPhoneSeen=false;
         static bool previousPhone[12]{};
         const auto now=GetTickCount64();
         const bool inputFresh=OpenXRVR::HasFocusedViews() && OpenXRVR::GetControllerInput(input);
@@ -670,6 +673,27 @@ namespace
         // scripts also use it to advance the raised phone to the keypad.
         static bool previousOpen=false;
         const bool open=(inputFresh && !inMenu && !input.phoneActive && now<phonePulseUntil) || directions[0];
+        // Seated phone menus can be active without the native held-phone task.
+        // Start it only for our manual open, preserving incoming-call tasks.
+        if(open && !previousOpen && input.driving && !input.phoneActive)
+        {
+            Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
+            if(ped && Natives::DoesCharExist(ped) && !Natives::IsCharDead(ped) && Natives::IsCharInAnyCar(ped))
+            {
+                Natives::TaskUseMobilePhone(ped,true);
+                carPhonePed=ped;carPhoneStarted=now;carPhoneSeen=false;
+            }
+        }
+        if(carPhonePed && inputFresh && !inMenu)
+        {
+            carPhoneSeen |= input.phoneActive;
+            if(!input.phoneActive && (carPhoneSeen || now-carPhoneStarted>2000))
+            {
+                if(Natives::DoesCharExist(carPhonePed) && !Natives::IsCharDead(carPhonePed))
+                    Natives::TaskUseMobilePhone(carPhonePed,false);
+                carPhonePed=0;carPhoneSeen=false;
+            }
+        }
         mergeButton(21,open,previousOpen);previousOpen=open;
         // Keyboard/frontend controls complement the raw gamepad query hooks.
         constexpr unsigned phoneIds[]{65,64,66,67,77,78,130,131,132,133,181,182};

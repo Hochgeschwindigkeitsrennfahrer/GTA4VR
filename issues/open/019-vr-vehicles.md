@@ -6,7 +6,7 @@ Provide usable VR vehicle cameras and controls for cars, bikes and available air
 
 ## Tasks
 
-- [ ] Keep both Vive Wand hands freely tracked in cars, with native phone presentation/controls available.
+- [x] Keep both Vive Wand hands freely tracked in cars, with native phone presentation/controls available (tested car route accepted; broader mission/episode lifecycle remains pending).
 - [x] Acquire/release the steering wheel with either grip, steer physically, and rotate the visible wheel where the vehicle asset supports it (user accepts multiple tested cars; untested models/episodes remain pending).
 - [ ] Equip native drive-by-compatible weapons in the left hand and fire from their tracked muzzle while driving.
 
@@ -20,6 +20,54 @@ Provide usable VR vehicle cameras and controls for cars, bikes and available air
 A documented route passes for each supported vehicle class with usable controls and coherent headset camera/entry/exit. Aircraft coverage and any unavailable plane gameplay are stated explicitly.
 
 ## Notes / evidence
+
+- 2026-10-10: User confirms the corrected manually opened phone works in the car
+  and requests committing this work. Final PID29448 reached FOCUSED continuous
+  DXVK/Vulkan stereo, ready eye images, zero command-buffer overflows. Phone
+  action/presentation accepted; entry weapon preservation is implemented but has
+  no separate explicit user acceptance yet. #019 remains open for its remaining
+  vehicle classes and combined gameplay/lifecycle routes. Historical pending
+  phone statements below are superseded by this result.
+
+- Phone visibility follow-up: user sees the native holding pose but no phone.
+  Read-only live PID1696/base005C0000 while seated/phone active found weapon-manager
+  slot9, entity1054C0A0, CWeapon13EA8090 type46, model2175. The phone is therefore
+  instantiated, not missing from the task. HideDrivingWeapon suppressed any
+  equipped entity while drivingHolstered, including that native phone. Restricted
+  this render omission to DriveByWeapon types7/9/12/13, preserving task props.
+  Ghidra Issue019PhoneEquipment bookmark at B64E30 previewed, applied, read back
+  and saved. No native patch/prototype changes. x86 Release passed (existing
+  dependency PDB warnings); deployed D405A9A806D18E5C085E3C88AAD82F797C61C60F3D37DD2ABE7EEEEA56E75FE6
+  after verified normal exit and ASI/INI backup under ignored
+  build/issue019-phone-visibility-*. INI preserved; headset acceptance pending.
+
+- Follow-up: user reports manual phone controls work but no held model appears,
+  whereas incoming calls previously showed it. Manual seated opening now starts
+  the native TASK_USE_MOBILE_PHONE task once, stopping our owned task on closure;
+  incoming calls are left to their native lifecycle. This is a behavior hypothesis
+  pending headset validation, not a verified native disassembly finding.
+- User also reports automatic SMG selection on every entry. Cache the equipped
+  inventory weapon before native entry starts and restore it once stable seated
+  tracking becomes available. Unsupported drive-by weapons enter holstered;
+  deliberate seated cycling remains available. x86 Release passed (existing
+  dependency PDB warnings); diff check passed. Deployed SHA256
+  CB034C284B066FCB5EFA739E59D1729C335552DC272FF24502B2F63C598C3F96 after
+  verified normal exit, ASI/INI backup in ignored build/issue019-phone-selection-*
+  and preserved installed INI. PID1696 initialized FOCUSED continuous
+  DXVK/Vulkan stereo with eye images ready and zero command-buffer overflows.
+  Seated headset validation pending.
+
+- 2026-10-10: Baseline c8ac66e. Added an independent Driving/open_phone boolean
+  action, labeled Open phone (hold), default left Menu for Vive. Its state joins
+  the existing system phone action only while driving outside menus, preserving
+  native phone opening and existing hold/tap handling and Phone navigation.
+  x86 Release passed with existing dependency PDB warnings; deployed ASI SHA256
+  ADFA3FAAE9292C705E671B80295111D19B6FEC8EC1E51861A35E49882D721171 after
+  normal bridge quit/verified exit and ASI/INI backup under ignored
+  build/issue019-driving-phone-*. Installed INI preserved. After launcher retries,
+  PID3792 initialized FOCUSED DXVK/Vulkan with the new action set attached.
+  Seated headset acceptance pending. No new
+  native hook or teleport; diagnostics remain off.
 
 - 2026-10-10: User accepts the authored-left-grip correction as perfect and requests committing the current vehicle state. #019 remains open by explicit request: broader vehicles, phone, drive-by fire/ammunition transitions, holster/horn and combined routes still require acceptance. Earlier offset failures below are historical experiments, superseded by this accepted attachment.
 

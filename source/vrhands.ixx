@@ -436,6 +436,7 @@ namespace
         VRMath::Matrix frame{},vehicleFrame{};uint64_t at=0;
     } drivingWeaponPose;
     bool DriveByWeapon(unsigned type) {return type==7 || type==9 || type==12 || type==13;}
+    bool triggerLatched=false;
     bool InventoryWeapon(Ped ped,void* owner,uint32_t& type)
     {
         if(Natives::GetCurrentCharWeapon(ped,&type)) return true;
@@ -451,20 +452,39 @@ namespace
     }
     void ProcessDriveByWeapon()
     {
+        static Ped selectionPed=0;
+        static unsigned lastOnFootWeapon=0;
+        static bool selectionValid=false,wasSeated=false,entrySelectionPending=false;
         if(!OpenXRVR::HasFocusedViews()) return;
         OpenXRVR::ControllerInput input{};
         if(!OpenXRVR::GetControllerInput(input)) return;
         Ped ped=0;uint32_t type=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
         if(!ped || Natives::IsCharDead(ped)) return;
+        if(selectionPed!=ped)
+        {selectionPed=ped;selectionValid=false;wasSeated=false;entrySelectionPending=false;}
         if(!Natives::IsCharInAnyCar(ped))
         {
+            wasSeated=false;entrySelectionPending=false;
+            // Freeze the choice throughout entry: native tasks may select an
+            // SMG before IsCharInAnyCar becomes true.
+            if(!Natives::IsCharGettingInToACar(ped) && Natives::GetCurrentCharWeapon(ped,&type))
+            {lastOnFootWeapon=type;selectionValid=true;}
             if(drivingHolstered.exchange(false)) Natives::SetCharCurrentWeaponVisible(ped,true);
             return;
         }
+        if(!wasSeated) {wasSeated=true;entrySelectionPending=selectionValid;}
         if(!input.driving || input.phoneActive || Natives::IsPauseMenuActive()) return;
         void* owner=nullptr;void* vehicle=nullptr;uint64_t at=0;
         AcquireSRWLockShared(&targetLock);owner=targetOwner;vehicle=trackingVehicle;at=targetAt;ReleaseSRWLockShared(&targetLock);
         if(!owner || !vehicle || !at || GetTickCount64()-at>100) return;
+        if(entrySelectionPending)
+        {
+            const unsigned selected=DriveByWeapon(lastOnFootWeapon) &&
+                Natives::HasCharGotWeapon(ped,lastOnFootWeapon) ? lastOnFootWeapon:0;
+            Natives::SetCurrentCharWeapon(ped,selected,true);
+            drivingHolstered=selected==0;entrySelectionPending=false;
+            triggerLatched=true; // Require a new squeeze after entry.
+        }
         if(drivingHolstered.load())
         {Natives::SetCharCurrentWeaponVisible(ped,false);drivingWeaponActive=false;return;}
         if(ped && !Natives::IsCharDead(ped) && Natives::IsCharInAnyCar(ped) &&
@@ -548,7 +568,6 @@ namespace
     std::atomic<unsigned> aimQueries=0,aimEvents=0,aimVehicleEvents=0;
     std::atomic<unsigned> bulletHits=0,bulletPart=~0u,bulletShape=~0u;
     std::atomic<float> bulletDamage=0,bulletApplied=0,bulletHealthBefore=0,bulletHealthAfter=0;
-    bool triggerLatched=false;
     std::atomic<unsigned> triggerAttempts{0},triggerShots{0};
     bool weaponSwapEnabled=false,weaponClickLatched=true;
     std::atomic<unsigned> weaponSwaps{0};
@@ -1822,7 +1841,10 @@ bool VRHands::HideDrivingWeapon(void* entity)
     void* owner=nullptr;void* car=nullptr;
     AcquireSRWLockShared(&targetLock);owner=targetOwner;car=trackingVehicle;ReleaseSRWLockShared(&targetLock);
     void* held=nullptr;
-    return owner && car && EquippedWeapon(owner,held) && held==entity;
+    auto* weapon=owner && car ? EquippedWeapon(owner,held):nullptr;
+    // Native phone tasks temporarily equip type 46 in this same manager.
+    // Holstering drive-by guns must not suppress the phone or other task props.
+    return weapon && held==entity && DriveByWeapon(*reinterpret_cast<unsigned*>(static_cast<char*>(weapon)+0x18));
 }
 void VRHands::PrepareObjectRender(void* entity)
 {

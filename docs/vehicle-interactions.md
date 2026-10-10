@@ -7,6 +7,17 @@ aircraft, passengers and episode-specific routes are not covered by this result.
 
 ## Seated hands
 
+Driving exposes its own **Open phone (hold)** action in SteamVR bindings, with
+left Menu as the Vive default. It feeds the same native phone-opening path as
+the system action: hold opens the phone, while a short shared Menu tap pauses.
+Custom bindings can use SteamVR's long-press activation. The existing Phone
+action set supplies navigation/accept/back once open; opening does not exit the
+vehicle. Existing custom bindings may need the new Driving action assigned.
+Manual seated opening also requests the native held-phone task; our task is
+released when the phone closes. Incoming calls keep their native task lifecycle.
+The native phone occupies the equipped-object manager as type46. Holster render
+filtering is limited to drive-by firearm types, so it retains this task prop.
+
 Stable first-person car seating enables the existing tracked arm IK. Entry,
 exit and ragdoll/action transitions retain their native pose gates. The published
 tracking transform is rebased through the old/current vehicle root matrices on
@@ -100,11 +111,16 @@ palm-to-rim distances, world centre, normalized steering, mesh model/vertex coun
 rim support, render-hook availability and visual callback count. These establish
 which path ran; they do not establish that the anchor fits the visible model.
 
-Native phone use and left-hand drive-by weapons remain acceptance/implementation
-tasks in #019. The initial wheel grip currently uses the raw tracked grip state;
+Manual car phone activation/presentation is user accepted on 2026-10-10;
+broader call/mission lifecycle and drive-by fire/ammo routes remain in #019.
+The initial wheel grip currently uses the raw tracked grip state;
 independent semantic driving bindings remain to be added.
 
 ## Drive-by weapons — first pass
+
+Entry preserves the last on-foot equipped weapon if it supports drive-by fire;
+otherwise it starts holstered instead of accepting the native automatic SMG
+choice. Weapon cycling while seated still changes that selection normally.
 
 Driving now exposes separate semantic weapon selection and left-hand fire
 actions. Right pad side clicks cycle the native inventory through unarmed,
@@ -139,8 +155,9 @@ wheel grip. Phone/menu activity suspends firing and weapon selection.
 This first pass returns clip management/reloading to the native vehicle route,
 transferring the existing partial clip and total ammunition on entry. Car-used
 weapons resume from native ammunition on exit. Physical magazine/rack gestures
-remain on foot. User accepted left-hand drive-by attachment on 2026-10-10. Firing, ammo transitions and phone use are
-pending headset acceptance; bikes/passengers/episodes are not inferred covered.
+remain on foot. User accepted left-hand drive-by attachment and manual car phone
+use on 2026-10-10. Firing/ammo transitions and broader phone lifecycle remain
+pending; bikes/passengers/episodes are not inferred covered.
 
 ## Analysis record (native wheel)
 

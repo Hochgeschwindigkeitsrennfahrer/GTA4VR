@@ -170,7 +170,7 @@ namespace
     enum class Action {Move,MoveEnable,Sprint,Jump,Interact,Fire,Support,Cycle,CycleDirection,Next,Previous,
         Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
         PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,
-        DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,Count};
+        DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,DrivePhoneOpen,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
     OpenXRVR::PanelPointer panelPointer{};
@@ -509,6 +509,7 @@ namespace
             !game(Action::DriveNext,drivingActions,"next_weapon","Next drive-by weapon",boolean,1,nullptr) ||
             !game(Action::DrivePrevious,drivingActions,"previous_weapon","Previous drive-by weapon",boolean,1,nullptr) ||
             !game(Action::DriveHorn,drivingActions,"horn","Car horn",boolean,1,"/input/trackpad/click") ||
+            !game(Action::DrivePhoneOpen,drivingActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
             !game(Action::Pause,systemActions,"pause","Pause menu (tap)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneOpen,systemActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneDirection,phoneActions,"phone_direction","Phone navigation direction",vector,1,"/input/trackpad") ||
@@ -604,7 +605,8 @@ namespace
                     sample.handbrake &= !sample.cycle || std::hypot(direction[0],direction[1])<.35f;
                 }
                 sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
-                sample.phoneOpen=getBool(Action::PhoneOpen);sample.phoneActive=phone;
+                sample.phoneOpen=getBool(Action::PhoneOpen) ||
+                    (!menu && drivingInput.load() && getBool(Action::DrivePhoneOpen));sample.phoneActive=phone;
                 if(phone)
                 {
                     const auto direction=getVector(Action::PhoneDirection);
