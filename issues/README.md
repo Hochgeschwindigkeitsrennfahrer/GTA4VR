@@ -50,5 +50,5 @@ Use `rg --files issues/open` to list pending work and `rg -n "pattern" issues` t
 
 - [032 — Attribute VR physical interactions to the player](open/032-vr-interaction-player-attribution.md)
 - [033 — Melee feedback and compatibility follow-up](open/033-melee-feedback-and-compatibility.md)
-- [034 — Correct spatial audio direction in VR](open/034-vr-spatial-audio-listener.md)
+- [034 — Correct spatial audio direction in VR (closed)](closed/034-vr-spatial-audio-listener.md)
 - [035 — Locomotion and tracked-hand stability (closed)](closed/035-locomotion-and-tracked-hand-stability.md)

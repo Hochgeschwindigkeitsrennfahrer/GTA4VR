@@ -23,6 +23,7 @@ export namespace VRCamera
     std::string MovementStatus();
     std::string ControllerMovementStatus();
     std::string AimStatus();
+    std::string AudioStatus();
     void SetVisibilityAvailable(bool available);
     bool HideLocalCharacter(const void* entity);
     bool ShowLocalBody(const void* entity);
@@ -37,6 +38,46 @@ namespace
 {
     using Setter=void (__thiscall*)(rage::grcViewport*,const void*);
     Setter setCamera=nullptr, setProjection=nullptr;
+    SafetyHookInline audioUpdate{};
+    SafetyHookMid audioListeners[2]{};
+    SRWLOCK audioLock=SRWLOCK_INIT;
+    VRMath::Matrix audioHead=VRMath::Identity(),audioNative=VRMath::Identity();
+    uint64_t audioHeadAt=0;
+    std::atomic<unsigned> audioUpdates{0},audioOverrides[2]{};
+    thread_local bool vrAudioUpdate=false;
+    alignas(16) thread_local VRMath::Matrix audioFrame=VRMath::Identity();
+
+    void __fastcall UpdateAudioListeners(void* self,void* edx)
+    {
+        const bool previous=vrAudioUpdate;
+        AcquireSRWLockShared(&audioLock);
+        const auto now=GetTickCount64();
+        vrAudioUpdate=audioHeadAt && now-audioHeadAt<=250 && OpenXRVR::HasFocusedViews();
+        if(vrAudioUpdate) audioFrame=audioHead;
+        ReleaseSRWLockShared(&audioLock);
+        ++audioUpdates;
+        audioUpdate.unsafe_fastcall<void>(self,edx);
+        vrAudioUpdate=previous;
+    }
+
+    void AudioListenerInput(SafetyHookContext& regs,unsigned route)
+    {
+        if(!vrAudioUpdate) return;
+        // CE thiscall(matrix*, listenerIndex, gain), RET 0xC. Only replace
+        // inputs while the native GTA listener update owns this thread.
+        // Preserve its double buffering, weights and world-to-listener math.
+        auto** matrix=reinterpret_cast<const VRMath::Matrix**>(regs.esp+4);
+        if(route==0 && *reinterpret_cast<int*>(regs.esp+8)==0)
+        {
+            AcquireSRWLockExclusive(&audioLock);
+            audioNative=VRMath::AffineXYZ(**matrix);
+            ReleaseSRWLockExclusive(&audioLock);
+        }
+        *matrix=&audioFrame;
+        ++audioOverrides[route];
+    }
+    void AudioListenerSpatial(SafetyHookContext& regs) {AudioListenerInput(regs,0);}
+    void AudioListenerDistance(SafetyHookContext& regs) {AudioListenerInput(regs,1);}
     std::atomic<bool> recenter{true};
     VRMath::Matrix referenceInverse{};
     bool probeAnchor=false;
@@ -1174,6 +1215,21 @@ bool VRCamera::ShowLocalBody(const void* entity)
 }
 void VRCamera::SetHeadlessBodyAvailable(bool available) {headlessBodyAvailable=available;}
 
+std::string VRCamera::AudioStatus()
+{
+    AcquireSRWLockShared(&audioLock);
+    const auto head=audioHead,native=audioNative;
+    const auto at=audioHeadAt;
+    ReleaseSRWLockShared(&audioLock);
+    char text[1024]{};
+    sprintf_s(text,"{\"hookReady\":%s,\"updates\":%u,\"spatialOverrides\":%u,\"distanceOverrides\":%u,\"poseAgeMs\":%llu,\"headPosition\":[%.6f,%.6f,%.6f],\"headForward\":[%.6f,%.6f,%.6f],\"nativePosition\":[%.6f,%.6f,%.6f],\"nativeForward\":[%.6f,%.6f,%.6f]}",
+        audioUpdate ? "true":"false",audioUpdates.load(),audioOverrides[0].load(),audioOverrides[1].load(),
+        static_cast<unsigned long long>(at ? GetTickCount64()-at:0),
+        head[3][0],head[3][1],head[3][2],head[1][0],head[1][1],head[1][2],
+        native[3][0],native[3][1],native[3][2],native[1][0],native[1][1],native[1][2]);
+    return text;
+}
+
 void VRCamera::Install()
 {
     CIniReader ini("");
@@ -1181,6 +1237,26 @@ void VRCamera::Install()
     probeAnchor=ini.ReadInteger("DEVELOPMENT","ProbeFirstPersonAnchor",0)!=0;
     probeSamples=std::clamp(ini.ReadInteger("DEVELOPMENT","FirstPersonProbeSamples",8),1,240);
     firstPerson=ini.ReadInteger("VR","ExperimentalFirstPerson",0)!=0;
+    if(firstPerson)
+    {
+        const auto base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const unsigned char updateSignature[]{0x55,0x8B,0xEC,0x83,0xE4,0xF0,0x81,0xEC,0xC4,0x01,0,0,0x53,0x56,0x57,0x8B,0xF9};
+        const unsigned char setterSignature[]{0x55,0x8B,0xEC,0x83,0xE4,0xF0,0x81,0xEC,0xC8,0,0,0,0x56,0x8B,0x75,0x08,0x57};
+        auto* update=reinterpret_cast<void*>(base+0x56D490);
+        auto* spatial=reinterpret_cast<void*>(base+0x4A8BE0);
+        auto* distance=reinterpret_cast<void*>(base+0x4A8F50);
+        // Verified CE 1.2.0.59 entries; unknown executables retain native audio.
+        if(!std::memcmp(update,updateSignature,sizeof(updateSignature)) &&
+            !std::memcmp(spatial,setterSignature,sizeof(setterSignature)) &&
+            !std::memcmp(distance,setterSignature,sizeof(setterSignature)))
+        {
+            audioListeners[0]=safetyhook::create_mid(spatial,AudioListenerSpatial);
+            audioListeners[1]=safetyhook::create_mid(distance,AudioListenerDistance);
+            if(audioListeners[0] && audioListeners[1])
+                audioUpdate=safetyhook::create_inline(update,UpdateAudioListeners);
+            if(!audioUpdate) {audioListeners[0].reset();audioListeners[1].reset();}
+        }
+    }
     controllerButtons=firstPerson && ini.ReadInteger("VR","ExperimentalControllerInput",0) &&
         ini.ReadInteger("VR","ExperimentalControllerButtons",0);
     if(controllerButtons)
@@ -1536,6 +1612,17 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
         for(unsigned axis=0;axis<3;++axis)
             diagnosticView[axis]=(output[0].mViewInverseMatrix[3][axis]+output[1].mViewInverseMatrix[3][axis])*.5f;
         ReleaseSRWLockExclusive(&roomLock);
+        VRMath::Matrix listener=VRMath::Identity();
+        for(unsigned axis=0;axis<3;++axis)
+        {
+            listener[0][axis]=output[0].mViewInverseMatrix[0][axis];
+            listener[1][axis]=-output[0].mViewInverseMatrix[2][axis];
+            listener[2][axis]=output[0].mViewInverseMatrix[1][axis];
+            listener[3][axis]=(output[0].mViewInverseMatrix[3][axis]+output[1].mViewInverseMatrix[3][axis])*.5f;
+        }
+        AcquireSRWLockExclusive(&audioLock);
+        audioHead=listener;audioHeadAt=GetTickCount64();
+        ReleaseSRWLockExclusive(&audioLock);
         return true;
     }
     catch(const std::exception&)

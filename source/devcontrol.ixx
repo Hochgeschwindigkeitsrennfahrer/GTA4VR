@@ -321,6 +321,10 @@ namespace
         {
             response="{\"ok\":true,\"aim\":"+VRCamera::AimStatus()+"}";
         }
+        else if(command=="audio-status")
+        {
+            response="{\"ok\":true,\"audio\":"+VRCamera::AudioStatus()+"}";
+        }
         else if(command=="visibility-test on" || command=="visibility-test off")
         {
             const bool value=command=="visibility-test on";

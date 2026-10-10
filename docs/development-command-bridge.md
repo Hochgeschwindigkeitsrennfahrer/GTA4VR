@@ -358,3 +358,7 @@ hand-status includes bodyHeightEnabled/playerHeight/nativeBodyHeight/bodyScale f
 `tools/game-command.ps1 hud-capture` requests one source radar and post-draw eye PNG on the next drawable watch frame. Outputs are local `plugins/GTAIV.VR.wrist-radar.png` and `GTAIV.VR.wrist-eye.png`; they remain outside Git. This one-shot readback can hitch and is not a performance capture.
 
 OpenXR status now reports panelActive and panelFrames for the loading/pause screen. The screen can submit while eyeImages=false; panelFrames counts completed panel transfers prepared for frame submission, separate from stereoLayers/native gameplay FPS. hud-status reports the sampled native wanted count; zero hides its star row. These counters require visual acceptance for orientation, readability and timing.
+
+For #034, `audio-status` reads listener hook readiness, native-update/setter counts,
+head-pose age and head/native position and forward vectors. Counters establish
+callback coverage, not audible direction or acceptance.
