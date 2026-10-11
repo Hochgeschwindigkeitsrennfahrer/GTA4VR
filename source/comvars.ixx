@@ -1890,6 +1890,9 @@ export namespace rage
         static inline int(__fastcall* getParamIndex)(grmShaderInfo* instance, void* edx, const char* name, int a3) = nullptr;
 
         static inline SafetyHookInline shsub_436D70{};
+        // Optional VR transform operates on a copied value, never shared
+        // shader metadata. Only the owning world-build/execute thread opts in.
+        static inline bool(*TransformScreenSize)(grmShaderInfo*,int,const void*,int,float*) = nullptr;
         static void __fastcall setShaderParam(grmShaderInfo* _this, void* edx, void* a2, int index, void* pDataArr, int nArrSize, int a6, int a7)
         {
             if (_this->m_parameters.wCount)
@@ -1911,11 +1914,17 @@ export namespace rage
                     setShaderParamData(idx, pDataArr, nArrSize);
                 }
             }
+            float adjusted[4]{};
+            if(TransformScreenSize && TransformScreenSize(_this,index,pDataArr,nArrSize,adjusted))
+                pDataArr=adjusted;
             shsub_436D70.unsafe_fastcall(_this, edx, a2, index, pDataArr, nArrSize, a6, a7);
         }
 
         static void __fastcall setShaderParamOriginal(grmShaderInfo* _this, void* edx, void* a2, int index, void* pDataArr, int nArrSize, int a6, int a7)
         {
+            float adjusted[4]{};
+            if(TransformScreenSize && TransformScreenSize(_this,index,pDataArr,nArrSize,adjusted))
+                pDataArr=adjusted;
             shsub_436D70.unsafe_fastcall(_this, edx, a2, index, pDataArr, nArrSize, a6, a7);
         }
     };

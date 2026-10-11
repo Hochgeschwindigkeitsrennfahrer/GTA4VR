@@ -20,6 +20,7 @@ module;
 #include <filesystem>
 #include "includes/vrmath.hpp"
 #include "includes/vrphoneinput.hpp"
+#include "includes/vrresolution.hpp"
 
 export module openxrvr;
 
@@ -86,6 +87,7 @@ export namespace OpenXRVR
     bool CanAcceptEyeImages(); // Render callback thread; false while stopped or recreating.
     bool PacesGameplay(); // Atomic; true while the runtime requests stereo frames.
     bool IsSessionRunning(); // Atomic; focus/overlay changes do not stop the session.
+    bool GetEyeResolution(unsigned& width,unsigned& height); // Fixed at session creation; independent of desktop.
     bool SetEyeImages(const HANDLE (&shared)[2], unsigned width, unsigned height,
         const EyeView (&views)[2], long long poseTime); // Render callback thread after D3D9 GPU completion.
     bool UsesVulkan();
@@ -104,6 +106,7 @@ namespace
         PFN_xrGetInstanceProperties getInstanceProperties = nullptr;
         PFN_xrGetSystem getSystem = nullptr;
         PFN_xrGetSystemProperties getSystemProperties = nullptr;
+        PFN_xrEnumerateViewConfigurationViews enumerateViewConfigurationViews = nullptr;
         PFN_xrGetInstanceProcAddr getInstanceProcAddr = nullptr;
         PFN_xrCreateSession createSession = nullptr;
         PFN_xrDestroySession destroySession = nullptr;
@@ -146,6 +149,7 @@ namespace
 #define xrGetInstanceProperties api.getInstanceProperties
 #define xrGetSystem api.getSystem
 #define xrGetSystemProperties api.getSystemProperties
+#define xrEnumerateViewConfigurationViews api.enumerateViewConfigurationViews
 #define xrGetInstanceProcAddr api.getInstanceProcAddr
 #define xrCreateSession api.createSession
 #define xrDestroySession api.destroySession
@@ -234,6 +238,9 @@ namespace
     XrPosef panelPose{{0,0,0,1},{0,0,-2}};
     OpenXRVR::EyeView imageViews[2]{};
     unsigned imageWidth=0,imageHeight=0;
+    std::atomic<uint64_t> recommendedEyeSize{0};
+    float eyeRenderScale=1.f;
+    bool runtimeEyeResolution=true;
     long long imagePoseTime=0;
     bool haveEyeImages=false;
     unsigned submittedFrames=0;
@@ -316,6 +323,7 @@ namespace
         LOAD_XR(getInstanceProperties, xrGetInstanceProperties)
         LOAD_XR(getSystem, xrGetSystem)
         LOAD_XR(getSystemProperties, xrGetSystemProperties)
+        LOAD_XR(enumerateViewConfigurationViews, xrEnumerateViewConfigurationViews)
         LOAD_XR(getInstanceProcAddr, xrGetInstanceProcAddr)
         LOAD_XR(createSession, xrCreateSession)
         LOAD_XR(destroySession, xrDestroySession)
@@ -396,6 +404,7 @@ namespace
         }
         delete[] eyeChains; eyeChains=nullptr;
         imageWidth=imageHeight=0;submittedFrames=0;
+        recommendedEyeSize=0;
         AcquireSRWLockExclusive(&eyeLock);
         eyeViewsValid = false;
         focusedEyeViews=false;
@@ -794,6 +803,32 @@ namespace
         XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
         systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         if (!Check("xrGetSystem(HMD)", xrGetSystem(instance, &systemInfo, &systemId))) return false;
+        if(runtimeEyeResolution)
+        {
+            uint32_t count=0;
+            if(!Check("xrEnumerateViewConfigurationViews(count)",xrEnumerateViewConfigurationViews(instance,
+                systemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,0,&count,nullptr)) || count!=2) return false;
+            XrViewConfigurationView dimensions[2]{{XR_TYPE_VIEW_CONFIGURATION_VIEW},{XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+            if(!Check("xrEnumerateViewConfigurationViews",xrEnumerateViewConfigurationViews(instance,
+                systemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,2,&count,dimensions)) || count!=2) return false;
+            D3DCAPS9 caps{};
+            auto* device9=RageDirect3DDevice9::m_pRealDevice ? *RageDirect3DDevice9::m_pRealDevice:nullptr;
+            if(!device9 || FAILED(device9->GetDeviceCaps(&caps))) return false;
+            // Equal allocation sizes allow our existing pair interop; the
+            // individual eye FOVs still come from xrLocateViews unchanged.
+            VRResolution::Size suggested{std::max(dimensions[0].recommendedImageRectWidth,dimensions[1].recommendedImageRectWidth),
+                std::max(dimensions[0].recommendedImageRectHeight,dimensions[1].recommendedImageRectHeight)};
+            VRResolution::Size maximum{std::min({dimensions[0].maxImageRectWidth,dimensions[1].maxImageRectWidth,unsigned(caps.MaxTextureWidth),65535u}),
+                std::min({dimensions[0].maxImageRectHeight,dimensions[1].maxImageRectHeight,unsigned(caps.MaxTextureHeight),65535u})};
+            try
+            {
+                const auto size=VRResolution::Recommended(suggested,maximum,eyeRenderScale);
+                recommendedEyeSize=(uint64_t(size.width)<<32)|size.height;
+                char message[180];sprintf_s(message,"Eye resolution: runtime=%ux%u scale=%.3f allocated=%ux%u",
+                    suggested.width,suggested.height,eyeRenderScale,size.width,size.height);Log(message);
+            }
+            catch(...) {Log("Invalid runtime eye dimensions; retaining flat-screen fallback");return false;}
+        }
         XrSystemProperties systemProps{XR_TYPE_SYSTEM_PROPERTIES};
         if (Check("xrGetSystemProperties", xrGetSystemProperties(instance, systemId, &systemProps)))
         {
@@ -1239,13 +1274,18 @@ void OpenXRVR::Shutdown()
 
 std::string OpenXRVR::Status()
 {
-    char text[500];
+    char text[700];
     sprintf_s(text, "{\"enabled\":%s,\"running\":%s,\"failed\":%s,\"sessionState\":\"%s\",\"frames\":%u,\"eyeImages\":%s,\"stereoLayers\":%u,\"displayRefreshHz\":%.3f,\"submittedHz\":%.2f,\"graphicsBackend\":\"%s\",\"panelActive\":%s,\"panelFrames\":%u}",
         enabled ? "true" : "false", running ? "true" : "false",
         permanentFailure ? "true" : "false", StateName(sessionState), frameCount,
         haveEyeImages ? "true" : "false",submittedFrames,displayRefreshHz.load(),submittedHz.load(),vulkanEnabled ? "DXVK-Vulkan" : "D3D9Ex-D3D11",
         panelActive ? "true":"false",panelFrames);
-    return text;
+    std::string result=text;result.pop_back();
+    const auto size=recommendedEyeSize.load();
+    result+=",\"configuredEyeWidth\":"+std::to_string(unsigned(size>>32))+",\"configuredEyeHeight\":"+
+        std::to_string(unsigned(size))+",\"submittedEyeWidth\":"+std::to_string(imageWidth)+
+        ",\"submittedEyeHeight\":"+std::to_string(imageHeight)+",\"eyeRenderScale\":"+std::to_string(eyeRenderScale)+"}";
+    return result;
 }
 
 bool OpenXRVR::RequestProducerTest(bool enable)
@@ -1262,6 +1302,13 @@ std::string OpenXRVR::ProducerTestStatus()
 }
 
 bool OpenXRVR::IsSessionRunning() {return running.load();}
+
+bool OpenXRVR::GetEyeResolution(unsigned& width,unsigned& height)
+{
+    const auto size=recommendedEyeSize.load();
+    width=unsigned(size>>32);height=unsigned(size);
+    return width && height;
+}
 
 bool OpenXRVR::PacesGameplay()
 {
@@ -1550,6 +1597,15 @@ void OpenXRVR::Install()
     enabled = ini.ReadInteger("VR", "DisableOpenXR", 0) == 0;
     vulkanEnabled=enabled && ini.ReadInteger("VR","ExperimentalVulkanBridge",0)!=0;
     controllerEnabled=ini.ReadInteger("VR","ExperimentalControllerInput",0)!=0;
+    runtimeEyeResolution=ini.ReadInteger("VR","UseRecommendedEyeResolution",1)!=0;
+    try
+    {
+        const auto value=ini.ReadString("VR","EyeRenderScale","1.0");size_t end=0;
+        eyeRenderScale=std::stof(value,&end);
+        if(value.find_first_not_of(" \t\r\n",end)!=std::string::npos || !std::isfinite(eyeRenderScale) || eyeRenderScale<=0)
+            throw std::invalid_argument("invalid eye render scale");
+    }
+    catch(...) {eyeRenderScale=1.f;Log("Invalid EyeRenderScale; using 1.0");}
     if (!enabled) return;
     wchar_t path[MAX_PATH]{};
     if (VRDiagnostics::logging && GetModuleFileNameW(nullptr, path, MAX_PATH))

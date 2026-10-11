@@ -13,6 +13,7 @@ module;
 #include "includes/vrrigidinstance.hpp"
 #include "includes/vrmeshpacketprobe.hpp"
 #include "includes/vrconstantbatch.hpp"
+#include "includes/vrresolution.hpp"
 #include <intrin.h>
 #include <atomic>
 #include <cstring>
@@ -93,6 +94,7 @@ namespace
     };
     struct Resources
     {
+        VRResolution::Size desktopSize{},eyeSize{};
         VRTextureRouting::Cache<IDirect3DBaseTexture9*> textureRoutes;
         struct GPUTiming
         {
@@ -129,6 +131,53 @@ namespace
     rage::grcViewport scopeViewport{};
     bool scopeActive=false,buildingScope=false;
     float worldTargetAspect=1.f;
+    std::atomic<uint64_t> eyeRasterSize{0};
+    std::atomic<unsigned> screenParameterGeneration{0};
+    bool resolutionCapture=false;
+    thread_local VRResolution::Size shaderEyeSize{};
+
+    bool TransformScreenSize(rage::grmShaderInfo* shader,int index,const void* data,int bytes,float* output)
+    {
+        if(!shaderEyeSize.width || !shader || !data || bytes!=sizeof(float)*4) return false;
+        struct Parameters {int global,deferred;};
+        static thread_local std::unordered_map<rage::grmShaderInfo*,Parameters> parameters;
+        static thread_local unsigned generation=~0u;
+        const unsigned currentGeneration=screenParameterGeneration.load(std::memory_order_relaxed);
+        if(generation!=currentGeneration) {parameters.clear();generation=currentGeneration;}
+        const auto [found,inserted]=parameters.try_emplace(shader,Parameters{-1,-1});
+        if(inserted)
+        {
+            found->second.global=rage::grmShaderInfo::getParamIndex(shader,nullptr,"globalScreenSize",1);
+            found->second.deferred=rage::grmShaderInfo::getParamIndex(shader,nullptr,"gooDeferredLightScreenSize",1);
+        }
+        if(index<0 || (index!=found->second.global && index!=found->second.deferred)) return false;
+        const auto* input=static_cast<const float*>(data);
+        const bool origin=input[0]==0.f && input[1]==0.f;
+        output[0]=origin ? 0.f:float(shaderEyeSize.width);output[1]=origin ? 0.f:float(shaderEyeSize.height);
+        output[2]=1.f/shaderEyeSize.width;output[3]=1.f/shaderEyeSize.height;
+        return true;
+    }
+
+    void ResizeEyeViewport(rage::grcViewport& viewport)
+    {
+        const auto size=eyeRasterSize.load();if(!size) return;
+        const unsigned width=unsigned(size>>32),height=unsigned(size);
+        // These windows are normalized (recorded CE viewport: 0,0,1,1).
+        // Preserve their fractions and the runtime FOV, change raster size only.
+        viewport.mWidth=width;viewport.mHeight=height;
+    }
+
+
+    VRResolution::Size EyeTargetSize(const std::string& name,const D3DSURFACE_DESC& original,
+        VRResolution::Size desktop,VRResolution::Size eye)
+    {
+        // Luminance reduction/history and the square phone target are fixed
+        // semantic resources, not fractions of the main screen.
+        if(name.starts_with("Lum ") || name.starts_with("Adapted Lum") || name=="Current Lum" || name=="FullScreenCopy2")
+            return {original.Width,original.Height};
+        return {VRResolution::Relative(original.Width,desktop.width,eye.width),
+            VRResolution::Relative(original.Height,desktop.height,eye.height)};
+    }
     unsigned scopeConfigRevision=~0u;
     std::atomic<unsigned> scopeBuilds=0,scopeRenders=0,scopeLensDraws=0,scopeFailures=0;
     unsigned scopeCompletedFrame=~0u;
@@ -181,13 +230,14 @@ namespace
         if(scopeResources) return true;
         if(!resources) return false;
         // One world view, no additional OpenXR swapchain or shared handle.
-        // Keep native dimensions until all fullscreen screen-size constants
-        // can be scaled together; only render while the eyepiece is in use.
+        // Use the same independent raster size and post-processing dimensions
+        // as the eyes; only render while the eyepiece is in use.
         auto owned=std::make_unique<Resources>();
+        owned->desktopSize=resources->desktopSize;owned->eyeSize=resources->eyeSize;
         owned->originalBack=resources->originalBack;
         D3DSURFACE_DESC back{};
         if(FAILED(owned->originalBack->GetDesc(&back)) ||
-            FAILED(device->CreateTexture(back.Width,back.Height,1,D3DUSAGE_RENDERTARGET,
+            FAILED(device->CreateTexture(owned->eyeSize.width,owned->eyeSize.height,1,D3DUSAGE_RENDERTARGET,
                 D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&owned->finalTexture[0],nullptr)) ||
             FAILED(owned->finalTexture[0]->GetSurfaceLevel(0,&owned->finalSurface[0]))) return false;
         // The routing cache recognizes both stereo slots, including every
@@ -199,8 +249,8 @@ namespace
             Target target;target.name=source.name;target.original=source.original;
             target.originalSurface=source.originalSurface;target.originalMips=source.originalMips;
             D3DSURFACE_DESC desc{};
-            if(FAILED(target.original->GetLevelDesc(0,&desc)) ||
-                FAILED(device->CreateTexture(desc.Width,desc.Height,target.original->GetLevelCount(),desc.Usage,
+            if(FAILED(source.texture[0]->GetLevelDesc(0,&desc)) ||
+                FAILED(device->CreateTexture(desc.Width,desc.Height,source.texture[0]->GetLevelCount(),desc.Usage,
                     desc.Format,D3DPOOL_DEFAULT,&target.texture[0],nullptr)) ||
                 FAILED(target.texture[0]->GetSurfaceLevel(0,&target.surface[0]))) return false;
             target.eyeMips[0].resize(target.originalMips.size());
@@ -208,7 +258,7 @@ namespace
                 device->StretchRect(target.originalSurface.Get(),nullptr,target.surface[0].Get(),nullptr,D3DTEXF_NONE);
             for(unsigned level=0;level<target.originalMips.size();++level)
             {
-                if(FAILED(target.texture[0]->GetSurfaceLevel(level+1,&target.eyeMips[0][level]))) return false;
+                if(FAILED(target.texture[0]->GetSurfaceLevel(std::min<unsigned>(level+1,target.texture[0]->GetLevelCount()-1),&target.eyeMips[0][level]))) return false;
                 if(desc.Usage&D3DUSAGE_RENDERTARGET)
                     device->StretchRect(target.originalMips[level].Get(),nullptr,target.eyeMips[0][level].Get(),nullptr,D3DTEXF_NONE);
             }
@@ -334,6 +384,8 @@ namespace
     SRWLOCK modelReferencesLock=SRWLOCK_INIT;
     unsigned retainedModelPeak=0,duplicateModelReferences=0;
     thread_local bool buildingLocalBody=false;
+    thread_local bool renderingLocalBody=false;
+    unsigned bodyMaterialCaptures[2]{};
     SRWLOCK bodyCommandsLock=SRWLOCK_INIT;
     std::unordered_set<void*> bodyCommands;
     unsigned headlessBodyCalls[2]{};
@@ -371,7 +423,7 @@ namespace
     unsigned sphereQueries[3]{},sphereCorrections[3]{};
     rage::grcViewport* observedSphereViewports[16]{};
     unsigned observedSphereViewportCount=0;
-    SafetyHookInline setTarget{},setDepth{},setTexture{},stretch{};
+    SafetyHookInline setTarget{},setDepth{},setTexture{},stretch{},setViewport{},setScissor{},drawUP{};
     SafetyHookInline setRenderState{},setSamplerState{},setStreamSource{},setIndices{},setVertexDeclaration{};
     bool stateHooksReady=false,stateHooksFailed=false;
     SafetyHookInline setVertexShader{};
@@ -1758,9 +1810,80 @@ namespace
     }
     HRESULT WINAPI Stretch(IDirect3DDevice9* self,IDirect3DSurface9* source,const RECT* sourceRect,
         IDirect3DSurface9* destination,const RECT* destinationRect,D3DTEXTUREFILTERTYPE filter)
-    {FlushLiveMesh(self);const bool route=GetCurrentThreadId()==routingThread && !composingHud;
-     return stretch.unsafe_stdcall<HRESULT>(self,route ? MapSurface(source,renderEye) : source,sourceRect,
-        route ? MapSurface(destination,renderEye) : destination,destinationRect,filter);}
+    {
+        FlushLiveMesh(self);const bool route=GetCurrentThreadId()==routingThread && !composingHud;
+        auto* mappedSource=route ? MapSurface(source,renderEye):source;
+        auto* mappedDestination=route ? MapSurface(destination,renderEye):destination;
+        const auto resize=[](IDirect3DSurface9* native,IDirect3DSurface9* mapped,const RECT* rect,RECT& output)->const RECT*
+        {
+            if(!rect || native==mapped || !native || !mapped) return rect;
+            D3DSURFACE_DESC a{},b{};if(FAILED(native->GetDesc(&a)) || FAILED(mapped->GetDesc(&b))) return rect;
+            output={LONG(std::lround(double(rect->left)*b.Width/a.Width)),LONG(std::lround(double(rect->top)*b.Height/a.Height)),
+                LONG(std::lround(double(rect->right)*b.Width/a.Width)),LONG(std::lround(double(rect->bottom)*b.Height/a.Height))};return &output;
+        };
+        RECT a{},b{};
+        return stretch.unsafe_stdcall<HRESULT>(self,mappedSource,resize(source,mappedSource,sourceRect,a),
+            mappedDestination,resize(destination,mappedDestination,destinationRect,b),filter);
+    }
+
+    bool RoutedTargetSize(IDirect3DDevice9* device,D3DSURFACE_DESC& native,D3DSURFACE_DESC& eye)
+    {
+        if(!OnRoutingThread() || renderEye<0 || composingHud || !resources) return false;
+        ComPtr<IDirect3DSurface9> target;
+        if(FAILED(device->GetRenderTarget(0,&target)) || !target) return false;
+        auto* original=MapSurfaceImpl(target.Get(),-1);
+        return original!=target.Get() && SUCCEEDED(original->GetDesc(&native)) && SUCCEEDED(target->GetDesc(&eye)) &&
+            (native.Width!=eye.Width || native.Height!=eye.Height);
+    }
+
+    HRESULT WINAPI SetViewport(IDirect3DDevice9* device,const D3DVIEWPORT9* input)
+    {
+        D3DSURFACE_DESC native{},eye{};D3DVIEWPORT9 value{};
+        // World camera commands already carry the resized viewport; native
+        // fullscreen/post-processing commands still name their original RT.
+        if(input && RoutedTargetSize(device,native,eye) && input->Width==native.Width && input->Height==native.Height)
+        {
+            value=*input;value.X=unsigned((uint64_t(input->X)*eye.Width+native.Width/2)/native.Width);
+            value.Y=unsigned((uint64_t(input->Y)*eye.Height+native.Height/2)/native.Height);
+            value.Width=eye.Width;value.Height=eye.Height;input=&value;
+        }
+        return setViewport.unsafe_stdcall<HRESULT>(device,input);
+    }
+
+    HRESULT WINAPI SetScissor(IDirect3DDevice9* device,const RECT* input)
+    {
+        D3DSURFACE_DESC native{},eye{};RECT value{};
+        if(input && input->left==0 && input->top==0 && RoutedTargetSize(device,native,eye) &&
+            input->right==LONG(native.Width) && input->bottom==LONG(native.Height))
+        {value={0,0,LONG(eye.Width),LONG(eye.Height)};input=&value;}
+        return setScissor.unsafe_stdcall<HRESULT>(device,input);
+    }
+
+    HRESULT WINAPI DrawUP(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,UINT primitives,const void* input,UINT stride)
+    {
+        D3DSURFACE_DESC native{},eye{};DWORD fvf=0;
+        if(input && primitives==2 && (type==D3DPT_TRIANGLESTRIP || type==D3DPT_TRIANGLELIST) && stride>=16 &&
+            RoutedTargetSize(device,native,eye) && SUCCEEDED(device->GetFVF(&fvf)) && (fvf&D3DFVF_POSITION_MASK)==D3DFVF_XYZRHW)
+        {
+            const unsigned count=type==D3DPT_TRIANGLESTRIP ? 4:6;
+            bool fullWidth=false,fullHeight=false;
+            for(unsigned i=0;i<count;++i)
+            {
+                auto* v=reinterpret_cast<const float*>(static_cast<const char*>(input)+i*stride);
+                fullWidth|=std::abs(v[0]-(float(native.Width)-.5f))<.01f;
+                fullHeight|=std::abs(v[1]-(float(native.Height)-.5f))<.01f;
+            }
+            if(fullWidth && fullHeight)
+            {
+                std::vector<unsigned char> vertices(size_t(count)*stride);std::memcpy(vertices.data(),input,vertices.size());
+                for(unsigned i=0;i<count;++i)
+                {auto* v=reinterpret_cast<float*>(vertices.data()+i*stride);
+                 v[0]=VRResolution::PixelCenter(v[0],native.Width,eye.Width);v[1]=VRResolution::PixelCenter(v[1],native.Height,eye.Height);}
+                return drawUP.unsafe_stdcall<HRESULT>(device,type,primitives,vertices.data(),stride);
+            }
+        }
+        return drawUP.unsafe_stdcall<HRESULT>(device,type,primitives,input,stride);
+    }
 
     HRESULT WINAPI SetVertexShader(IDirect3DDevice9* self,IDirect3DVertexShader9* shader)
     {
@@ -1777,7 +1900,7 @@ namespace
         if(resources && shader==resources->asymmetricRayShader.Get() && shader)
             shader=resources->symmetricRayShader.Get();
         if(shader && resources && GetCurrentThreadId()==routingThread && renderEye>=0 && renderStage==2 &&
-            resources->observedShaders.size()<8 && std::none_of(resources->observedShaders.begin(),
+            !resources->asymmetricRayShader && std::none_of(resources->observedShaders.begin(),
                 resources->observedShaders.end(),[shader](const auto& value){return value.Get()==shader;}))
         {
             resources->observedShaders.emplace_back(shader);
@@ -1832,6 +1955,20 @@ namespace
     HRESULT WINAPI SetVertexConstants(IDirect3DDevice9* self,UINT start,const float* data,UINT count)
     {
         if(composingHud) return setVertexConstants.unsafe_stdcall<HRESULT>(self,start,data,count);
+        std::vector<float> resized;
+        if(OnRoutingThread() && renderEye>=0 && resources)
+            for(UINT reg=start;reg<start+count;++reg)
+                {
+                    const float* original=data+(reg-start)*4;float value[4]{};
+                    const auto native=resources->desktopSize,eye=resources->eyeSize;
+                    // CE shaders assign the same screen-size parameter to
+                    // different registers. Match its complete value signature,
+                    // rather than assuming a particular register layout.
+                    if(!VRResolution::ScreenSize(original,native,eye,value)) continue;
+                    if(resized.empty()) resized.assign(data,data+count*4);
+                    std::memcpy(resized.data()+(reg-start)*4,value,sizeof(value));
+                }
+        if(!resized.empty()) data=resized.data();
         if(binderDevice)
         {
             if(self==binderDevice && binderConstants.Write(start,data,count))return S_OK;
@@ -1911,6 +2048,66 @@ namespace
                 constants[i][0],constants[i][1],constants[i][2],constants[i][3]); Log(line);}
     }
 
+    void CaptureBodyMaterial(IDirect3DDevice9* device)
+    {
+        if(!resolutionCapture || !normalProbeActive || !renderingLocalBody ||
+            renderEye<0 || renderEye>1 || bodyMaterialCaptures[renderEye]>=16) return;
+        const unsigned record=bodyMaterialCaptures[renderEye]++;
+        wchar_t root[MAX_PATH]{},path[MAX_PATH]{};GetModuleFileNameW(nullptr,root,MAX_PATH);
+        if(auto* last=wcsrchr(root,L'\\'))last[1]=0;
+        swprintf_s(path,L"%splugins\\GTAIV.VR.body-material-eye%d-%u.txt",root,renderEye,record);
+        FILE* file=nullptr;_wfopen_s(&file,path,L"wb");if(!file)return;
+        ComPtr<IDirect3DPixelShader9> shader;device->GetPixelShader(&shader);
+        fprintf(file,"eye %d record %u shader %p\n",renderEye,record,shader.Get());
+        UINT bytes=0;
+        if(shader && SUCCEEDED(shader->GetFunction(nullptr,&bytes)) && bytes && bytes<=65536)
+        {
+            std::vector<DWORD> code((bytes+3)/4);ComPtr<ID3DXBuffer> assembly;
+            if(SUCCEEDED(shader->GetFunction(code.data(),&bytes)) &&
+                SUCCEEDED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)))
+                fwrite(assembly->GetBufferPointer(),assembly->GetBufferSize(),1,file);
+        }
+        for(unsigned slot=0;slot<16;++slot)
+        {
+            ComPtr<IDirect3DBaseTexture9> texture;device->GetTexture(slot,&texture);
+            fprintf(file,"texture %u %p\n",slot,texture.Get());
+            for(unsigned state=1;state<=13;++state)
+            {
+                DWORD value=0;if(SUCCEEDED(device->GetSamplerState(slot,D3DSAMPLERSTATETYPE(state),&value)))
+                    fprintf(file,"sampler %u %u %08lX\n",slot,state,value);
+            }
+        }
+        float constants[224][4]{};
+        if(SUCCEEDED(device->GetPixelShaderConstantF(0,constants[0],224)))
+            for(unsigned i=0;i<224;++i)fprintf(file,"PS%u %.9g %.9g %.9g %.9g\n",i,
+                constants[i][0],constants[i][1],constants[i][2],constants[i][3]);
+        // Temporal body flicker can originate before the pixel shader: retain
+        // the vertex lighting inputs and MRT write state for the same draw.
+        ComPtr<IDirect3DVertexShader9> vertex;device->GetVertexShader(&vertex);
+        bytes=0;
+        if(vertex && SUCCEEDED(vertex->GetFunction(nullptr,&bytes)) && bytes && bytes<=65536)
+        {
+            std::vector<DWORD> code((bytes+3)/4);ComPtr<ID3DXBuffer> assembly;
+            if(SUCCEEDED(vertex->GetFunction(code.data(),&bytes)) &&
+                SUCCEEDED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)))
+                fwrite(assembly->GetBufferPointer(),assembly->GetBufferSize(),1,file);
+        }
+        float vertexConstants[256][4]{};
+        D3DCAPS9 caps{};device->GetDeviceCaps(&caps);
+        const UINT registers=std::min<UINT>(256,caps.MaxVertexShaderConst);
+        if(SUCCEEDED(device->GetVertexShaderConstantF(0,vertexConstants[0],registers)))
+            for(unsigned i=0;i<registers;++i)fprintf(file,"VS%u %.9g %.9g %.9g %.9g\n",i,
+                vertexConstants[i][0],vertexConstants[i][1],vertexConstants[i][2],vertexConstants[i][3]);
+        for(unsigned state=1;state<=D3DRS_BLENDOPALPHA;++state)
+        {DWORD value=0;if(SUCCEEDED(device->GetRenderState(D3DRENDERSTATETYPE(state),&value)))
+            fprintf(file,"render-state %u %08lX\n",state,value);}
+        for(unsigned slot=0;slot<4;++slot)
+        {ComPtr<IDirect3DSurface9> surface;D3DSURFACE_DESC desc{};
+            if(SUCCEEDED(device->GetRenderTarget(slot,&surface)) && surface && SUCCEEDED(surface->GetDesc(&desc)))
+                fprintf(file,"target %u %p %u %u %u\n",slot,surface.Get(),desc.Width,desc.Height,unsigned(desc.Format));}
+        fclose(file);
+    }
+
     HRESULT WINAPI DrawIndexedPrimitive(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,
         INT base,UINT minimum,UINT vertices,UINT start,UINT primitives)
     {
@@ -1930,6 +2127,7 @@ namespace
         }
         CaptureMeshBindings(device,type,base,minimum,vertices,start,primitives);
         if(normalProbeActive) ProbeNormalDraw(device);
+        CaptureBodyMaterial(device);
         const auto stamp=drawProbeActive ? BeginDrawProbe(true,primitives,vertices):VRProfile::Stamp{};
         HRESULT result=S_OK;bool executed=false;
         if(rigidInstances && GetCurrentThreadId()==routingThread && renderEye>=0 && renderStage==1)
@@ -1946,6 +2144,64 @@ namespace
         if(!executed)result=drawIndexedPrimitive.unsafe_stdcall<HRESULT>(device,type,base,minimum,vertices,start,primitives);
         if(drawProbeActive) EndDrawProbe(stamp,result);
         return result;
+    }
+
+    unsigned resolutionLightDraws[2]{};
+    void CaptureResolutionLight(IDirect3DDevice9* device)
+    {
+        if(!resolutionCapture || captured || renderEye<0 || renderEye>1 || renderStage!=2 || !resources || resolutionLightDraws[renderEye]>=64) return;
+        const unsigned index=resolutionLightDraws[renderEye]++;
+        wchar_t root[MAX_PATH]{};GetModuleFileNameW(nullptr,root,MAX_PATH);
+        if(auto* last=wcsrchr(root,L'\\')) last[1]=0;
+        wchar_t path[MAX_PATH]{};swprintf_s(path,L"%splugins\\GTAIV.VR.resolution-light-eye%d-%u.txt",root,renderEye,index);
+        FILE* file=nullptr;_wfopen_s(&file,path,L"wb");if(!file)return;
+        D3DVIEWPORT9 viewport{};device->GetViewport(&viewport);
+        fprintf(file,"viewport %u %u %u %u\n",viewport.X,viewport.Y,viewport.Width,viewport.Height);
+        ComPtr<IDirect3DVertexShader9> vs;ComPtr<IDirect3DPixelShader9> ps;
+        device->GetVertexShader(&vs);device->GetPixelShader(&ps);
+        const auto shader=[&](auto* value)
+        {
+            UINT bytes=0;if(!value || FAILED(value->GetFunction(nullptr,&bytes)))return;
+            std::vector<DWORD> code((bytes+3)/4);ComPtr<ID3DXBuffer> assembly;
+            if(SUCCEEDED(value->GetFunction(code.data(),&bytes)) &&
+                SUCCEEDED(D3DXDisassembleShader(code.data(),FALSE,nullptr,&assembly)))
+                fwrite(assembly->GetBufferPointer(),assembly->GetBufferSize(),1,file);
+        };
+        shader(vs.Get());shader(ps.Get());
+        float constants[256][4]{};
+        if(SUCCEEDED(device->GetVertexShaderConstantF(0,constants[0],256)))
+            for(unsigned i=0;i<256;++i)fprintf(file,"VS%u %.9g %.9g %.9g %.9g\n",i,constants[i][0],constants[i][1],constants[i][2],constants[i][3]);
+        if(SUCCEEDED(device->GetPixelShaderConstantF(0,constants[0],224)))
+            for(unsigned i=0;i<224;++i)fprintf(file,"PS%u %.9g %.9g %.9g %.9g\n",i,constants[i][0],constants[i][1],constants[i][2],constants[i][3]);
+        for(unsigned slot=0;slot<16;++slot)
+        {
+            ComPtr<IDirect3DBaseTexture9> texture;device->GetTexture(slot,&texture);
+            fprintf(file,"texture %u %p\n",slot,texture.Get());
+            for(unsigned state=1;state<=13;++state)
+            {DWORD value=0;if(SUCCEEDED(device->GetSamplerState(slot,D3DSAMPLERSTATETYPE(state),&value)))
+                fprintf(file,"sampler %u %u %08lX\n",slot,state,value);}
+            // RTCache includes retired native entries after a reset. Inspect
+            // only the AddRef-held texture actually bound on this device.
+            ComPtr<IDirect3DTexture9> flat;ComPtr<IDirect3DCubeTexture9> cube;
+            D3DSURFACE_DESC desc{};
+            if(texture && SUCCEEDED(texture.As(&flat)) && SUCCEEDED(flat->GetLevelDesc(0,&desc)))
+                fprintf(file,"texture-size %u 2D %u %u\n",slot,desc.Width,desc.Height);
+            else if(texture && SUCCEEDED(texture.As(&cube)) && SUCCEEDED(cube->GetLevelDesc(0,&desc)))
+                fprintf(file,"texture-size %u cube %u %u\n",slot,desc.Width,desc.Height);
+            for(const auto& target:resources->targets)
+                if(texture==target.texture[renderEye] || texture==target.original)
+                {D3DSURFACE_DESC desc{};target.texture[renderEye]->GetLevelDesc(0,&desc);
+                    fprintf(file,"texture%u %s %s %u %u\n",slot,target.name.c_str(),texture==target.original ? "native":"eye",desc.Width,desc.Height);}
+        }
+        fclose(file);
+        if(renderEye || index>=4) return; // Read back only four diagnostic thumbnails.
+        ComPtr<IDirect3DSurface9> target,surface;ComPtr<IDirect3DTexture9> thumbnail;
+        D3DSURFACE_DESC desc{};device->GetRenderTarget(0,&target);
+        if(target && SUCCEEDED(target->GetDesc(&desc)) &&
+            SUCCEEDED(device->CreateTexture(512,std::max(1u,unsigned(512ull*desc.Height/desc.Width)),1,D3DUSAGE_RENDERTARGET,
+                D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&thumbnail,nullptr)) && SUCCEEDED(thumbnail->GetSurfaceLevel(0,&surface)) &&
+            SUCCEEDED(stretch.unsafe_stdcall<HRESULT>(device,target.Get(),nullptr,surface.Get(),nullptr,D3DTEXF_LINEAR)))
+        {swprintf_s(path,L"%splugins\\GTAIV.VR.resolution-light%u.png",root,index);D3DXSaveSurfaceToFileW(path,D3DXIFF_PNG,surface.Get(),nullptr,nullptr);}
     }
 
     HRESULT WINAPI DrawPrimitive(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,UINT start,UINT count)
@@ -1983,6 +2239,7 @@ namespace
         }
         const auto stamp=drawProbeActive ? BeginDrawProbe(false,count,0):VRProfile::Stamp{};
         const auto result=drawPrimitive.unsafe_stdcall<HRESULT>(device,type,start,count);
+        CaptureResolutionLight(device);
         if(drawProbeActive) EndDrawProbe(stamp,result);
         return result;
     }
@@ -2022,7 +2279,7 @@ namespace
             setPixelConstants.unsafe_stdcall<HRESULT>(device,14,originalCascadeForward,1);
             cascadeShaderBound=false;
         }
-        if(shader && renderEye>=0 && renderStage==2 && resources->observedPixelShaders.size()<16 &&
+        if(shader && renderEye>=0 && renderStage==2 &&
             std::none_of(resources->observedPixelShaders.begin(),resources->observedPixelShaders.end(),
                 [shader](const auto& value){return value.Get()==shader;}))
         {
@@ -2037,7 +2294,7 @@ namespace
                 {
                     const std::string text(static_cast<const char*>(assembly->GetBufferPointer()),assembly->GetBufferSize());
                     char header[128];
-                    sprintf_s(header,"lighting pixel shader=%p frame=%u eye=%d (bounded discovery)",shader,completedFrame,renderEye);
+                    sprintf_s(header,"lighting pixel shader=%p frame=%u eye=%d (once per shader)",shader,completedFrame,renderEye);
                     Log(header);
                     Log(text.substr(0,24000).c_str());
                     const std::regex register14("\\bc14\\b");
@@ -2069,6 +2326,19 @@ namespace
 
     HRESULT WINAPI SetPixelConstants(IDirect3DDevice9* device,UINT start,const float* data,UINT count)
     {
+        std::vector<float> resized;
+        if(OnRoutingThread() && !composingHud && renderEye>=0 && resources)
+        {
+            const auto native=resources->desktopSize,eye=resources->eyeSize;
+            for(UINT reg=start;reg<start+count;++reg)
+            {
+                const float* original=data+(reg-start)*4;float value[4]{};
+                if(!VRResolution::ScreenSize(original,native,eye,value)) continue;
+                if(resized.empty()) resized.assign(data,data+count*4);
+                std::memcpy(resized.data()+(reg-start)*4,value,sizeof(value));
+            }
+            if(!resized.empty()) data=resized.data();
+        }
         if(composingHud) return setPixelConstants.unsafe_stdcall<HRESULT>(device,start,data,count);
         if(!cascadeShaderBound && !constantProbeActive)
             return ObserveStateCall(VRProfile::StateKind::PixelConstants,
@@ -2088,27 +2358,82 @@ namespace
 
     void Rebind(IDirect3DDevice9* device,int eye)
     {
+        D3DVIEWPORT9 previousViewport{};device->GetViewport(&previousViewport);
+        ComPtr<IDirect3DSurface9> previousTarget;device->GetRenderTarget(0,&previousTarget);
+        D3DSURFACE_DESC previousSize{};if(previousTarget) previousTarget->GetDesc(&previousSize);
+        ComPtr<IDirect3DSurface9> previousTargets[4],previousDepth;
+        for(unsigned i=0;i<4;++i) device->GetRenderTarget(i,&previousTargets[i]);
+        device->GetDepthStencilSurface(&previousDepth);
         ComPtr<IDirect3DVertexShader9> shader;
         if(SUCCEEDED(device->GetVertexShader(&shader))) SetVertexShader(device,shader.Get());
         ComPtr<IDirect3DPixelShader9> pixel;
         if(SUCCEEDED(device->GetPixelShader(&pixel))) SetPixelShader(device,pixel.Get());
         // RAGE caches the original pointers. Rebind actual device state even
         // when the game omits an identical SetTexture/SetRenderTarget call.
+        // D3D9 cannot bind a larger color target while the smaller native
+        // depth/MRT surfaces remain attached. Detach, then bind the whole set.
+        setDepth.unsafe_stdcall<HRESULT>(device,nullptr);
+        for(unsigned i=1;i<4;++i) setTarget.unsafe_stdcall<HRESULT>(device,i,nullptr);
         for(unsigned i=0;i<4;++i)
-        {
-            ComPtr<IDirect3DSurface9> surface;
-            if(SUCCEEDED(device->GetRenderTarget(i,&surface)))
-                setTarget.unsafe_stdcall<HRESULT>(device,i,MapSurface(surface.Get(),eye));
-        }
-        ComPtr<IDirect3DSurface9> depth;
-        if(SUCCEEDED(device->GetDepthStencilSurface(&depth)))
-            setDepth.unsafe_stdcall<HRESULT>(device,MapSurface(depth.Get(),eye));
+            if(i || previousTargets[i]) setTarget.unsafe_stdcall<HRESULT>(device,i,MapSurface(previousTargets[i].Get(),eye));
+        setDepth.unsafe_stdcall<HRESULT>(device,MapSurface(previousDepth.Get(),eye));
         for(unsigned i=0;i<20;++i)
         {
             const unsigned stage=i<16 ? i : D3DVERTEXTEXTURESAMPLER0+i-16;
             ComPtr<IDirect3DBaseTexture9> texture;
             if(SUCCEEDED(device->GetTexture(stage,&texture)))
                 setTexture.unsafe_stdcall<HRESULT>(device,stage,MapTexture(texture.Get(),eye));
+        }
+        ComPtr<IDirect3DSurface9> nextTarget;device->GetRenderTarget(0,&nextTarget);
+        D3DSURFACE_DESC nextSize{};
+        if(nextTarget && SUCCEEDED(nextTarget->GetDesc(&nextSize)) && previousSize.Width && previousSize.Height &&
+            (previousSize.Width!=nextSize.Width || previousSize.Height!=nextSize.Height))
+        {
+            previousViewport.X=unsigned(double(previousViewport.X)*nextSize.Width/previousSize.Width);
+            previousViewport.Y=unsigned(double(previousViewport.Y)*nextSize.Height/previousSize.Height);
+            previousViewport.Width=VRResolution::Relative(previousViewport.Width,previousSize.Width,nextSize.Width);
+            previousViewport.Height=VRResolution::Relative(previousViewport.Height,previousSize.Height,nextSize.Height);
+            setViewport.unsafe_stdcall<HRESULT>(device,&previousViewport);
+        }
+        if(resources)
+        {
+            const auto size=resources->eyeSize,native=resources->desktopSize;
+            const auto from=eye<0 ? size:native,to=eye<0 ? native:size;
+            float value[4]{float(to.width),float(to.height),1.f/to.width,1.f/to.height};
+            float current[256*4]{};
+            D3DCAPS9 caps{};device->GetDeviceCaps(&caps);
+            const UINT vertexRegisters=std::min<UINT>(caps.MaxVertexShaderConst,256);
+            if(SUCCEEDED(device->GetVertexShaderConstantF(0,current,vertexRegisters)))
+            for(UINT reg=0;reg<vertexRegisters;++reg)
+                if(VRResolution::ScreenSize(current+reg*4,from,to,value))
+                    setVertexConstants.unsafe_stdcall<HRESULT>(device,reg,value,1);
+            if(SUCCEEDED(device->GetPixelShaderConstantF(0,current,224)))
+            for(UINT reg=0;reg<224;++reg)
+                if(VRResolution::ScreenSize(current+reg*4,from,to,value))
+                    setPixelConstants.unsafe_stdcall<HRESULT>(device,reg,value,1);
+        }
+    }
+
+    void CaptureResolutionTargets(IDirect3DDevice9* device,unsigned stage)
+    {
+        // Explicit stereo-test only; never a continuous gameplay observer.
+        if(!resolutionCapture || captured || !resources || (resources->eyeSize.width==resources->desktopSize.width &&
+            resources->eyeSize.height==resources->desktopSize.height)) return;
+        for(const auto& target:resources->targets)
+        {
+            if(!target.name.starts_with("FullScreen") && !target.name.starts_with("Quarter Screen") &&
+                !target.name.starts_with("Blur Screen")) continue;
+            D3DSURFACE_DESC desc{};if(FAILED(target.surface[0]->GetDesc(&desc))) continue;
+            ComPtr<IDirect3DTexture9> thumbnail;ComPtr<IDirect3DSurface9> surface;
+            if(FAILED(device->CreateTexture(512,std::max(1u,unsigned(512ull*desc.Height/desc.Width)),1,
+                D3DUSAGE_RENDERTARGET,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&thumbnail,nullptr)) ||
+                FAILED(thumbnail->GetSurfaceLevel(0,&surface)) ||
+                FAILED(stretch.unsafe_stdcall<HRESULT>(device,target.surface[0].Get(),nullptr,surface.Get(),nullptr,D3DTEXF_LINEAR))) continue;
+            wchar_t path[MAX_PATH]{};GetModuleFileNameW(nullptr,path,MAX_PATH);
+            if(auto* last=wcsrchr(path,L'\\')) last[1]=0;
+            const std::wstring name(target.name.begin(),target.name.end());
+            wchar_t suffix[160]{};swprintf_s(suffix,L"plugins\\GTAIV.VR.resolution-stage%u-%s.png",stage,name.c_str());
+            wcscat_s(path,suffix);D3DXSaveSurfaceToFileW(path,D3DXIFF_PNG,surface.Get(),nullptr,nullptr);
         }
     }
 
@@ -2144,6 +2469,7 @@ namespace
             if(!ready || !RageDirect3DDevice9::m_pRealDevice) return;
             auto* device=*RageDirect3DDevice9::m_pRealDevice;
             if(!device) return;
+            shaderEyeSize=begin && resources ? resources->eyeSize:VRResolution::Size{};
             if(optical)
             {
                 if(VRDiagnostics::logging && VRDiagnostics::counters && scopeRenders.load()<3)
@@ -2361,9 +2687,11 @@ namespace
             if(begin && stage==1) commandStart[eye]=VRProfile::Begin();
             if(stage==1 && begin) GPUTime(device,eye,true);
             if(stage==3 && !begin) GPUTime(device,eye,false);
-            if(begin && stage==1 && eye==0 && captureNextPair.exchange(false)) {captured=false; lightingProbeMask=0;}
+            if(begin && stage==1 && eye==0 && captureNextPair.exchange(false))
+            {captured=false; lightingProbeMask=0;resolutionLightDraws[0]=resolutionLightDraws[1]=0;}
             if(begin && stage==1 && eye==0 && !captured)
-            {for(auto& keys:normalProbeKeys) keys.clear(); normalProbeShaders.clear();}
+            {for(auto& keys:normalProbeKeys) keys.clear(); normalProbeShaders.clear();
+             bodyMaterialCaptures[0]=bodyMaterialCaptures[1]=0;}
             normalProbeActive=begin && stage==1 && !captured;
             constantProbeActive=begin && stage>=1 && stage<=3 && VRProfile::ConstantObservationEnabled();
             routingProbeActive=begin && stage>=1 && stage<=3 && phaseStart[eye][stage-1].epoch!=0;
@@ -2392,6 +2720,7 @@ namespace
                 eyeRayConstants[0]=(right-left)*.5f; eyeRayConstants[1]=(up-down)*.5f;
                 eyeRayConstants[2]=(right+left)*.5f; eyeRayConstants[3]=(up+down)*.5f;
             }
+            if(!begin && eye==0 && stage>=2) CaptureResolutionTargets(device,stage);
             Rebind(device,renderEye);
             if(!begin && stage>=1 && stage<=3)
                 VRProfile::End(phaseMetrics[eye][stage-1],phaseStart[eye][stage-1]);
@@ -2432,6 +2761,8 @@ namespace
         buildingStage=begin ? stage : 0;
         auto* marker=new EyeMarker(buildingEye,stage,gameFrame,begin);
         if(marker) marker->Append();
+        const auto size=eyeRasterSize.load();
+        shaderEyeSize=begin ? VRResolution::Size{unsigned(size>>32),unsigned(size)}:VRResolution::Size{};
     }
 
     // CE CDrawPlayerDC: constructor ret 0x28; executor ret; destructor ret 4.
@@ -2512,7 +2843,9 @@ namespace
             for(unsigned component:{0u,7u,9u,10u}) // head, hair, teeth, face
                 std::memcpy(components.data()+component*4,&empty,4);
             *table=components.data();
+            const bool previousLocal=renderingLocalBody;renderingLocalBody=true;
             playerDrawExecute.unsafe_fastcall(self,edx);
+            renderingLocalBody=previousLocal;
             *table=original;
             if(VRDiagnostics::Increment(headlessBodyCalls[renderEye])==1) Log("Headless local-player body command executed in an eye stream");
             return;
@@ -3001,7 +3334,10 @@ namespace
         if(!Check("back buffer",device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&owned->originalBack))) return;
         D3DSURFACE_DESC back{};
         if(!Check("back description",owned->originalBack->GetDesc(&back)) || back.MultiSampleType!=D3DMULTISAMPLE_NONE) return;
-        worldTargetAspect=float(back.Width)/back.Height;
+        owned->desktopSize={back.Width,back.Height};owned->eyeSize=owned->desktopSize;
+        unsigned eyeWidth=0,eyeHeight=0;
+        if(OpenXRVR::GetEyeResolution(eyeWidth,eyeHeight)) owned->eyeSize={eyeWidth,eyeHeight};
+        worldTargetAspect=float(owned->eyeSize.width)/owned->eyeSize.height;
         ComPtr<IDirect3DSwapChain9> desktopChain;
         D3DPRESENT_PARAMETERS desktopParameters{};
         if(SUCCEEDED(device->GetSwapChain(0,&desktopChain)) && SUCCEEDED(desktopChain->GetPresentParameters(&desktopParameters)))
@@ -3011,7 +3347,7 @@ namespace
                 desktopParameters.Windowed,desktopParameters.FullScreen_RefreshRateInHz); Log(line);
         }
         for(unsigned eye=0;eye<2;++eye)
-            if(!Check("shared eye color",device->CreateTexture(back.Width,back.Height,1,D3DUSAGE_RENDERTARGET,
+            if(!Check("shared eye color",device->CreateTexture(owned->eyeSize.width,owned->eyeSize.height,1,D3DUSAGE_RENDERTARGET,
                 D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&owned->finalTexture[eye],OpenXRVR::UsesVulkan() ? nullptr : &owned->shared[eye])) ||
                 !Check("eye color surface",owned->finalTexture[eye]->GetSurfaceLevel(0,&owned->finalSurface[eye]))) return;
         for(const auto& [name,original]:rage::grcTextureFactoryPC::RTCache)
@@ -3024,9 +3360,11 @@ namespace
             if(!Check("target description",target.original->GetLevelDesc(0,&desc)) ||
                 !Check("original target surface",target.original->GetSurfaceLevel(0,&target.originalSurface))) return;
             if(desc.MultiSampleType!=D3DMULTISAMPLE_NONE) {Log("Unsupported multisampled eye target"); return;}
+            const auto dimensions=EyeTargetSize(name,desc,owned->desktopSize,owned->eyeSize);
+            const auto eyeLevels=VRResolution::MipLevels(dimensions,target.original->GetLevelCount());
             for(unsigned eye=0;eye<2;++eye)
             {
-                if(!Check(name.c_str(),device->CreateTexture(desc.Width,desc.Height,target.original->GetLevelCount(),
+                if(!Check(name.c_str(),device->CreateTexture(dimensions.width,dimensions.height,eyeLevels,
                     desc.Usage,desc.Format,D3DPOOL_DEFAULT,&target.texture[eye],nullptr)) ||
                     !Check("target surface",target.texture[eye]->GetSurfaceLevel(0,&target.surface[eye]))) return;
                 if(desc.Usage&D3DUSAGE_RENDERTARGET)
@@ -3043,7 +3381,7 @@ namespace
                 if(!Check("original target mip",target.original->GetSurfaceLevel(level,&target.originalMips[level-1]))) return;
                 for(unsigned eye=0;eye<2;++eye)
                 {
-                    if(!Check("eye target mip",target.texture[eye]->GetSurfaceLevel(level,&target.eyeMips[eye][level-1]))) return;
+                    if(!Check("eye target mip",target.texture[eye]->GetSurfaceLevel(std::min<unsigned>(level,eyeLevels-1),&target.eyeMips[eye][level-1]))) return;
                     if(desc.Usage&D3DUSAGE_RENDERTARGET)
                         Check("seed history mip",device->StretchRect(target.originalMips[level-1].Get(),nullptr,
                             target.eyeMips[eye][level-1].Get(),nullptr,D3DTEXF_NONE));
@@ -3070,18 +3408,22 @@ namespace
         if(!setDepth) setDepth=safetyhook::create_inline(table[39],SetDepth);
         if(!setTexture) setTexture=safetyhook::create_inline(table[65],SetTexture);
         if(!stretch) stretch=safetyhook::create_inline(table[34],Stretch);
+        if(!setViewport) setViewport=safetyhook::create_inline(table[47],SetViewport);
+        if(!setScissor) setScissor=safetyhook::create_inline(table[75],SetScissor);
+        if(!drawUP) drawUP=safetyhook::create_inline(table[83],DrawUP);
         if(!setVertexShader) setVertexShader=safetyhook::create_inline(table[92],SetVertexShader);
         if(!setVertexConstants) setVertexConstants=safetyhook::create_inline(table[94],SetVertexConstants);
         if(!drawPrimitive) drawPrimitive=safetyhook::create_inline(table[81],DrawPrimitive);
         if(!drawIndexedPrimitive) drawIndexedPrimitive=safetyhook::create_inline(table[82],DrawIndexedPrimitive);
         if(!setPixelShader) setPixelShader=safetyhook::create_inline(table[107],SetPixelShader);
         if(!setPixelConstants) setPixelConstants=safetyhook::create_inline(table[109],SetPixelConstants);
-        if(!setTarget || !setDepth || !setTexture || !stretch || !setVertexShader || !setVertexConstants || !drawPrimitive || !drawIndexedPrimitive || !setPixelShader || !setPixelConstants) {Log("Device routing hook unavailable"); return;}
+        if(!setTarget || !setDepth || !setTexture || !stretch || !setViewport || !setScissor || !drawUP || !setVertexShader || !setVertexConstants || !drawPrimitive || !drawIndexedPrimitive || !setPixelShader || !setPixelConstants) {Log("Device routing hook unavailable"); return;}
         char line[160];
         sprintf_s(line,"allocated two eye sets targets=%zu finalColor=%ux%u format=21 shared=%u,%u",
-            owned->targets.size(),back.Width,back.Height,owned->shared[0]!=nullptr,owned->shared[1]!=nullptr);
+            owned->targets.size(),owned->eyeSize.width,owned->eyeSize.height,owned->shared[0]!=nullptr,owned->shared[1]!=nullptr);
         Log(line);
         resources=owned.release();
+        eyeRasterSize=(uint64_t(resources->eyeSize.width)<<32)|resources->eyeSize.height;
         routingThread=GetCurrentThreadId();
         routingGeneration.fetch_add(1,std::memory_order_relaxed);
         ready=true;
@@ -3464,6 +3806,7 @@ namespace
         auto* base=reinterpret_cast<rage::grcViewport*>(static_cast<char*>(self)+0xB0);
         std::memcpy(gameShadowForward,base->mViewInverseMatrix[2],sizeof(gameShadowForward));
         if(!VRCamera::Generate(*base,xrViews,eyeViewports)) return;
+        for(auto& viewport:eyeViewports) ResizeEyeViewport(viewport);
         scopeActive=false;
         queuedScopeGunValid=false;
         ReadScopeSettings();
@@ -3480,7 +3823,7 @@ namespace
                 VRMath::Vector position{};std::memcpy(position.data(),eye.mViewInverseMatrix[3],sizeof(position));
                 if(VRScope::InEyeBox(scopeLensPose,position,scopeSettings)) scopeActive=true;
             }
-            alignas(16) auto opticalBase=*base;opticalBase.mAspect=worldTargetAspect;
+            alignas(16) auto opticalBase=*base;ResizeEyeViewport(opticalBase);opticalBase.mAspect=worldTargetAspect;
             if(scopeProbeFrames) {scopeActive=true;--scopeProbeFrames;}
             scopeActive=scopeActive && VRCamera::GenerateOpticalView(opticalBase,scopeCamera,scopeSettings.verticalFov,scopeViewport);
         }
@@ -3612,7 +3955,7 @@ namespace
                 VRMath::Vector position{};std::memcpy(position.data(),eye.mViewInverseMatrix[3],sizeof(position));
                 if(VRScope::InEyeBox(scopeLensPose,position,scopeSettings)) scopeActive=true;
             }
-            alignas(16) auto opticalBase=saved[0][0];opticalBase.mAspect=worldTargetAspect;
+            alignas(16) auto opticalBase=saved[0][0];ResizeEyeViewport(opticalBase);opticalBase.mAspect=worldTargetAspect;
             if(scopeProbeFrames) scopeActive=true;
             scopeActive=scopeActive && VRCamera::GenerateOpticalView(opticalBase,scopeCamera,scopeSettings.verticalFov,scopeViewport);
         }
@@ -3695,6 +4038,7 @@ namespace
 
 void VRStereo::Shutdown()
 {
+    shaderEyeSize={};eyeRasterSize=0;screenParameterGeneration.fetch_add(1,std::memory_order_relaxed);
     VRHud::Reset();
     scopeActive=buildingScope=false;scopeCompletedFrame=~0u;scopeConfigRevision=~0u;
     scopeProbeRequested=false;scopeCaptureRequested=false;scopeProbeFrames=0;
@@ -3892,11 +4236,13 @@ std::string VRStereo::Status()
 
 void VRStereo::Install()
 {
+    rage::grmShaderInfo::TransformScreenSize=TransformScreenSize;
     VRHud::SetOverlayRouting([](bool begin){
         if(begin && (!OnRoutingThread() || renderEye>=0 || composingHud)) return false;
         composingHud=begin;return true;
     });
     CIniReader ini("");
+    resolutionCapture=ini.ReadInteger("DEVELOPMENT","ProbeEyeResolution",0)!=0;
     if(!ini.ReadInteger("VR","ExperimentalStereo",0)) return;
     captured=!VRDiagnostics::automaticCaptures;
     if(CIniReader(CSettings::d3d9cfgPath).ReadInteger("MAIN","API",0)!=0 && !OpenXRVR::UsesVulkan())
