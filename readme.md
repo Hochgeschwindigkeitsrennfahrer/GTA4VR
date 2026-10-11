@@ -5,7 +5,7 @@
 
 A single-player VR mod for **Grand Theft Auto IV: The Complete Edition**, built on [FusionFix](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix).
 
-> **Full playthrough entirely in VR is not possible yet.** Shops, some mission actions, NPC interactions and minigames are not supported. You will need to temporarily disable VR and play those sections on a flat screen with keyboard/mouse or a gamepad.
+> **A full VR-only playthrough has not been verified.** Minigames remain unsupported, and some native pickup interactions do not work. Known mission workarounds are listed below. Other story missions may require keyboard/gamepad input or temporarily disabling VR, but no additional mission progression blockers are currently confirmed.
 
 The Lost and Damned and The Ballad of Gay Tony have **not** been tested at all.
 
@@ -51,10 +51,10 @@ Short clips of the current build; these demonstrate individual features, not a c
 
 | Limitation | Tracking |
 | --- | --- |
-| **Concrete Jungle:** the required take-cover step needs keyboard/gamepad input; VR controls do not provide it yet. | [#12](https://github.com/bordplate/GTA4VR/issues/12) |
-| **Clothing stores:** purchasing items does not work through VR controls, blocking an early mission. | [#13](https://github.com/bordplate/GTA4VR/issues/13) |
-| **Minigames:** not currently playable through the VR control path. | [#14](https://github.com/bordplate/GTA4VR/issues/14) |
-| **NPC services:** interactions such as hot-dog vendors and bowling staff are missing; the bowling interaction is required for mission progression. | [#15](https://github.com/bordplate/GTA4VR/issues/15) |
+| **Minigames:** not currently playable through VR controls. To progress through the required bowling activity in the Michelle mission, enter the bowling minigame and immediately exit it. Playing the activity itself still requires flat-screen controls. | [#14](https://github.com/bordplate/GTA4VR/issues/14) |
+| **Bull in a China Shop:** the tutorial's cinder block reacts to physics but cannot be picked up. **Workaround:** smash the shopkeeper's window with your fist instead of picking up and throwing the block. | [#17](https://github.com/bordplate/GTA4VR/issues/17) |
+
+The required cover step in [Concrete Jungle](https://github.com/bordplate/GTA4VR/issues/12) and [clothing-store purchases](https://github.com/bordplate/GTA4VR/issues/13) are fixed. Vendor interactions and clothing-menu navigation also work through VR controls. The known mission workarounds above allow progression through those sections; they do not establish support for every story mission. No additional mission progression blockers are currently confirmed.
 
 There are also known stereo issues with [traffic-light lamps](https://github.com/bordplate/GTA4VR/issues/1), [objective markers](https://github.com/bordplate/GTA4VR/issues/4) and [water](https://github.com/bordplate/GTA4VR/issues/6). UI coverage, vehicle classes and lifecycle handling remain under development. The desktop currently shows an eye view; an independent third-person desktop camera is [planned](https://github.com/bordplate/GTA4VR/issues/7).
 
