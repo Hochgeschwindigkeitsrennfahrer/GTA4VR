@@ -100,7 +100,7 @@ Bindings are named actions in SteamVR and can be customized. These are the curre
 | --- | --- |
 | Move | Touch the left trackpad; its outer edge jogs. Hold its click to sprint. |
 | Jump / weapon selection | Right trackpad center click jumps; left/right clicks cycle weapons. |
-| Pause / phone | Tap left Menu for pause; hold it to open the phone, including while driving. |
+| Pause / phone | Tap left Menu for pause or to skip a cutscene; hold it to open the phone, including while driving. |
 | Fire / support | Right trigger fires on foot. Hold left grip near the weapon to support it. |
 | Grab | Grip near an object with a free hand; hold to retain it. |
 | Reload | Right grip ejects supported magazines; left grip over the shoulder retrieves ammunition. Insert it, then manipulate the slide/handle/pump as required by the weapon. Ejected magazine ammunition is discarded. |

@@ -59,6 +59,9 @@ export namespace OpenXRVR
         float phoneDirection[2]{};
         bool phoneUp=false,phoneDown=false,phoneLeft=false,phoneRight=false,phoneAccept=false;
         uint64_t phonePresses[6]{};
+        bool contextInteract=false,scriptMenuActive=false;
+        bool scriptUp=false,scriptDown=false,scriptLeft=false,scriptRight=false,scriptAccept=false,scriptBack=false;
+        uint64_t scriptPresses[6]{},contextPresses=0;
         unsigned long long sampledAt=0;
     };
     struct PanelPointer
@@ -70,6 +73,7 @@ export namespace OpenXRVR
     };
     bool GetPanelPointer(PanelPointer& pointer);
     void SetDriving(bool driving);
+    void SetScriptMenu(bool active);
     bool GetControllerInput(ControllerInput& input);
     std::string InputStatus();
     void Install();
@@ -170,9 +174,11 @@ namespace
     enum class Action {Move,MoveEnable,Sprint,Jump,Interact,Fire,Support,Cycle,CycleDirection,Next,Previous,
         Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
         PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,
-        DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,DrivePhoneOpen,Count};
+        DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,DrivePhoneOpen,
+        ContextInteract,ScriptDirection,ScriptClick,ScriptUp,ScriptDown,ScriptLeft,ScriptRight,ScriptAccept,ScriptBack,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
+    std::atomic<bool> scriptMenuInput=false;
     OpenXRVR::PanelPointer panelPointer{};
     XrAction padAction=XR_NULL_HANDLE,clickAction=XR_NULL_HANDLE,aimAction=XR_NULL_HANDLE;
     XrAction gripPoseAction=XR_NULL_HANDLE,gripAction=XR_NULL_HANDLE;
@@ -183,6 +189,7 @@ namespace
     XrSpace gripSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
     OpenXRVR::ControllerInput controllerInput{}; // Published with eyeLock.
     VRPhoneInput::Edges phoneEdges{}; // Render-thread input edges survive between simulation ticks.
+    VRPhoneInput::Edges scriptEdges{},contextEdges{};
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -421,6 +428,7 @@ namespace
         for(auto set:{inputActions,gameplayActions,drivingActions,menuActions,systemActions,phoneActions})
             if(set!=XR_NULL_HANDLE) api.destroyActionSet(set);
         gameplayActions=drivingActions=menuActions=systemActions=phoneActions=XR_NULL_HANDLE;
+        scriptMenuInput=false;
         for(auto& action:actions) action=XR_NULL_HANDLE;
         AcquireSRWLockExclusive(&eyeLock);panelPointer={};ReleaseSRWLockExclusive(&eyeLock);
         inputActions=XR_NULL_HANDLE;
@@ -487,7 +495,7 @@ namespace
             !game(Action::MoveEnable,gameplayActions,"move_enable","Enable movement (touch)",boolean,0,"/input/trackpad/touch") ||
             !game(Action::Sprint,gameplayActions,"sprint","Sprint",boolean,0,"/input/trackpad/click") ||
             !game(Action::Jump,gameplayActions,"jump","Jump",boolean,1,"/input/trackpad/click") ||
-            !game(Action::Interact,gameplayActions,"interact","Enter vehicle / interact",boolean,1,"/input/menu/click") ||
+            !game(Action::Interact,gameplayActions,"interact","Enter vehicle",boolean,1,"/input/menu/click") ||
             !game(Action::Fire,gameplayActions,"fire","Fire equipped weapon",scalar,1,"/input/trigger/value") ||
             !game(Action::Support,gameplayActions,"support_weapon","Support weapon",boolean,0,"/input/squeeze/click") ||
             !game(Action::GrabLeft,gameplayActions,"grab_left","Grab with left hand",boolean,0,"/input/squeeze/click") ||
@@ -510,7 +518,7 @@ namespace
             !game(Action::DrivePrevious,drivingActions,"previous_weapon","Previous drive-by weapon",boolean,1,nullptr) ||
             !game(Action::DriveHorn,drivingActions,"horn","Car horn",boolean,1,"/input/trackpad/click") ||
             !game(Action::DrivePhoneOpen,drivingActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
-            !game(Action::Pause,systemActions,"pause","Pause menu (tap)",boolean,0,"/input/menu/click") ||
+            !game(Action::Pause,systemActions,"pause","Pause / skip cutscene (tap)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneOpen,systemActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneDirection,phoneActions,"phone_direction","Phone navigation direction",vector,1,"/input/trackpad") ||
             !game(Action::PhoneClick,phoneActions,"phone_click","Phone navigate / accept",boolean,1,"/input/trackpad/click") ||
@@ -520,6 +528,15 @@ namespace
             !game(Action::PhoneLeft,phoneActions,"phone_left","Phone left",boolean,1,nullptr) ||
             !game(Action::PhoneRight,phoneActions,"phone_right","Phone right",boolean,1,nullptr) ||
             !game(Action::PhoneAccept,phoneActions,"phone_accept","Phone accept",boolean,1,nullptr) ||
+            !game(Action::ContextInteract,gameplayActions,"context_interact","Interact with shops / vendors",boolean,0,"/input/trigger/click") ||
+            !game(Action::ScriptDirection,menuActions,"navigate_direction","Navigation direction",vector,1,"/input/trackpad") ||
+            !game(Action::ScriptClick,menuActions,"navigate_click","Navigate / confirm",boolean,1,"/input/trackpad/click") ||
+            !game(Action::ScriptUp,menuActions,"navigate_up","Navigate up",boolean,1,nullptr) ||
+            !game(Action::ScriptDown,menuActions,"navigate_down","Navigate down",boolean,1,nullptr) ||
+            !game(Action::ScriptLeft,menuActions,"navigate_left","Navigate left",boolean,1,nullptr) ||
+            !game(Action::ScriptRight,menuActions,"navigate_right","Navigate right",boolean,1,nullptr) ||
+            !game(Action::ScriptAccept,menuActions,"confirm","Confirm",boolean,1,nullptr) ||
+            !game(Action::ScriptBack,menuActions,"interaction_back","Back / leave interaction",boolean,1,"/input/menu/click") ||
             !game(Action::Select,menuActions,"select","Select / drag",boolean,-1,"/input/trigger/click") ||
             !game(Action::Back,menuActions,"back","Back",boolean,1,"/input/menu/click")) return false;
         XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -549,8 +566,9 @@ namespace
         if(inputReady && sessionState==XR_SESSION_STATE_FOCUSED)
         {
             const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+            const bool scripted=!menu && scriptMenuInput.load();
             XrActiveActionSet active[]{{inputActions,XR_NULL_PATH},{systemActions,XR_NULL_PATH},
-                {menu ? menuActions : drivingInput.load() ? drivingActions : gameplayActions,XR_NULL_PATH},
+                {(menu || scripted) ? menuActions : drivingInput.load() ? drivingActions : gameplayActions,XR_NULL_PATH},
                 {phoneActions,XR_NULL_PATH}};
             const bool phone=!menu && CPhoneMgr::bDisplayMobile && *CPhoneMgr::bDisplayMobile;
             XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=phone ? 4:3; sync.activeActionSets=active;
@@ -605,6 +623,23 @@ namespace
                     sample.handbrake &= !sample.cycle || std::hypot(direction[0],direction[1])<.35f;
                 }
                 sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
+                sample.contextInteract=!menu && !phone && getBool(Action::ContextInteract);
+                sample.scriptMenuActive=scripted && !phone;
+                if(sample.scriptMenuActive)
+                {
+                    // Reuse the phone's four-way/centre interpretation and edge
+                    // transport for native script menus, without phone ownership.
+                    const auto axis=getVector(Action::ScriptDirection);
+                    auto nav=sample;nav.phoneActive=true;nav.phoneClick=getBool(Action::ScriptClick);
+                    nav.phoneDirection[0]=axis[0];nav.phoneDirection[1]=axis[1];
+                    nav.phoneUp=getBool(Action::ScriptUp);nav.phoneDown=getBool(Action::ScriptDown);
+                    nav.phoneLeft=getBool(Action::ScriptLeft);nav.phoneRight=getBool(Action::ScriptRight);
+                    nav.phoneAccept=getBool(Action::ScriptAccept);
+                    nav.phoneBack=getBool(Action::ScriptBack)||getBool(Action::Back);
+                    const auto keys=VRPhoneInput::Buttons(nav);
+                    sample.scriptUp=keys[0];sample.scriptDown=keys[1];sample.scriptLeft=keys[2];
+                    sample.scriptRight=keys[3];sample.scriptAccept=keys[4];sample.scriptBack=keys[5];
+                }
                 sample.phoneOpen=getBool(Action::PhoneOpen) ||
                     (!menu && drivingInput.load() && getBool(Action::DrivePhoneOpen));sample.phoneActive=phone;
                 if(phone)
@@ -684,6 +719,10 @@ namespace
         sample.sampledAt=GetTickCount64();
         phoneEdges.Sample(VRPhoneInput::Buttons(sample));
         std::copy(phoneEdges.presses.begin(),phoneEdges.presses.end(),sample.phonePresses);
+        scriptEdges.Sample({sample.scriptUp,sample.scriptDown,sample.scriptLeft,sample.scriptRight,sample.scriptAccept,sample.scriptBack});
+        std::copy(scriptEdges.presses.begin(),scriptEdges.presses.end(),sample.scriptPresses);
+        contextEdges.Sample({sample.contextInteract,false,false,false,false,false});
+        sample.contextPresses=contextEdges.presses[0];
         AcquireSRWLockExclusive(&eyeLock); controllerInput=sample; ReleaseSRWLockExclusive(&eyeLock);
     }
 
@@ -1317,6 +1356,15 @@ std::string OpenXRVR::InputStatus()
     for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(input.phonePresses[i]);}
     result+="],\"grab\":["+std::string(input.grab[0] ? "true":"false")+","+(input.grab[1] ? "true":"false")+
         "],\"grabActive\":["+(input.grabActive[0] ? "true":"false")+","+(input.grabActive[1] ? "true":"false")+"]}";
+    result.pop_back();
+    result+=",\"scriptInteraction\":{\"active\":"+std::string(input.scriptMenuActive ? "true":"false")+
+        ",\"context\":"+(input.contextInteract ? "true":"false")+
+        ",\"contextPresses\":"+std::to_string(input.contextPresses)+",\"buttons\":[";
+    const bool scriptButtons[]{input.scriptUp,input.scriptDown,input.scriptLeft,input.scriptRight,input.scriptAccept,input.scriptBack};
+    for(unsigned i=0;i<6;++i){if(i)result+=",";result+=scriptButtons[i] ? "true":"false";}
+    result+="],\"presses\":[";
+    for(unsigned i=0;i<6;++i){if(i)result+=",";result+=std::to_string(input.scriptPresses[i]);}
+    result+="]}}";
     return result;
 }
 
@@ -1379,6 +1427,7 @@ bool OpenXRVR::SetEyeImages(const HANDLE (&shared)[2], unsigned width,unsigned h
 }
 
 void OpenXRVR::SetDriving(bool driving) {drivingInput=driving;}
+void OpenXRVR::SetScriptMenu(bool active) {scriptMenuInput=active;}
 
 bool OpenXRVR::GetPanelPointer(PanelPointer& pointer)
 {

@@ -19,7 +19,11 @@ SteamVR binding files.
 | On foot | Move / enable movement | Left trackpad XY / touch |
 | On foot | Sprint | Hold left trackpad click; outer-edge movement still jogs |
 | On foot | Jump | Right trackpad center click |
-| On foot | Enter vehicle / interact | Right Menu (currently vehicle entry) |
+| On foot | Enter vehicle | Right Menu (currently vehicle entry) |
+| On foot | Interact with shops / vendors | Left trigger click; native pickup/context input |
+| Menus (scripted interactions) | Navigate / confirm | Right trackpad click: four directions, center confirms |
+| Menus (scripted interactions) | Back / leave interaction | Right Menu |
+| Menus (scripted interactions) | Navigate up/down/left/right; Confirm | Independent actions for custom D-pad bindings |
 | On foot | Fire equipped weapon | Right trigger value; existing pistol firing path |
 | On foot | Support weapon | Left grip near the weapon; hold to retain grip |
 | On foot | Activate weapon selection / direction | Right trackpad click / XY; horizontal sides cycle |
@@ -68,3 +72,26 @@ References: [OpenXR action sets](https://registry.khronos.org/OpenXR/specs/1.0/m
 [OpenXR action synchronization](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrSyncActions.html),
 [Valve OpenXR controller bindings](https://partner.steamgames.com/doc/features/steamvr/settings?language=english),
 [IV-SDK control enumeration](https://github.com/Zolika1351/iv-sdk/blob/master/include/ePadControls.h).
+
+## Cutscene and contextual interaction routing
+
+During a loaded, unfinished cutscene, **Pause / skip cutscene (tap)** sends a brief native frontend-confirm input instead of opening pause or the phone. The game retains skip eligibility and mission bookkeeping. The existing Pause binding is unchanged.
+
+SteamVR 2.17.10's tested editor displays internal OpenXR names rather than the
+friendly labels supplied by the application. Bind **`on_foot` →
+`context_interact`** to start native contextual interactions (default left trigger
+click). **`on_foot` → `interact`** is vehicle entry; it does not activate shops or
+vendors. **`menus` → `confirm`** only confirms an interaction already in progress.
+Custom SteamVR bindings need the new actions added manually. The vehicle-entry
+action remains separate.
+
+For right-touchpad directional browsing, bind Position to `navigate_direction`
+and Click to `navigate_click` under `menus`. A direct `confirm` binding always
+confirms; it does not interpret the click position. Alternatively use SteamVR's
+D-pad mode with `navigate_up/down/left/right` and center `confirm`. Both `back`
+and `interaction_back` exit scripted interactions. Save the personal binding
+after editing so a later session uses the updated controls.
+
+A valid propagating script draw camera activates the existing **Menus** action set and retains the native third-person character, including the head. Navigation supplements native frontend controls and raw gamepad queries, independent of keyboard/gamepad selection. Sampled short presses survive between render and simulation ticks. Pause pointer actions are read only during pause; scripted navigation is read only during scripted interactions. Phone routing takes precedence.
+
+The contextual input does not require a first-person camera. Native scripts retain proximity, availability, prices and mission progression. Camera-free menus and service variants still need gameplay acceptance; see GitHub #13 and #15 and `docs/contextual-interactions.md`.

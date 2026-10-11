@@ -94,6 +94,11 @@ namespace
     SafetyHookInline phoneRawPressed{},phoneRawJustPressed{};
     std::atomic<unsigned> phoneRawDown{0},phoneRawRising{0},phoneRawQueries{0},phoneRawMatches{0};
     std::atomic<uint64_t> phoneRawSampledAt{0};
+    std::atomic<bool> scriptCameraActive{false};
+    using ScriptCameraAccessor=void* (__thiscall*)(void*);
+    void* scriptCameraManager=nullptr;
+    ScriptCameraAccessor scriptCameraRoot=nullptr,scriptCameraDraw=nullptr;
+    std::atomic<unsigned> scriptRawDown{0},scriptRawRising{0};
     std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
     std::atomic<bool> firstPersonActive{false};
     bool visibilityAvailable=false;
@@ -588,13 +593,17 @@ namespace
         // semantic CPad controls used in keyboard mode. Keep native input and
         // device ownership intact; supplement only local phone button queries.
         constexpr unsigned ids[]{8,9,10,11,16,17}; // D-pad, A, B
-        if(pad>1 || !CPhoneMgr::bDisplayMobile || !*CPhoneMgr::bDisplayMobile ||
+        const bool phone=CPhoneMgr::bDisplayMobile && *CPhoneMgr::bDisplayMobile;
+        const bool scripted=scriptCameraActive.load() && !phone;
+        if(pad>1 || (!phone && !scripted) ||
             (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) ||
             !OpenXRVR::HasFocusedViews() || GetTickCount64()-phoneRawSampledAt.load()>250) return 0;
         for(unsigned i=0;i<6;++i) if(button==ids[i])
         {
             VRDiagnostics::Increment(phoneRawQueries);
-            const bool pressed=((rising ? phoneRawRising.load():phoneRawDown.load()) & (1u<<i))!=0;
+            const auto mask=scripted ? (rising ? scriptRawRising.load():scriptRawDown.load()) :
+                (rising ? phoneRawRising.load():phoneRawDown.load());
+            const bool pressed=(mask & (1u<<i))!=0;
             if(pressed) VRDiagnostics::Increment(phoneRawMatches);
             return pressed ? 1:0;
         }
@@ -621,7 +630,8 @@ namespace
         // Shared default: a short left Menu press pauses on release; a hold
         // opens the native phone once. Separate semantic bindings still work.
         static bool previousPause=false,leftHeld=false,holdConsumed=false,pauseHeld=false;
-        static uint64_t heldAt=0,phonePulseUntil=0;
+        static uint64_t heldAt=0,phonePulseUntil=0,cutsceneSkipUntil=0;
+        static bool previousCutsceneSkip=false;
         static Ped carPhonePed=0;
         static uint64_t carPhoneStarted=0;
         static bool carPhoneSeen=false;
@@ -629,19 +639,42 @@ namespace
         const auto now=GetTickCount64();
         const bool inputFresh=OpenXRVR::HasFocusedViews() && OpenXRVR::GetControllerInput(input);
         const bool inMenu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+        using Hash=Natives::NativeHashes;
+        const bool inCutscene=!inMenu &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Hash::HAS_CUTSCENE_LOADED)) &&
+            NativeInvoke::GetNativeHandler(std::to_underlying(Hash::HAS_CUTSCENE_FINISHED)) &&
+            Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished();
+        // Native service/menu cameras retain the ordinary third-person rig.
+        // GET_SCRIPT_DRAW_CAM assumes a nonnull script root and crashes in
+        // ordinary gameplay/startup. Use its verified internal accessors with
+        // a null check between them, before any camera-handle conversion.
+        bool scripted=false;
+        if(!inCutscene && scriptCameraManager && scriptCameraRoot && scriptCameraDraw)
+        {
+            auto* root=scriptCameraRoot(scriptCameraManager);
+            // The draw accessor selects a child whose entire parent chain has
+            // native active/propagation bits set (A7C6D0), or returns null.
+            scripted=root && scriptCameraDraw(root)!=nullptr;
+        }
+        scriptCameraActive=scripted;OpenXRVR::SetScriptMenu(scripted);
         const bool down=inputFresh && (input.pause || (!inMenu && input.phoneOpen));
         if(down && !leftHeld) {heldAt=now;holdConsumed=false;pauseHeld=false;}
         if(down && input.pause) pauseHeld=true;
-        const bool directPause=down && !leftHeld && input.pause && (inMenu || !input.phoneOpen);
+        // Feed native Enter/confirm instead of forcibly stopping the scene:
+        // its own skip handler owns skip eligibility and mission bookkeeping.
+        if(inCutscene && down && !leftHeld && input.pause)
+        {cutsceneSkipUntil=now+100;holdConsumed=true;}
+        const bool directPause=!inCutscene && down && !leftHeld && input.pause && (inMenu || !input.phoneOpen);
         // A runtime long-press binding delivers PhoneOpen separately. Execute
         // immediately; only the shared suggested click needs our fallback timer.
-        if(down && !inMenu && input.phoneOpen && !holdConsumed &&
+        if(down && !inMenu && !inCutscene && input.phoneOpen && !holdConsumed &&
             (!input.pause || now-heldAt>=500))
         {holdConsumed=true;phonePulseUntil=now+100;}
-        const bool pause=inputFresh && (directPause || (!down && leftHeld && pauseHeld && !holdConsumed));
+        const bool pause=inputFresh && !inCutscene && (directPause || (!down && leftHeld && pauseHeld && !holdConsumed));
         if(directPause) holdConsumed=true;
         leftHeld=down;
         if(!inputFresh) {holdConsumed=false;pauseHeld=false;phonePulseUntil=0;}
+        if(!inputFresh || !inCutscene) cutsceneSkipUntil=0;
         auto mergeButton=[&](unsigned id,bool pressed,bool wasPressed)
         {
             auto* value=static_cast<unsigned char*>(pad)+0x2698+16*id;
@@ -699,7 +732,33 @@ namespace
         constexpr unsigned phoneIds[]{65,64,66,67,77,78,130,131,132,133,181,182};
         for(unsigned i=0;i<12;++i)
         {mergeButton(phoneIds[i],directions[i%6],previousPhone[i]);previousPhone[i]=directions[i%6];}
+        const bool cutsceneSkip=inCutscene && inputFresh && now<cutsceneSkipUntil;
+        mergeButton(77,cutsceneSkip,previousCutsceneSkip); // INPUT_FRONTEND_ACCEPT
+        previousCutsceneSkip=cutsceneSkip;
+        // Script actions work outside the first-person movement gate. Preserve
+        // native input, prices, task ownership and mission-side bookkeeping.
+        static VRPhoneInput::Pulse contextPulse{},scriptPulses[6]{};
+        static bool previousContext=false,previousScript[6]{};
+        const bool scriptEnabled=inputFresh && !inMenu && !inCutscene && !input.phoneActive &&
+            scripted && input.scriptMenuActive;
+        const bool scriptHeld[]{input.scriptUp,input.scriptDown,input.scriptLeft,input.scriptRight,input.scriptAccept,input.scriptBack};
+        bool scriptButtons[6]{};unsigned scriptDown=0,scriptRising=0;
+        for(unsigned i=0;i<6;++i)
+        {
+            const bool wasDown=scriptPulses[i].down;
+            scriptButtons[i]=scriptPulses[i].Update(input.scriptPresses[i],scriptHeld[i],scriptEnabled,now);
+            if(scriptButtons[i]) scriptDown|=1u<<i;
+            if(scriptButtons[i] && !wasDown) scriptRising|=1u<<i;
+        }
+        scriptRawDown=scriptDown;scriptRawRising=scriptRising;
+        const bool context=contextPulse.Update(input.contextPresses,input.contextInteract,
+            inputFresh && !inMenu && !inCutscene && !input.phoneActive && !input.driving,now) || scriptButtons[5];
+        mergeButton(23,context,previousContext);previousContext=context;
+        constexpr unsigned scriptIds[]{65,64,66,67,77,78};
+        for(unsigned i=0;i<6;++i)
+        {mergeButton(scriptIds[i],scriptButtons[i],previousScript[i]);previousScript[i]=scriptButtons[i];}
         const bool fresh=firstPersonActive && !ragdollView && OpenXRVR::HasFocusedViews() &&
+            !scripted &&
             !(CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) &&
             !(CTimer::ms_bScriptPause && *CTimer::ms_bScriptPause) &&
             OpenXRVR::GetControllerInput(input) && input.gripPoseValid[1];
@@ -1218,7 +1277,9 @@ std::string VRCamera::ControllerMovementStatus()
     for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(phoneDelivered[i].load());}
     return result+"],\"phoneRawInstalled\":"+(phoneRawPressed && phoneRawJustPressed ? "true":"false")+
         ",\"phoneRawQueries\":"+std::to_string(phoneRawQueries.load())+
-        ",\"phoneRawMatches\":"+std::to_string(phoneRawMatches.load())+"}";
+        ",\"phoneRawMatches\":"+std::to_string(phoneRawMatches.load())+
+        ",\"scriptCameraResolved\":"+(scriptCameraRoot && scriptCameraDraw ? "true":"false")+
+        ",\"scriptCameraActive\":"+(scriptCameraActive.load() ? "true":"false")+"}";
 }
 bool VRCamera::RestartAnchorProbe()
 {
@@ -1229,13 +1290,13 @@ bool VRCamera::RestartAnchorProbe()
 
 bool VRCamera::HideLocalCharacter(const void* entity)
 {
-    return firstPersonActive && visibilityAvailable && FindPlayerPed && entity==FindPlayerPed(0) &&
+    return firstPersonActive && !scriptCameraActive && visibilityAvailable && FindPlayerPed && entity==FindPlayerPed(0) &&
         !(showBody && headlessBodyAvailable.load());
 }
 
 bool VRCamera::ShowLocalBody(const void* entity)
 {
-    return firstPersonActive && visibilityAvailable && showBody && headlessBodyAvailable.load() &&
+    return firstPersonActive && !scriptCameraActive && visibilityAvailable && showBody && headlessBodyAvailable.load() &&
         FindPlayerPed && entity==FindPlayerPed(0);
 }
 void VRCamera::SetHeadlessBodyAvailable(bool available) {headlessBodyAvailable=available;}
@@ -1286,6 +1347,33 @@ void VRCamera::Install()
         ini.ReadInteger("VR","ExperimentalControllerButtons",0);
     if(controllerButtons)
     {
+        // CE GET_SCRIPT_DRAW_CAM implementation: static camera manager, root
+        // accessor, draw accessor, then handle-pool conversion. Unknown builds
+        // retain the native camera and do not activate scripted-menu routing.
+        auto camera=hook::pattern("B9 ? ? ? ? E8 ? ? ? ? 8B C8 E8 ? ? ? ? 8B 0D ? ? ? ? 50 E8 ? ? ? ? 8B 4C 24 04 89 01 C2 04 00");
+        void* cameraManager=nullptr;
+        ScriptCameraAccessor cameraRoot=nullptr,cameraDraw=nullptr;
+        unsigned scriptCameraMatches=0;
+        for(size_t i=0;i<camera.size();++i)
+        {
+            auto* code=camera.get(i).get<unsigned char>();
+            auto* root=code+10+*reinterpret_cast<int32_t*>(code+6);
+            auto* draw=code+17+*reinterpret_cast<int32_t*>(code+13);
+            // GET_SCRIPT_DRAW_CAM selects root type 6. The same outer code
+            // also belongs to a type-39 camera native; do not reject the valid
+            // script candidate just because the outer pattern is shared.
+            const unsigned char rootBytes[]{0x8B,0x49,0x04,0x85,0xC9,0x75,0x03,0x33,0xC0,0xC3,0x6A,0x00,0x6A,0x06};
+            const unsigned char drawBytes[]{0x81,0xEC,0xF0,0,0,0,0x8D,0x04,0x24,0x56,0x57,0x50,0x8B,0xF9};
+            if(!std::memcmp(root,rootBytes,sizeof(rootBytes)) && !std::memcmp(draw,drawBytes,sizeof(drawBytes)))
+            {
+                ++scriptCameraMatches;
+                cameraManager=*reinterpret_cast<void**>(code+1);
+                cameraRoot=reinterpret_cast<ScriptCameraAccessor>(root);
+                cameraDraw=reinterpret_cast<ScriptCameraAccessor>(draw);
+            }
+        }
+        if(scriptCameraMatches==1)
+        {scriptCameraManager=cameraManager;scriptCameraRoot=cameraRoot;scriptCameraDraw=cameraDraw;}
         auto update=hook::pattern("83 EC 1C 56 6A 00 6A 01 8B F1 E8 ? ? ? ? 83 C4 04 8B C8 E8 ? ? ? ? 50 E8");
         if(update.size()==1)
         {
@@ -1470,7 +1558,7 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
         Vehicle vehicle=0; bool ducking=false,airborne=false;
         bool animated=false,ragdoll=false,exiting=false;
         VRMath::Matrix vehicleBasis{};
-        const bool useFirstPerson=firstPerson && visibilityAvailable &&
+        const bool useFirstPerson=firstPerson && visibilityAvailable && !scriptCameraActive &&
             GameplayAnchor(anchor,heading,measuredHeight,groundZ,vehicle,ducking,airborne,vehicleBasis,animated,ragdoll,exiting);
         vehicleHudValid=useFirstPerson && vehicle && seatAnchorValid && seatIsCar && !exiting;
         if(vehicleHudValid){vehicleHudAnchor=vehicleBasis;vehicleHudAnchor[3]=anchor;}
