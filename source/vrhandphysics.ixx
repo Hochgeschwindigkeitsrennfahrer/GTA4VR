@@ -43,6 +43,7 @@ export namespace VRHandPhysics
 namespace
 {
     SafetyHookInline pairHook{},queryHook{},rayHook{},overlapHook{},ragdollDeactivateHook{},ragdollSettleHook{};
+    SafetyHookInline carryHoldingHook{},carryObjectHook{},carryWeaponHook{};
     thread_local void* shotOwner=nullptr;
     thread_local void* shotWeapon=nullptr;
     std::atomic<unsigned> excludedShotQueries=0;
@@ -421,6 +422,58 @@ namespace
         return VRGrip::Rigid(pose);
     }
 
+    bool NativeCarryable(void* entity)
+    {
+        // CE A06780 (SET_OBJECT_AS_STEALABLE) owns bit 10. This is the
+        // game's pickup eligibility, rather than a list of prop models.
+        return entity && (*reinterpret_cast<uint32_t*>(static_cast<char*>(entity)+0x210)&0x400)!=0;
+    }
+
+    Object ScriptCarriedObject(Ped ped)
+    {
+        if(!grabbingEnabled || !OpenXRVR::IsSessionRunning() ||
+            !rage::scrThread::s_CurrentThread || !*rage::scrThread::s_CurrentThread) return 0;
+        auto* owner=FindPlayerPed(0);
+        if(!owner || PedEntity(ped)!=owner) return 0;
+        for(unsigned hand=0;hand<2;++hand)
+        {
+            if(!grabbing[hand]) continue;
+            const auto& grab=grabs[hand];
+            auto* entity=Entity(grab.handle);
+            VRMath::Matrix body{};
+            if(entity==grabEntities[hand].load() && NativeCarryable(entity) &&
+                BodyPose(grab.handle,grab.instance,body)) return grab.handle;
+        }
+        return 0;
+    }
+
+    void __cdecl ScriptHoldingObject(scrNativeCallContext* context)
+    {
+        if(context && context->GetArgumentCount()==1 && ScriptCarriedObject(context->GetArgument<Ped>(0)))
+        {context->SetResult<uint32_t>(0,1);return;}
+        carryHoldingHook.unsafe_ccall<void>(context);
+    }
+
+    void __cdecl ScriptHeldObject(scrNativeCallContext* context)
+    {
+        const auto object=context && context->GetArgumentCount()==1 ? ScriptCarriedObject(context->GetArgument<Ped>(0)):0;
+        if(object) {context->SetResult<Object>(0,object);return;}
+        carryObjectHook.unsafe_ccall<void>(context);
+    }
+
+    void __cdecl ScriptCarryWeapon(scrNativeCallContext* context)
+    {
+        // Keep the real inventory/attachment unchanged. Mission scripts use
+        // OBJECT (46) plus IS_PED_HOLDING_AN_OBJECT to recognize a pickup.
+        const auto object=context && context->GetArgumentCount()==2 ? ScriptCarriedObject(context->GetArgument<Ped>(0)):0;
+        carryWeaponHook.unsafe_ccall<void>(context);
+        if(object)
+        {
+            auto* selected=context->GetArgument<uint32_t*>(1);
+            if(selected) *selected=46;
+        }
+    }
+
     bool ReadDoor(Vehicle handle,unsigned index,DoorState& state)
     {
         if(!requestDoor || index>=6) return false;
@@ -576,7 +629,10 @@ namespace
         const uint32_t invalidPair=0xffff;std::memcpy(hit+0x54,&invalidPair,4);
         grabCandidates.assign(1,candidate);selectingGrab=true;
         // CE A535E0 param9=1 invokes the stationary sphere overlap first.
-        const bool found=grabQuery(palm.data(),palm.data(),radius,owner,hit,0x8E,0xffffffff,1,1);
+        // Candidate identity is already restricted in both narrowphase hooks.
+        // Native carryable props use archetype category 0x100, excluded by
+        // the former vehicle/ordinary-prop mask 0x8E (CE765910).
+        const bool found=grabQuery(palm.data(),palm.data(),radius,owner,hit,0xffffffff,0xffffffff,1,1);
         selectingGrab=false;
         return found && *reinterpret_cast<void**>(hit)==candidate;
     }
@@ -925,7 +981,8 @@ namespace
             if(!instance || IsProxy(instance)) continue;
             const auto handle=pool->GetIndex(storage);
             if(!BodyPose(handle,instance,body) || VRMath::Length3(VRMath::Difference3(body[3],palm))>3.f ||
-                !Natives::DoesObjectHavePhysics(handle) || Natives::IsObjectAttached(handle) || Natives::IsObjectStatic(handle)) continue;
+                !Natives::DoesObjectHavePhysics(handle) || Natives::IsObjectAttached(handle) ||
+                (Natives::IsObjectStatic(handle) && !NativeCarryable(entity))) continue;
             float mass=0;Natives::GetObjectMass(handle,&mass);
             if(!std::isfinite(mass) || mass<=0 || !HandOverlap(pose,hand,nearest,[&](const auto& point,float r){return PalmOverlap(point,pose.owner,instance,r);})) continue;
             VRDiagnostics::Increment(grabHits);
@@ -1561,6 +1618,17 @@ void VRHandPhysics::Install()
     if(wantGrabbing)
     {
         grabbingEnabled=grabQuery!=nullptr;
+        auto holding=hook::pattern("68 ? ? ? ? 68 97 18 81 22 E8");
+        auto heldObject=hook::pattern("68 ? ? ? ? 68 38 58 34 45 E8");
+        auto carryWeapon=hook::pattern("68 ? ? ? ? 68 9F 28 B8 5A E8");
+        if(holding.size()==1 && heldObject.size()==1 && carryWeapon.size()==1)
+        {
+            carryHoldingHook=safetyhook::create_inline(*holding.get_first<void*>(1),ScriptHoldingObject);
+            carryObjectHook=safetyhook::create_inline(*heldObject.get_first<void*>(1),ScriptHeldObject);
+            carryWeaponHook=safetyhook::create_inline(*carryWeapon.get_first<void*>(1),ScriptCarryWeapon);
+            if(!carryHoldingHook || !carryObjectHook || !carryWeaponHook)
+            {carryHoldingHook.reset();carryObjectHook.reset();carryWeaponHook.reset();}
+        }
         auto activity=hook::pattern("8B 44 24 04 89 81 B8 07 00 00 A1 ? ? ? ? 89 81 BC 07 00 00 C2 08 00");
         if(activity.size()==1) ragdollActivity=reinterpret_cast<RagdollActivity>(activity.get_first());
         auto permission=hook::pattern("55 8B EC 83 E4 F0 83 EC 48 56 57 E8 ? ? ? ? 84 C0 74 31 8B 7D 08 8B 75 0C 8B 87 6C 02 00 00");
