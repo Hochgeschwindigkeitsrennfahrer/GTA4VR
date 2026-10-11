@@ -42,6 +42,7 @@ export namespace VRStereo
     void Install();
     void Shutdown(); // Render callback thread, never DllMain.
     bool RestartExperiment();
+    bool RequestResolutionCapture();
     bool RequestScopeProbe();
     bool RestartLodProbe();
     bool SetVisibilityTest(bool value);
@@ -114,6 +115,7 @@ namespace
         HANDLE shared[2]{};
         std::vector<ComPtr<IDirect3DVertexShader9>> observedShaders;
         ComPtr<IDirect3DVertexShader9> symmetricRayShader,asymmetricRayShader;
+        ComPtr<IDirect3DVertexShader9> symmetricPostRayShader,asymmetricPostRayShader;
         std::vector<ComPtr<IDirect3DPixelShader9>> observedPixelShaders,cascadeShaders;
     };
     // Explicit render-thread ownership; process detach must not invoke driver
@@ -134,6 +136,7 @@ namespace
     std::atomic<uint64_t> eyeRasterSize{0};
     std::atomic<unsigned> screenParameterGeneration{0};
     bool resolutionCapture=false;
+    std::atomic<bool> resolutionCaptureRequested=false;
     thread_local VRResolution::Size shaderEyeSize{};
 
     bool TransformScreenSize(rage::grmShaderInfo* shader,int index,const void* data,int bytes,float* output)
@@ -1853,14 +1856,28 @@ namespace
     HRESULT WINAPI SetScissor(IDirect3DDevice9* device,const RECT* input)
     {
         D3DSURFACE_DESC native{},eye{};RECT value{};
-        if(input && input->left==0 && input->top==0 && RoutedTargetSize(device,native,eye) &&
-            input->right==LONG(native.Width) && input->bottom==LONG(native.Height))
-        {value={0,0,LONG(eye.Width),LONG(eye.Height)};input=&value;}
+        // Native sky/moon and local-light commands contain partial scissors
+        // projected with the eye camera but rasterized in desktop coordinates.
+        // Mapping only fullscreen bounds leaves those draws clipped elsewhere.
+        if(input && RoutedTargetSize(device,native,eye) &&
+            !(input->left==0 && input->top==0 && input->right==LONG(eye.Width) && input->bottom==LONG(eye.Height)))
+        {
+            value={VRResolution::Boundary(input->left,native.Width,eye.Width,false),
+                VRResolution::Boundary(input->top,native.Height,eye.Height,false),
+                VRResolution::Boundary(input->right,native.Width,eye.Width,true),
+                VRResolution::Boundary(input->bottom,native.Height,eye.Height,true)};
+            input=&value;
+        }
         return setScissor.unsafe_stdcall<HRESULT>(device,input);
     }
 
+    void CaptureResolutionLight(IDirect3DDevice9* device);
+
     HRESULT WINAPI DrawUP(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,UINT primitives,const void* input,UINT stride)
     {
+        // FusionFix AO and other immediate fullscreen passes use DrawUP.
+        // Include their actual sampling inputs in the explicit one-pair capture.
+        CaptureResolutionLight(device);
         D3DSURFACE_DESC native{},eye{};DWORD fvf=0;
         if(input && primitives==2 && (type==D3DPT_TRIANGLESTRIP || type==D3DPT_TRIANGLELIST) && stride>=16 &&
             RoutedTargetSize(device,native,eye) && SUCCEEDED(device->GetFVF(&fvf)) && (fvf&D3DFVF_POSITION_MASK)==D3DFVF_XYZRHW)
@@ -1899,8 +1916,10 @@ namespace
         }
         if(resources && shader==resources->asymmetricRayShader.Get() && shader)
             shader=resources->symmetricRayShader.Get();
-        if(shader && resources && GetCurrentThreadId()==routingThread && renderEye>=0 && renderStage==2 &&
-            !resources->asymmetricRayShader && std::none_of(resources->observedShaders.begin(),
+        if(shader && shader==resources->asymmetricPostRayShader.Get()) shader=resources->symmetricPostRayShader.Get();
+        if(shader && resources && GetCurrentThreadId()==routingThread && renderEye>=0 &&
+            ((renderStage==2 && !resources->asymmetricRayShader) || (renderStage==3 && !resources->asymmetricPostRayShader)) &&
+            std::none_of(resources->observedShaders.begin(),
                 resources->observedShaders.end(),[shader](const auto& value){return value.Get()==shader;}))
         {
             resources->observedShaders.emplace_back(shader);
@@ -1919,6 +1938,29 @@ namespace
                     std::string text(static_cast<const char*>(assembly->GetBufferPointer()),
                         std::min<size_t>(assembly->GetBufferSize(),16000));
                     Log(text.c_str());
+                    constexpr char postRay[]="mul r0.xy, v0, c77.zwww";
+                    const auto postAt=text.find(postRay);
+                    // Verified final-scene VS: clip position/UV pass through;
+                    // only the world ray used by depth-based fog is changed.
+                    // c209 is unused by this six-instruction native shader.
+                    if(renderStage==3 && postAt!=std::string::npos &&
+                        text.find(postRay,postAt+1)==std::string::npos &&
+                        text.find("mad o0, v0.xyzx, c0.xxxy, c0.yyyx")!=std::string::npos &&
+                        text.find("mov o1.xy, v1")!=std::string::npos &&
+                        text.find("mad r0.xyz, -r0.x, c12, r0.yzww")!=std::string::npos &&
+                        text.find("add o2.xyz, r0, c14")!=std::string::npos &&
+                        text.find("approximately 6 instruction slots")!=std::string::npos &&
+                        text.find("c209")==std::string::npos)
+                    {
+                        auto corrected=text;
+                        corrected.replace(postAt,sizeof(postRay)-1,"mad r0.xy, v0, c209.xyxy, c209.zwzw");
+                        ComPtr<ID3DXBuffer> patched,errors;
+                        if(Check("asymmetric post-process ray assembly",D3DXAssembleShader(corrected.data(),
+                            static_cast<UINT>(corrected.size()),nullptr,nullptr,0,&patched,&errors)) &&
+                            Check("asymmetric post-process ray shader",self->CreateVertexShader(
+                                static_cast<DWORD*>(patched->GetBufferPointer()),&resources->asymmetricPostRayShader)))
+                        {resources->symmetricPostRayShader=shader;Log("Verified post-process ray shader corrected for asymmetric eye projection");}
+                    }
                     constexpr char symmetric[]="mul r0.xy, r0, c209";
                     const auto at=text.find(symmetric);
                     // Verified fullscreen deferred-lighting VS0. Keep its
@@ -1941,12 +1983,13 @@ namespace
                 }
             }
         }
-        if(resources && renderEye>=0 && renderStage==2 && GetCurrentThreadId()==routingThread &&
-            shader && shader==resources->symmetricRayShader.Get() && resources->asymmetricRayShader &&
+        const bool lightingRay=renderStage==2 && shader && shader==resources->symmetricRayShader.Get() && resources->asymmetricRayShader;
+        const bool postRay=renderStage==3 && shader && shader==resources->symmetricPostRayShader.Get() && resources->asymmetricPostRayShader;
+        if(resources && renderEye>=0 && GetCurrentThreadId()==routingThread && (lightingRay || postRay) &&
             SUCCEEDED(self->GetVertexShaderConstantF(209,originalRayConstants,1)))
         {
             setVertexConstants.unsafe_stdcall<HRESULT>(self,209,eyeRayConstants,1);
-            shader=resources->asymmetricRayShader.Get();
+            shader=postRay ? resources->asymmetricPostRayShader.Get():resources->asymmetricRayShader.Get();
             rayShaderBound=true;
         }
         return ObserveStateCall(VRProfile::StateKind::VertexShader,[&](){return setVertexShader.unsafe_stdcall<HRESULT>(self,shader);});
@@ -2108,10 +2151,13 @@ namespace
         fclose(file);
     }
 
+    void CaptureResolutionLight(IDirect3DDevice9* device);
+
     HRESULT WINAPI DrawIndexedPrimitive(IDirect3DDevice9* device,D3DPRIMITIVETYPE type,
         INT base,UINT minimum,UINT vertices,UINT start,UINT primitives)
     {
         FlushBinderConstants();
+        CaptureResolutionLight(device);
         if(liveMeshPackets && OnRoutingThread() && renderEye>=0 && renderStage==1 && liveMeshPackets->Observing())
         {
             bool queued=false;
@@ -2147,18 +2193,36 @@ namespace
     }
 
     unsigned resolutionLightDraws[2]{};
+    std::vector<std::pair<IDirect3DVertexShader9*,IDirect3DPixelShader9*>> resolutionSceneShaders[2][3];
     void CaptureResolutionLight(IDirect3DDevice9* device)
     {
-        if(!resolutionCapture || captured || renderEye<0 || renderEye>1 || renderStage!=2 || !resources || resolutionLightDraws[renderEye]>=64) return;
-        const unsigned index=resolutionLightDraws[renderEye]++;
+        if(!resolutionCapture || captured || renderEye<0 || renderEye>1 || renderStage<1 || renderStage>3 || !resources) return;
+        ComPtr<IDirect3DVertexShader9> vs;ComPtr<IDirect3DPixelShader9> ps;
+        device->GetVertexShader(&vs);device->GetPixelShader(&ps);
+        auto& shaders=resolutionSceneShaders[renderEye][renderStage-1];
+        const auto key=std::pair{vs.Get(),ps.Get()};
+        if(shaders.size()>=64 || std::find(shaders.begin(),shaders.end(),key)!=shaders.end()) return;
+        const unsigned index=unsigned(shaders.size());shaders.push_back(key);
+        if(renderStage==2) ++resolutionLightDraws[renderEye];
         wchar_t root[MAX_PATH]{};GetModuleFileNameW(nullptr,root,MAX_PATH);
         if(auto* last=wcsrchr(root,L'\\')) last[1]=0;
-        wchar_t path[MAX_PATH]{};swprintf_s(path,L"%splugins\\GTAIV.VR.resolution-light-eye%d-%u.txt",root,renderEye,index);
+        wchar_t path[MAX_PATH]{};swprintf_s(path,L"%splugins\\GTAIV.VR.resolution-stage%u-eye%d-%u.txt",root,renderStage,renderEye,index);
         FILE* file=nullptr;_wfopen_s(&file,path,L"wb");if(!file)return;
         D3DVIEWPORT9 viewport{};device->GetViewport(&viewport);
         fprintf(file,"viewport %u %u %u %u\n",viewport.X,viewport.Y,viewport.Width,viewport.Height);
-        ComPtr<IDirect3DVertexShader9> vs;ComPtr<IDirect3DPixelShader9> ps;
-        device->GetVertexShader(&vs);device->GetPixelShader(&ps);
+        RECT scissor{};DWORD scissorEnabled=0;
+        device->GetScissorRect(&scissor);device->GetRenderState(D3DRS_SCISSORTESTENABLE,&scissorEnabled);
+        fprintf(file,"scissor %lu %ld %ld %ld %ld\n",scissorEnabled,scissor.left,scissor.top,scissor.right,scissor.bottom);
+        fprintf(file,"viewport-depth %.9g %.9g\n",viewport.MinZ,viewport.MaxZ);
+        for(auto state:{D3DRS_ZENABLE,D3DRS_ZWRITEENABLE,D3DRS_ZFUNC,D3DRS_CULLMODE,D3DRS_CLIPPLANEENABLE})
+        {DWORD value=0;if(SUCCEEDED(device->GetRenderState(state,&value)))
+            fprintf(file,"render-state %u %08lX\n",unsigned(state),value);}
+        fprintf(file,"stage %u vertex %p pixel %p\n",renderStage,vs.Get(),ps.Get());
+        fprintf(file,"expected-ray %.9g %.9g %.9g %.9g\n",eyeRayConstants[0],eyeRayConstants[1],eyeRayConstants[2],eyeRayConstants[3]);
+        for(unsigned slot=0;slot<4;++slot)
+        {ComPtr<IDirect3DSurface9> surface;D3DSURFACE_DESC desc{};
+            if(SUCCEEDED(device->GetRenderTarget(slot,&surface)) && surface && SUCCEEDED(surface->GetDesc(&desc)))
+                fprintf(file,"target %u %p %u %u %u\n",slot,surface.Get(),desc.Width,desc.Height,unsigned(desc.Format));}
         const auto shader=[&](auto* value)
         {
             UINT bytes=0;if(!value || FAILED(value->GetFunction(nullptr,&bytes)))return;
@@ -2194,7 +2258,7 @@ namespace
                     fprintf(file,"texture%u %s %s %u %u\n",slot,target.name.c_str(),texture==target.original ? "native":"eye",desc.Width,desc.Height);}
         }
         fclose(file);
-        if(renderEye || index>=4) return; // Read back only four diagnostic thumbnails.
+        if(renderStage!=2 || renderEye || index>=4) return; // Read back only four diagnostic thumbnails.
         ComPtr<IDirect3DSurface9> target,surface;ComPtr<IDirect3DTexture9> thumbnail;
         D3DSURFACE_DESC desc{};device->GetRenderTarget(0,&target);
         if(target && SUCCEEDED(target->GetDesc(&desc)) &&
@@ -2359,6 +2423,7 @@ namespace
     void Rebind(IDirect3DDevice9* device,int eye)
     {
         D3DVIEWPORT9 previousViewport{};device->GetViewport(&previousViewport);
+        RECT previousScissor{};const bool haveScissor=SUCCEEDED(device->GetScissorRect(&previousScissor));
         ComPtr<IDirect3DSurface9> previousTarget;device->GetRenderTarget(0,&previousTarget);
         D3DSURFACE_DESC previousSize{};if(previousTarget) previousTarget->GetDesc(&previousSize);
         ComPtr<IDirect3DSurface9> previousTargets[4],previousDepth;
@@ -2394,6 +2459,14 @@ namespace
             previousViewport.Width=VRResolution::Relative(previousViewport.Width,previousSize.Width,nextSize.Width);
             previousViewport.Height=VRResolution::Relative(previousViewport.Height,previousSize.Height,nextSize.Height);
             setViewport.unsafe_stdcall<HRESULT>(device,&previousViewport);
+            if(haveScissor)
+            {
+                const RECT resized{VRResolution::Boundary(previousScissor.left,previousSize.Width,nextSize.Width,false),
+                    VRResolution::Boundary(previousScissor.top,previousSize.Height,nextSize.Height,false),
+                    VRResolution::Boundary(previousScissor.right,previousSize.Width,nextSize.Width,true),
+                    VRResolution::Boundary(previousScissor.bottom,previousSize.Height,nextSize.Height,true)};
+                setScissor.unsafe_stdcall<HRESULT>(device,&resized);
+            }
         }
         if(resources)
         {
@@ -2687,11 +2760,13 @@ namespace
             if(begin && stage==1) commandStart[eye]=VRProfile::Begin();
             if(stage==1 && begin) GPUTime(device,eye,true);
             if(stage==3 && !begin) GPUTime(device,eye,false);
+            if(begin && stage==1 && eye==0 && resolutionCaptureRequested.exchange(false)) resolutionCapture=true;
             if(begin && stage==1 && eye==0 && captureNextPair.exchange(false))
             {captured=false; lightingProbeMask=0;resolutionLightDraws[0]=resolutionLightDraws[1]=0;}
             if(begin && stage==1 && eye==0 && !captured)
             {for(auto& keys:normalProbeKeys) keys.clear(); normalProbeShaders.clear();
-             bodyMaterialCaptures[0]=bodyMaterialCaptures[1]=0;}
+             bodyMaterialCaptures[0]=bodyMaterialCaptures[1]=0;
+             for(auto& eyeShaders:resolutionSceneShaders) for(auto& shaders:eyeShaders) shaders.clear();}
             normalProbeActive=begin && stage==1 && !captured;
             constantProbeActive=begin && stage>=1 && stage<=3 && VRProfile::ConstantObservationEnabled();
             routingProbeActive=begin && stage>=1 && stage<=3 && phaseStart[eye][stage-1].epoch!=0;
@@ -4042,6 +4117,7 @@ void VRStereo::Shutdown()
     VRHud::Reset();
     scopeActive=buildingScope=false;scopeCompletedFrame=~0u;scopeConfigRevision=~0u;
     scopeProbeRequested=false;scopeCaptureRequested=false;scopeProbeFrames=0;
+    resolutionCaptureRequested=false;
     scopeLensShader.Reset();scopeLensVertexShader.Reset();delete scopeResources;scopeResources=nullptr;mainResources=nullptr;
     cpuOmitRequested=99;cpuOmitMode=0;cpuOmitDeadline=0;cpuOmitHook.reset();
     liveMeshRequested=0;liveMeshMode=0;liveMeshPackets.reset();liveMeshRenderer=VRRigidInstance::Renderer{};liveMeshClear.reset();RemoveLiveMeshResourceHooks();
@@ -4217,6 +4293,12 @@ bool VRStereo::RequestScopeProbe()
 {
     if(!ready || !enabled) return false;
     scopeCaptureRequested=true;scopeProbeRequested=true;return true;
+}
+
+bool VRStereo::RequestResolutionCapture()
+{
+    if(!ready || !enabled) return false;
+    resolutionCaptureRequested=true;restartRequested=true;return true;
 }
 
 std::string VRStereo::Status()

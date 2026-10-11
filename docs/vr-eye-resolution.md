@@ -175,3 +175,166 @@ the user stopped the investigation. ProbeEyeResolution is restored to 0 in
 the installed INI for the next launch. Independent sizing and accepted shadow
 correction remain active; flat-screen regression remains pending. See GitHub
 issue #2 for the deferred limitation.
+
+## Persistent shading investigation (2026-10-11)
+
+The user reports the defect throughout gameplay, including the moon and mirror
+reflections, without requiring a desktop resolution change. This supersedes
+the reset-only interpretation. Investigation resumes under [issue #2](https://github.com/bordplate/GTA4VR/issues/2);
+performance work remains deferred.
+
+The explicit bridge command `resolution-capture` records one stereo pair's
+shader/constants, viewport, target and sampled texture dimensions across all
+three main eye stages. It records up to 64 unique vertex/pixel shader pairs
+per stage/eye, includes indexed draws, and reuses the existing bounded body
+capture. It does not enable continuous diagnostic logging or counters.
+Raw output stays outside Git. No Computer Use or location restore is needed.
+
+Release E2175437C2C564C655F2A0FEEBA7FE7BD5E96534598FF737A84ACF8FEC5E7885
+captured 33 geometry, 6 lighting and 43 final-scene records across both eyes
+in the normal spawn scene. A final-scene smoothing shader sampled
+`FullScreenCopy` at 1974x2192 while PS c76 remained
+`(1/2560, 1/1440, 0, 0)`. Its instructions use c76.xy for neighbouring
+color/depth samples. The previous screen-size matcher only recognized inverse
+dimensions in zw. The correction also routes the verified inverse-xy/zero-zw
+encoding and restores it at the native phase boundary. Packed constants
+such as c220 `(1/2560, 1/1024, 1.3333, -0.3333)` remain unchanged.
+
+Focused math checks cover forward conversion, restoration and preservation of
+unrelated packed constants. This is a verified texel-size mismatch, not proof that it
+causes all reported shading, moon or mirror defects. The tracked mirror shader
+uses projected coordinates and no screen-size parameter; it may need separate
+projection/texture-generation investigation. Headset acceptance is pending.
+
+Corrected Release 3FC2D60E0487A86CE2BBA8193C65163EA0FDF9189B6B238A6E0CE70C84AF7981
+built and deployed with ASI/INI backup; installed INI was preserved. PID31564
+reported focused OpenXR and continuous stereo. A fresh explicit capture reads
+PS c76 `(1/1974, 1/2192, 0, 0)` in both identified final-scene consumers.
+Focused forward/restoration/packed-constant preservation tests passed. This confirms the
+specific shader input correction in runtime; visible defect acceptance and
+flat-screen regression remain pending. No performance improvement is claimed.
+
+The user reports possible partial improvement from inverse-xy correction, with
+remaining smooth shading sliding across walls/floors during head movement.
+The captured final-scene fog VS still reconstructs depth rays symmetrically:
+`mul r0.xy, v0, c77.zwww`, with c77.zw `(1.27877092, 1.42167366)`.
+Its fog PS combines that ray with eye depth to reconstruct world height and
+atmospheric scattering. Main eye geometry uses the asymmetric runtime FOV,
+so these ray slopes omit each eye's projection offset.
+
+The verified six-instruction VS is cloned with only that multiply changed to
+`mad r0.xy, v0, c209.xyxy, c209.zwzw`. c209 is unused by the native VS and is
+supplied with half tangent spans and half tangent sums for the active eye,
+then restored when switching shader/phase. Native clip position, texture UVs
+and camera basis remain intact. This extends the deferred-lighting ray
+correction to the final-scene fog path; it does not patch arbitrary shaders.
+Release 1072BF4B215EDD11BB41A3D93E4CD66D9AB14B28686C2AEB97E0EC192BF1A61A
+built successfully (existing updater PDB warning only) and was deployed after
+normal bridge shutdown, with ASI/INI backup and no automatic location restore.
+Live shader input and visual acceptance checks follow.
+
+Runtime PID26072 reports focused continuous DXVK-Vulkan stereo at 1974x2192.
+The explicit post-correction capture confirms the patched MAD and c209 match
+expected eye rays in both eyes: left `(1.27877092, 1.42167366,
+-0.0680714846, 0.00277125835)`, right `(1.28085423, 1.42296398,
+0.0687324405, 0.00235509872)`. Raw records are in ignored
+`build/shading-ray-after`. Headset acceptance is requested; moon/mirror and
+flat-screen regression remain unverified. No performance claim is made.
+
+User follow-up rejects fog correction as the remaining defect fix: the reported
+problem started with independent eye sizing. Treat the fog patch as a separate
+projection correction, without claiming acceptance of the target issue.
+
+The earlier "shadow-atlas c220" interpretation was too confident. Captured
+directional and forward shaders read only c220.zw in a clamped blend; neither
+reads c220.xy containing inverse2560/inverse1024. Thus those numerical matches
+do not establish desktop-size shadow sampling. Keep that packed register
+unchanged; investigate actual shadow/reflection sampling separately.
+
+The initial all-stage capture missed DrawPrimitiveUP, used by FusionFix's
+ambient-occlusion and immediate postfx passes. Explicit resolution capture now
+includes that call as well, using the same bounded shader-pair inventory.
+Release 5DADE2CBCAE8C6918BCD607A4DA5B55CFF23CC9CB0BBC6C7D34667F291F5683D
+built and deployed with backup; installed settings preserved. No behavior
+change beyond the explicit capture is claimed for this build.
+
+Immediate-pass capture at PID36572 found AO rendering into 1974x2192 with
+projection coefficients derived from desktop2560x1440. ComputeAO PS c6.xy
+was `(-0.000999039738,-0.00197454682)`, while the eye projection requires
+`(-2*1.27877092/1974,-2*1.42167366/2192)`. Its inverse-size c3 was already
+routed, creating an internally inconsistent reconstruction. Minification
+preshader c2 retained `(2559,1439)`; horizontal blur c6.x was 2/2560 and
+vertical c6.y was 2/1440. These are verified desktop-dependent consumers,
+not just numerical resemblance in an unused register.
+
+RenderAmbientOcclusion now derives its raster dimensions from the device's
+actual saved viewport rather than RAGE's execution-time mWidth/mHeight.
+This supplies consistent full-screen vertices, inverse size, projection
+coefficients/scale, mip bounds and blur offsets. Mip dimensions clamp to one
+pixel for valid texture levels. It retains the current camera projection,
+near/far, AO settings, and native texture identities for existing routing.
+Release E73CE72963BA776485F04925E95832DABBE06A203279D069D4CA8A99392143DB
+built successfully and was deployed with ASI/INI backup. Runtime readback and
+headset acceptance follow; this mismatch can explain depth-dependent sliding
+shading but is not yet proven to explain moon/mirror symptoms.
+
+Post-correction explicit capture verifies AO c6.xy now
+`(-0.00129561382,-0.00129714748)` in the left eye, equal to its actual
+projection slopes divided by1974x2192. Minification bounds are `(1973,2191)`
+and horizontal blur c6.x is2/1974. Runtime remains focused/continuous.
+Headset acceptance is requested; no visual resolution or performance gain is
+claimed until that check. Shared AO implementation also needs flat-screen
+regression before issue closure.
+
+User accepts the AO correction: sliding wall/floor shading is now fixed.
+The moon remains unresolved, so the graphics issue stays open. The held-sky
+capture includes the moon-capable atmos/clouds shader. PS c44 already reads
+1974x2192 with correct inverse dimensions; its only screen-size use controls
+an aspect-conditioned fog branch, disabled by captured c210.y=0. Moon UVs
+come from normalized sky direction and PS c85/86/87, not screen coordinates.
+The captured final eye image shows starfield but no visible moon. Asked for
+its observed symptom and a visible view before claiming a cause or changing
+moon projection. Current settings/location preserved; no Computer Use.
+
+### Moon clipping after independent eye sizing (2026-10-11)
+
+The user reports the moon appearing only at the edge of the headset view and
+confirms it worked before independent sizing. Release clipping capture
+`66CDB347177532739213DA05FB96DF0542E2C7CF37A185169A8B13FA250C41C2`
+on CE1.2.0.59 / SteamVR2.17.10 / DXVK-Vulkan / Vive Pro records the actual
+moon-capable atmosphere draw with scissor testing enabled. Left-eye viewport
+and target are1974x2192, but its scissor is `(1212,793)-(1510,951)`.
+The right eye similarly retains `(1076,793)-(1373,950)`. Depth range is0-1,
+ZFUNC is LESSEQUAL, and user clip planes are disabled.
+
+Projecting captured PS MoonPosition through the sky VS matrices places its
+left-eye center near `(1052,1322)`. Using desktop2560x1440 instead gives
+approximately `(1365,868)`, inside the captured rectangle. This identifies
+a desktop-coordinate scissor, rather than a wrong moon screen-size constant.
+The previous SetScissor hook resized only complete fullscreen rectangles.
+
+SetScissor now scales partial native rectangles to the bound eye target as
+well, rounding lower bounds down and upper bounds up. Existing full eye
+rectangles and compositor calls are preserved. Rebind also converts the
+existing device scissor when switching between differently sized native/eye
+targets, keeping restored native state consistent. Focused deterministic
+tests cover the captured rectangle, fullscreen bounds, and outward rounding.
+They pass; runtime capture and headset acceptance follow. No moon fix or
+performance gain is claimed before those checks. No Ghidra project changes
+were required: evidence is shader bytecode, constants and actual D3D state.
+
+Release `53773E66C1D642E7D1687177F13AF3D577C745B9682F1ED09BBC7C00B1522C5B`
+built successfully (existing updater PDB warnings only), passed the focused
+eye-resolution math checks, and was deployed with ASI/INI backup and normal
+bridge shutdown. Installed tuning is preserved. Launcher startup was retried
+through Steam when PlayGTAIV exited without a live GTAIV process; no player
+location restore is performed. Runtime acceptance remains pending.
+
+After-capture at PID11408 confirms partial eye scissors now scale with the
+eye raster: left `(934,1207)-(1164,1448)`, right
+`(828,1205)-(1058,1447)` on1974x2192 targets. Slight differences from the
+earlier bounds reflect the current view. Raw records remain ignored under
+`build/moon-scissor-after`. The user confirms the moon now works normally
+when turning the head. AO and moon regressions are accepted fixed; mirror
+behavior and shared flat-screen regression remain unverified. Issue#2 stays
+open for its broader outstanding rendering/performance work.

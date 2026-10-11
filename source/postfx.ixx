@@ -1558,8 +1558,12 @@ private:
                 IDirect3DSurface9* aoSurf = PostFxResources.AOSurf;
                 IDirect3DSurface9* aoBlurSurf = PostFxResources.AOBlurSurf;
 
-                float width = float(currGrcViewport->mWidth);
-                float height = float(currGrcViewport->mHeight);
+                // The device viewport is already routed to the current eye.
+                // RAGE's execution-time viewport can retain desktop dimensions;
+                // using it here mixes eye depth with desktop reconstruction,
+                // mip bounds and blur offsets. Use the actual raster footprint.
+                float width = float(oldViewport.Width);
+                float height = float(oldViewport.Height);
 
                 D3DVIEWPORT9 vp = {};
                 vp.MaxZ = 1.0;
@@ -1595,10 +1599,10 @@ private:
                 effect->BeginPass(1);
                 for (auto i = 1; i < PostFxResources.nAmbientOcclusionMaxMipLevel; ++i)
                 {
-                    float prevMipDimensions[] = { float((int)width >> (i - 1)), float((int)height >> (i - 1)) };
+                    float prevMipDimensions[] = { float(std::max(1, (int)width >> (i - 1))), float(std::max(1, (int)height >> (i - 1))) };
                     float prevMipTexel[] = { float(1.0f / prevMipDimensions[0]), float(1.0f / prevMipDimensions[1]) };
-                    float curMipWidth = float(int(width) >> i);
-                    float curMipHeight = float(int(height) >> i);
+                    float curMipWidth = float(std::max(1, int(width) >> i));
+                    float curMipHeight = float(std::max(1, int(height) >> i));
 
                     effect->SetFloatArray(h.vec2PrevMipSize, prevMipDimensions, 2);
                     effect->SetFloatArray(h.vec2PrevMipTexel, prevMipTexel, 2);

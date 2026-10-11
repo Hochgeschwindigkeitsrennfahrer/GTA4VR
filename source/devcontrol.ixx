@@ -422,6 +422,11 @@ namespace
             response=VRStereo::RestartExperiment() ? "{\"ok\":true,\"command\":\"stereo-test\",\"accepted\":true}" :
                 "{\"ok\":false,\"error\":\"experimental stereo not ready\"}";
         }
+        else if(command=="resolution-capture")
+        {
+            response=VRStereo::RequestResolutionCapture() ? "{\"ok\":true,\"accepted\":true}" :
+                "{\"ok\":false,\"error\":\"stereo renderer not ready\"}";
+        }
         else if(command=="scope-probe")
         {
             response=VRStereo::RequestScopeProbe() ? "{\"ok\":true,\"accepted\":true}" :
