@@ -23,6 +23,7 @@ export namespace VRHands
     void PublishTrackingTransform(const VRMath::Matrix& trackingToWorld,void* owner,bool active,bool seated=false);
     bool WheelSteering(float& steering);
     bool DrivingWeaponActive();
+    bool ExecutionInteractionActive();
     bool HideDrivingWeapon(void* entity);
     void PrepareObjectRender(void* entity);
     void ConsumeRoomMotion(void* owner,const VRMath::Vector& consumed);
@@ -834,6 +835,77 @@ namespace
         }
     }
 
+    // Native execution eligibility is script-owned. Retain generation-checked
+    // handles, never a ped pointer across updates or mission cleanup.
+    SafetyHookInline executionReadyHook{},executionAimHook{},executionTargetHook{};
+    Ped executionPeds[16]{};
+    std::atomic<bool> executionInteraction=false;
+    std::atomic<unsigned> executionRequests=0;
+
+    void* ExecutionPed(Ped handle)
+    {
+        auto* pool=CPed::GetPedPool();const int slot=handle>>8;
+        if(!pool || !handle || slot<0 || slot>=pool->GetSize() || !pool->m_aStorage || !pool->m_aFlags ||
+            pool->m_nStorageSize<4 || pool->m_nStorageSize>16384) return nullptr;
+        auto* storage=pool->GetAt(handle);
+        return storage && pool->m_nStorageSize==4 ? *reinterpret_cast<void**>(storage):storage;
+    }
+
+    void __cdecl ExecutionReady(scrNativeCallContext* context)
+    {
+        executionReadyHook.unsafe_ccall<void>(context);
+        if(!context || context->GetArgumentCount()!=2) return;
+        const auto ped=context->GetArgument<Ped>(0);
+        const bool ready=context->GetArgument<int>(1)!=0;
+        for(auto& candidate:executionPeds) if(candidate==ped)
+        {if(!ready) candidate=0;return;}
+        if(ready && ped) for(auto& candidate:executionPeds) if(!candidate)
+        {candidate=ped;return;}
+    }
+
+    bool PhysicalExecutionAim(Ped ped)
+    {
+        return executionInteraction && aimRaised && aimHasTarget && aimSampleAt &&
+            GetTickCount64()-aimSampleAt<=100 && aimCandidate &&
+            ExecutionPed(ped)==aimCandidate &&
+            std::find(std::begin(executionPeds),std::end(executionPeds),ped)!=std::end(executionPeds);
+    }
+
+    void __cdecl ExecutionAim(scrNativeCallContext* context)
+    {
+        executionAimHook.unsafe_ccall<void>(context);
+        if(context && context->GetArgumentCount()==2 &&
+            context->GetArgument<Player>(0)==Natives::GetPlayerId() && PhysicalExecutionAim(context->GetArgument<Ped>(1)))
+            context->SetResult<uint32_t>(0,1);
+    }
+    void __cdecl ExecutionTarget(scrNativeCallContext* context)
+    {
+        executionTargetHook.unsafe_ccall<void>(context);
+        if(context && context->GetArgumentCount()==2 &&
+            context->GetArgument<Player>(0)==Natives::GetPlayerId() && PhysicalExecutionAim(context->GetArgument<Ped>(1)))
+            context->SetResult<uint32_t>(0,1);
+    }
+
+    void UpdateExecutionInteraction()
+    {
+        executionInteraction=false;
+        if(!executionReadyHook || !executionAimHook || !executionTargetHook || !aimTarget ||
+            !OpenXRVR::HasFocusedViews() || Natives::IsPauseMenuActive()) return;
+        const auto player=Natives::GetPlayerId();Ped owner=0;
+        Natives::GetPlayerChar(player,&owner);
+        if(!owner || !Natives::DoesCharExist(owner) || Natives::IsCharInjured(owner) ||
+            Natives::IsCharInAnyCar(owner) || !Natives::IsPlayerControlOn(player)) return;
+        Vector3 position{};Natives::GetCharCoordinates(owner,&position.fX,&position.fY,&position.fZ);
+        for(auto& ped:executionPeds) if(ped)
+        {
+            if(!ExecutionPed(ped) || !Natives::DoesCharExist(ped) || Natives::IsCharInjured(ped) ||
+                !Natives::GetCharReadyToBeExecuted(ped)) {ped=0;continue;}
+            Vector3 target{};Natives::GetCharCoordinates(ped,&target.fX,&target.fY,&target.fZ);
+            const float x=target.fX-position.fX,y=target.fY-position.fY,z=target.fZ-position.fZ;
+            if(x*x+y*y+z*z<=64.f) executionInteraction=true;
+        }
+    }
+
     void ProcessPistolTrigger()
     {
         // Semiautomatic guns/RPG: one request per squeeze. Automatics: hold; native Fire limits cadence. No pad
@@ -863,6 +935,17 @@ namespace
             VRHands::PrepareObjectRender(entity);
         }
         if(!VRReloadRuntime::CanFire(owner,weapon)) {if(first) VRReloadRuntime::EmptyTrigger(owner,weapon);return;}
+        if(first && (type==7 || type==9)) for(const auto ped:executionPeds)
+            if(ped && PhysicalExecutionAim(ped) && Natives::GetCharReadyToBeExecuted(ped))
+            {
+                // roman7's execution helper consumes this native flag, clears
+                // readiness and starts its own finish sequence. Do not start
+                // the vanilla aiming/combat task or kill the protected actor
+                // ahead of the mission's animation and cleanup.
+                Natives::SetCharMeleeActionFlag0(ped,true);
+                ++executionRequests;
+                return;
+            }
         auto* gun=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!gun) return;
         alignas(16) VRMath::Vector muzzle{0,0,0,1},end{0,0,0,1};
@@ -1835,6 +1918,7 @@ bool VRHands::WheelSteering(float& steering)
 }
 
 bool VRHands::DrivingWeaponActive() {return drivingWeaponActive.load() && OpenXRVR::HasFocusedViews();}
+bool VRHands::ExecutionInteractionActive() {return executionInteraction.load() && OpenXRVR::HasFocusedViews();}
 bool VRHands::HideDrivingWeapon(void* entity)
 {
     if(!entity || !drivingHolstered.load() || !OpenXRVR::HasFocusedViews()) return false;
@@ -2185,6 +2269,18 @@ void VRHands::Install()
                 aimRaiseBelowHead=ini.ReadFloat("VR","PistolAimRaiseBelowHead",.40f);
                 if(!std::isfinite(aimRaiseBelowHead)) aimRaiseBelowHead=.40f;
                 aimRaiseBelowHead=std::clamp(aimRaiseBelowHead,.15f,1.f);
+                auto executionReady=hook::pattern("68 ? ? ? ? 68 6A 60 58 5F E8");
+                auto executionAim=hook::pattern("68 ? ? ? ? 68 B4 27 D4 30 E8");
+                auto executionTarget=hook::pattern("68 ? ? ? ? 68 7C 45 A6 58 E8");
+                if(executionReady.size()==1 && executionAim.size()==1 && executionTarget.size()==1)
+                {
+                    executionReadyHook=safetyhook::create_inline(*executionReady.get_first<void*>(1),ExecutionReady);
+                    executionAimHook=safetyhook::create_inline(*executionAim.get_first<void*>(1),ExecutionAim);
+                    executionTargetHook=safetyhook::create_inline(*executionTarget.get_first<void*>(1),ExecutionTarget);
+                    if(!executionReadyHook || !executionAimHook || !executionTargetHook)
+                    {executionReadyHook.reset();executionAimHook.reset();executionTargetHook.reset();}
+                    else FusionFix::onGameProcessEvent() += UpdateExecutionInteraction;
+                }
                 FusionFix::onGameProcessEvent() += ProcessPistolThreat;
             }
             if(pistolFireHook && ini.ReadInteger("VR","ExperimentalPistolTrigger",0))
@@ -2234,6 +2330,9 @@ std::string VRHands::PistolStatus()
         ",\"aimedHeadshotChecks\":"+std::to_string(aimedHeadshotChecks.load())+
         ",\"aimedHeadshotOverrides\":"+std::to_string(aimedHeadshotOverrides.load())+
         ",\"aimThreatReady\":"+(aimTarget && aimEventCtor && aimEventDtor && aimAddEvent ? "true":"false")+
+        ",\"executionReady\":"+(executionReadyHook && executionAimHook && executionTargetHook ? "true":"false")+
+        ",\"executionActive\":"+(executionInteraction.load() ? "true":"false")+
+        ",\"executionRequests\":"+std::to_string(executionRequests.load())+
         ",\"aimRaised\":"+(aimRaised ? "true":"false")+",\"aimHasTarget\":"+(aimHasTarget ? "true":"false")+
         ",\"aimQueries\":"+std::to_string(aimQueries.load())+",\"aimEvents\":"+std::to_string(aimEvents.load())+
         ",\"aimVehicleEvents\":"+std::to_string(aimVehicleEvents.load())+

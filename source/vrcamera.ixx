@@ -700,6 +700,10 @@ namespace
             // native active/propagation bits set (A7C6D0), or returns null.
             scripted=root && scriptCameraDraw(root)!=nullptr;
         }
+        // Execution choices are gameplay with a mission camera, not a service
+        // menu. Only native-ready nearby actors with player control qualify;
+        // the subsequent frozen/cutscene sequence keeps its native camera.
+        if(!inCutscene && VRHands::ExecutionInteractionActive()) scripted=false;
         scriptCameraActive=scripted;OpenXRVR::SetScriptMenu(scripted);
         const bool down=inputFresh && (input.pause || (!inMenu && input.phoneOpen));
         if(down && !leftHeld) {heldAt=now;holdConsumed=false;pauseHeld=false;}
