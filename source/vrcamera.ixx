@@ -95,6 +95,7 @@ namespace
     std::atomic<unsigned> phoneRawDown{0},phoneRawRising{0},phoneRawQueries{0},phoneRawMatches{0};
     std::atomic<uint64_t> phoneRawSampledAt{0};
     std::atomic<bool> scriptCameraActive{false};
+    SafetyHookInline missionCoverInput{},missionCoverTask{};
     using ScriptCameraAccessor=void* (__thiscall*)(void*);
     void* scriptCameraManager=nullptr;
     ScriptCameraAccessor scriptCameraRoot=nullptr,scriptCameraDraw=nullptr;
@@ -618,6 +619,39 @@ namespace
     {
         const bool native=phoneRawJustPressed.unsafe_ccall<bool>(pad,button);
         return PhoneRawButton(pad,button,true)!=0 || native;
+    }
+
+    bool IsConcreteJungleVRCall()
+    {
+        const auto* thread=rage::scrThread::s_CurrentThread ? *rage::scrThread::s_CurrentThread:nullptr;
+        return missionCoverInput && missionCoverTask && thread &&
+            std::strncmp(thread->m_szProgramName,"jacob1",sizeof(thread->m_szProgramName))==0 &&
+            OpenXRVR::IsSessionRunning();
+    }
+
+    void __cdecl ConcreteJungleCoverInput(scrNativeCallContext* context)
+    {
+        // jacob1 has one pad-2/control-28 query: its wall tutorial gate.
+        // Change that script query directly; do not synthesize cover input
+        // that would also reach the player's native movement task.
+        if(context && context->GetArgumentCount()==2 && context->GetArgument<int>(0)==2 &&
+            context->GetArgument<int>(1)==28 && IsConcreteJungleVRCall())
+        {context->SetResult<uint32_t>(0,1);return;}
+        missionCoverInput.unsafe_ccall<void>(context);
+    }
+
+    void __cdecl ConcreteJungleCoverTask(scrNativeCallContext* context)
+    {
+        if(context && context->GetArgumentCount()==6 && IsConcreteJungleVRCall())
+        {
+            Ped playerPed=0;
+            Natives::GetPlayerChar(Natives::GetPlayerId(),&playerPed);
+            // Keep Jacob's cover and sequence placeholder (ped 0) calls.
+            // The player's omitted task reports finished through the game's
+            // own task-status query; the mission already handles that case.
+            if(playerPed && context->GetArgument<Ped>(0)==playerPed) return;
+        }
+        missionCoverTask.unsafe_ccall<void>(context);
     }
 
     void __fastcall UpdateControllerPad(void* pad,void* edx)
@@ -1279,7 +1313,8 @@ std::string VRCamera::ControllerMovementStatus()
         ",\"phoneRawQueries\":"+std::to_string(phoneRawQueries.load())+
         ",\"phoneRawMatches\":"+std::to_string(phoneRawMatches.load())+
         ",\"scriptCameraResolved\":"+(scriptCameraRoot && scriptCameraDraw ? "true":"false")+
-        ",\"scriptCameraActive\":"+(scriptCameraActive.load() ? "true":"false")+"}";
+        ",\"scriptCameraActive\":"+(scriptCameraActive.load() ? "true":"false")+
+        ",\"missionCoverAdapterReady\":"+(missionCoverInput && missionCoverTask ? "true":"false")+"}";
 }
 bool VRCamera::RestartAnchorProbe()
 {
@@ -1347,6 +1382,15 @@ void VRCamera::Install()
         ini.ReadInteger("VR","ExperimentalControllerButtons",0);
     if(controllerButtons)
     {
+        auto coverInput=hook::pattern("68 ? ? ? ? 68 61 57 63 0E E8");
+        auto coverTask=hook::pattern("68 ? ? ? ? 68 D3 58 33 14 E8");
+        if(coverInput.size()==1 && coverTask.size()==1)
+        {
+            missionCoverInput=safetyhook::create_inline(*coverInput.get_first<void*>(1),ConcreteJungleCoverInput);
+            missionCoverTask=safetyhook::create_inline(*coverTask.get_first<void*>(1),ConcreteJungleCoverTask);
+            if(!missionCoverInput || !missionCoverTask)
+            {missionCoverInput.reset();missionCoverTask.reset();}
+        }
         // CE GET_SCRIPT_DRAW_CAM implementation: static camera manager, root
         // accessor, draw accessor, then handle-pool conversion. Unknown builds
         // retain the native camera and do not activate scripted-menu routing.
