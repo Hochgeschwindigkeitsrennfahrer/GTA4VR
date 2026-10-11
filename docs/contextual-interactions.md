@@ -269,3 +269,8 @@ clothing-store purchase/mission progression, bowling staff, episode variants,
 and flat-screen interaction regression remain to be checked. Issues #13 and
 #15 remain open for that coverage. Menu-to-cutscene skip routing is included
 in this changeset but its manual acceptance has not been recorded.
+
+### Driving context interaction (2026-10-11, issue #15)
+
+Driving now exposes context_interact (Context interaction), feeding the same native control 23 and retained edge/pulse transport as On foot. The driving exclusion in native input merging is removed; phone, pause and cutscene suppression remain. There is no suggested driving button because left trigger is already brake/drive-by fire. Add driving/context_interact to a button in custom SteamVR bindings. Runtime acceptance is pending; this makes the native input available without bypassing any scripted eligibility check.
+User accepted the driving context interaction on the deployed Release build (SHA256 0CD9B66137A4639A208C8315C5CB14AE1FDDAE843874BC1DF27B07074905808A). Issue #15 remains open for its broader service and mission coverage.

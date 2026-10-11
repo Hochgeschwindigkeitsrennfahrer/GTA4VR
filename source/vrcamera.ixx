@@ -786,7 +786,7 @@ namespace
         }
         scriptRawDown=scriptDown;scriptRawRising=scriptRising;
         const bool context=contextPulse.Update(input.contextPresses,input.contextInteract,
-            inputFresh && !inMenu && !inCutscene && !input.phoneActive && !input.driving,now) || scriptButtons[5];
+            inputFresh && !inMenu && !inCutscene && !input.phoneActive,now) || scriptButtons[5];
         mergeButton(23,context,previousContext);previousContext=context;
         constexpr unsigned scriptIds[]{65,64,66,67,77,78};
         for(unsigned i=0;i<6;++i)
