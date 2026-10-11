@@ -35,12 +35,16 @@ Extracted scripts and the game executable remain outside Git.
 
 - Observe the native ready setter, retaining at most 16 generation-checked ped
   handles. Revalidate native readiness and existence on simulation updates.
-- While a ready actor is within 8 game meters and native player control is on,
-  classify the interaction as gameplay rather than a scripted service menu.
-  Keep tracked hands and first-person view. Actual cutscenes remain native.
-- Supplement the two native character-aim queries only for these actors, using
-  the existing raised-weapon, obstruction-tested muzzle ray. Ordinary target
-  and aim results remain native.
+- First-person gameplay continues when a script camera accompanies native
+  player control. Originally limited to nearby execution-ready actors, camera
+  classification now uses native control ownership generally (issue #22).
+  Actual cutscenes and previews with disabled player control remain native.
+- Supplement the two native character-aim queries using the existing raised-
+  weapon, obstruction-tested muzzle ray. Originally limited to execution-ready
+  actors, this is generalized for mission intimidation in
+  [issue #21](https://github.com/bordplate/GTA4VR/issues/21). Execution triggering
+  still requires native execution readiness. Ordinary positive native results
+  remain intact.
 - A pistol trigger squeeze while physically aiming at the ready actor signals
   combat flag 0 through its native setter. The mission consumes that flag and
   owns the execution animation and progression. Avoid shooting/killing the

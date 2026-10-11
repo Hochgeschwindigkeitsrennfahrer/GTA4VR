@@ -863,11 +863,19 @@ namespace
         {candidate=ped;return;}
     }
 
+    bool PhysicalAimAtCharacter(Ped ped)
+    {
+        // Script aiming queries must see tracked aiming too: faustin2's
+        // intimidation tutorial uses these without execution readiness.
+        // A null handle means any character in both verified native queries.
+        return OpenXRVR::HasFocusedViews() && aimRaised && aimHasTarget && aimSampleAt &&
+            GetTickCount64()-aimSampleAt<=100 && aimCandidate &&
+            (!ped || ExecutionPed(ped)==aimCandidate);
+    }
+
     bool PhysicalExecutionAim(Ped ped)
     {
-        return executionInteraction && aimRaised && aimHasTarget && aimSampleAt &&
-            GetTickCount64()-aimSampleAt<=100 && aimCandidate &&
-            ExecutionPed(ped)==aimCandidate &&
+        return executionInteraction && ped && PhysicalAimAtCharacter(ped) &&
             std::find(std::begin(executionPeds),std::end(executionPeds),ped)!=std::end(executionPeds);
     }
 
@@ -875,14 +883,14 @@ namespace
     {
         executionAimHook.unsafe_ccall<void>(context);
         if(context && context->GetArgumentCount()==2 &&
-            context->GetArgument<Player>(0)==Natives::GetPlayerId() && PhysicalExecutionAim(context->GetArgument<Ped>(1)))
+            context->GetArgument<Player>(0)==Natives::GetPlayerId() && PhysicalAimAtCharacter(context->GetArgument<Ped>(1)))
             context->SetResult<uint32_t>(0,1);
     }
     void __cdecl ExecutionTarget(scrNativeCallContext* context)
     {
         executionTargetHook.unsafe_ccall<void>(context);
         if(context && context->GetArgumentCount()==2 &&
-            context->GetArgument<Player>(0)==Natives::GetPlayerId() && PhysicalExecutionAim(context->GetArgument<Ped>(1)))
+            context->GetArgument<Player>(0)==Natives::GetPlayerId() && PhysicalAimAtCharacter(context->GetArgument<Ped>(1)))
             context->SetResult<uint32_t>(0,1);
     }
 
