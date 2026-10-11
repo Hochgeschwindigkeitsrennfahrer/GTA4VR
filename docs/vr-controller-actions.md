@@ -95,3 +95,39 @@ after editing so a later session uses the updated controls.
 A valid propagating script draw camera activates the existing **Menus** action set and retains the native third-person character, including the head. Navigation supplements native frontend controls and raw gamepad queries, independent of keyboard/gamepad selection. Sampled short presses survive between render and simulation ticks. Pause pointer actions are read only during pause; scripted navigation is read only during scripted interactions. Phone routing takes precedence.
 
 The contextual input does not require a first-person camera. Native scripts retain proximity, availability, prices and mission progression. Camera-free menus and service variants still need gameplay acceptance; see GitHub #13 and #15 and `docs/contextual-interactions.md`.
+
+## Ladder controls
+
+Near a native ladder, forward/back on the left movement touchpad requests
+native ladder entry. While attached, forward climbs up and back climbs down;
+releasing the touchpad stops climbing. Native alignment, ladder animation and
+endpoint exits remain in charge. Physical hand-over-hand climbing is not
+implemented. Gameplay acceptance and remaining coverage are tracked in
+[issue #19](https://github.com/bordplate/GTA4VR/issues/19).
+
+On CE 1.2.0.59, A71F50 gates the CFB330 ladder scan on the jump action.
+The existing FusionFix AutoLadder hook can also bypass that input gate when
+VR movement requests entry, without changing the saved AutoClimbLadders
+setting. Native task CF9F30 reads shared vertical controls 14/15 through
+8F00F0 and 8EFF80. These controls were suppressed whenever animatedView was
+active, including ladder climbing. The VR pad update now permits them for
+ladder tasks, while native body ownership includes both ladder approach and
+climbing. Ghidra bookmark at CF9F30 is saved under GTA4VR #19.
+
+Win32 Release D4FB4A6D7E52B98DE32D27ABF7B4B8248EA5BA0FEB7316FAA17A4642CDA63382
+built and deployed with ASI/INI backup; existing updater PDB warnings only.
+Baseline CE 1.2.0.59 / SteamVR 2.17.10 / Vive Pro and Wands / DXVK-Vulkan.
+Runtime ladder and flat-screen acceptance remain pending. The user authorized
+this restart and returning to the ladder; a read-only entity transform captured
+the location because the development bridge refuses capture during missions.
+Location restoration does not restore mission progress. No performance claim.
+
+Runtime PID25488 reports focused continuous stereo with all four passive
+diagnostic controls off. Native restore completed and read back the saved
+position within the bridge tolerance; a fresh eye capture confirms ordinary
+world rendering at the restored location. User ladder gameplay check requested.
+
+The user confirms native entry, climbing up/down, stopping and endpoint exit
+work in this build and authorizes committing it (2026-10-11). This accepts the
+tested VR ladder control path. Mission replay, broader ladder/episode coverage
+and flat-screen regression remain unverified; issue #19 retains those checks.

@@ -305,6 +305,15 @@ namespace
         return true;
     }
 
+    bool LadderControlsBody(void* owner)
+    {
+        if(!owner || !*reinterpret_cast<void**>(static_cast<char*>(owner)+0x224)) return false;
+        for(auto task:{TaskID::TaskComplexClimbLadder,TaskID::TaskSimpleClimbLadder,
+            TaskID::TaskComplexClimbLadderFully})
+            if(CPed::ComparePedTasks(reinterpret_cast<uintptr_t>(owner),task)) return true;
+        return false;
+    }
+
     bool AnimationControlsBody(Ped ped,void* owner,bool& ragdoll,bool* exiting=nullptr)
     {
         if(exiting) *exiting=false;
@@ -312,6 +321,7 @@ namespace
             Natives::IsPedRagdoll(ped);
         if(ragdoll) return true;
         if(!owner || !*reinterpret_cast<void**>(static_cast<char*>(owner)+0x224)) return false;
+        if(LadderControlsBody(owner)) return true;
         const auto address=reinterpret_cast<uintptr_t>(owner);
         for(auto task:{TaskID::TaskComplexNewExitVehicle,TaskID::TaskSimpleCarGetOut,
             TaskID::TaskSimpleCarJumpOut,TaskID::TaskSimpleCarSlowBeDraggedOut})
@@ -858,7 +868,8 @@ namespace
         {
             writeValue(static_cast<unsigned char*>(pad)+0x2698+16*id,decoded);
         };
-        if(controllerLocomotion && !driving && !animatedView && input.gripPoseValid[0] &&
+        const bool ladder=!driving && LadderControlsBody(FindPlayerPed ? FindPlayerPed(0):nullptr);
+        if(controllerLocomotion && !driving && (!animatedView || ladder) && input.gripPoseValid[0] &&
             input.moveActive && input.moveEnabled)
         {
             const auto axes=VRMath::TouchpadMovement(input.move[0],input.move[1]);
@@ -870,9 +881,12 @@ namespace
             };
             // Supply the actual shared movement values too: jump selection and
             // takeoff query them outside the walking-only decoder call sites.
-            for(unsigned id:{12u,13u,91u}) analog(id,axisByte(axes[0]));
+            for(unsigned id:{12u,13u,91u}) analog(id,axisByte(ladder ? 0.f:axes[0]));
             for(unsigned id:{14u,15u,90u}) analog(id,axisByte(-axes[1]));
-            const bool run=std::hypot(axes[0],axes[1])>.01f &&
+            // Ladder ProcessPed (CE CF9F30) reads the shared 14/15 controls
+            // through 8F00F0; negative Y climbs up, positive Y climbs down.
+            // Its animation owns the body, but must still receive our axis.
+            const bool run=!ladder && std::hypot(axes[0],axes[1])>.01f &&
                 (input.sprint || std::hypot(input.move[0],input.move[1])>=.85f);
             button(1,run,previousRun);
             previousRun=run;

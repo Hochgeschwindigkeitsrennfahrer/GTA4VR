@@ -7,6 +7,20 @@ export module autoladder;
 import common;
 import comvars;
 import settings;
+import openxrvr;
+
+// Keep the native ladder scan, alignment, animation and endpoint handling.
+// VR's movement action can request entry without a keyboard jump press.
+static bool VRLadderEntryRequested()
+{
+    if(!OpenXRVR::HasFocusedViews() ||
+        (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) ||
+        (CTimer::ms_bScriptPause && *CTimer::ms_bScriptPause)) return false;
+    OpenXRVR::ControllerInput input{};
+    return OpenXRVR::GetControllerInput(input) && input.moveActive && input.moveEnabled &&
+        input.gripPoseValid[0] && !input.driving && !input.phoneActive && !input.scriptMenuActive &&
+        std::abs(input.move[1])>.25f;
+}
 
 static constexpr int32_t nRegrabCooldownMs = 2500;
 
@@ -50,7 +64,7 @@ public:
             static auto CTaskComplexPlayerOnFoot__HandlePlayerInput_Hook = safetyhook::create_mid(pattern.get_first(0), [](SafetyHookContext& regs)
             {
                 static auto AutoClimbLadders = FusionFixSettings.GetRef("PREF_AUTOCLIMBLADDERS");
-                if (AutoClimbLadders->get())
+                if (AutoClimbLadders->get() || VRLadderEntryRequested())
                     return_to(loc_A72369);
             });
 
@@ -62,7 +76,7 @@ public:
             static auto CTaskComplexInWater__HandlePlayerInput_Hook = safetyhook::create_mid(pattern.get_first(0), [](SafetyHookContext& regs)
             {
                 static auto AutoClimbLadders = FusionFixSettings.GetRef("PREF_AUTOCLIMBLADDERS");
-                if (AutoClimbLadders->get())
+                if (AutoClimbLadders->get() || VRLadderEntryRequested())
                 {
                     if (reg != 0x3C)
                         regs.ecx |= 0xFF;
