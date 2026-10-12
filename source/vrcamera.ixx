@@ -841,12 +841,11 @@ namespace
             value[7]=static_cast<unsigned char>(std::max<unsigned>(previous,wasDown ? 255:0)^key);
         };
         const bool driving=vehicleView;
-        const bool jump=buttonsArmed && center && !driving && !animatedView;
         const bool enter=buttonsArmed && menu;
         const bool grip[2]{input.gripActive[0] && input.gripped[0],input.gripActive[1] && input.gripped[1]};
         const bool newGrip=(grip[0] && !previousHangGrip[0]) || (grip[1] && !previousHangGrip[1]);
-        bool drop=false;
-        if(!driving && newGrip &&
+        bool hanging=false;
+        if(!driving && (newGrip || (buttonsArmed && center)) &&
             NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::GET_PED_CLIMB_STATE)))
         {
             Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
@@ -854,8 +853,12 @@ namespace
             // CF47A0 maps hang/shimmy to2/3/4. CF57C0 asks CF4210
             // mode0, which reads INPUT_ENTER's rising edge before selecting
             // the native hang_drop animation. Keep vault/ladder input native.
-            drop=climb>=2 && climb<=4;
+            hanging=climb>=2 && climb<=4;
         }
+        // Climb owns the body's animation while hanging, but still needs the
+        // ordinary jump edge to pull up. Other animated states retain the gate.
+        const bool jump=buttonsArmed && center && !driving && (!animatedView || hanging);
+        const bool drop=newGrip && hanging;
         previousHangGrip[0]=grip[0];previousHangGrip[1]=grip[1];
         const bool handbrake=buttonsArmed && center && driving;
         button(2,jump,previousJump); // INPUT_JUMP
