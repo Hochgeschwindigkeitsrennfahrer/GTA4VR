@@ -84,6 +84,12 @@ int main()
     gun.DropHeld();Check(gun.Owned()==owned-dropped);
     gun.Begin(0,0,17);Check(!gun.TakeMagazine() && !gun.Fired());
     // Exhaustive short sequences check conservation and invalid repetition.
+    VRReload::Pistol lastMagazine;lastMagazine.Begin(0,17,17);
+    lastMagazine.Eject();Check(lastMagazine.TakeMagazine());
+    Check(lastMagazine.Clip()==0 && lastMagazine.reserve==0 && lastMagazine.held==17);
+    Check(lastMagazine.Owned()==17 && !lastMagazine.Ready());
+    Check(lastMagazine.Insert());lastMagazine.Rack();
+    Check(lastMagazine.Clip()==17 && lastMagazine.Owned()==17 && lastMagazine.Ready());
     for(unsigned sequence=0;sequence<4096;++sequence)
     {
         gun.Begin(9,29,17);unsigned fired=0;

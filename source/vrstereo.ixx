@@ -4,6 +4,7 @@ module;
 #include <d3dx9shader.h>
 #include "includes/vrmath.hpp"
 #include "includes/vrscope.hpp"
+#include "includes/vrammocounter.hpp"
 #include "includes/vrmodelrefs.hpp"
 #include "includes/vrconstantprobe.hpp"
 #include "includes/vrtexturerouting.hpp"
@@ -362,6 +363,9 @@ namespace
     VRMath::Vector completedEyePosition[2]{};
     VRMath::Matrix completedEyeCamera[2]{};
     VRMath::Matrix completedWrist[2]{};
+    VRAmmoCounter::Snapshot queuedAmmoCounter[2]{},completedAmmoCounter[2]{};
+    ComPtr<IDirect3DVertexShader9> ammoCounterVertexShader;
+    ComPtr<IDirect3DPixelShader9> ammoCounterPixelShader;
     bool completedWristValid[2]{};
     VRMath::Matrix completedDashboard[2]{};
     bool completedDashboardValid[2]{};
@@ -2520,6 +2524,7 @@ namespace
         float camera[16]{};
         VRMath::Matrix viewProjection{},wristSnapshot{},dashboardSnapshot{},lensSnapshot{};
         bool wristValid=false,dashboardValid=false;
+        VRAmmoCounter::Snapshot counterSnapshot{};
         float shadowForward[4]{};
         float opticalRay[4]{};
         VRMath::Vector logDepth{};
@@ -2535,7 +2540,8 @@ namespace
          viewProjection=VRMath::Multiply(VRMath::InverseRigid(cameraWorld),projection);
          logDepth=VRScope::DepthParameters(eyeViewports[value].mNearClip,eyeViewports[value].mFarClip);
          wristValid=VRHands::GetWrist(0,wristSnapshot);
-         dashboardValid=VRCamera::GetVehicleHudAnchor(dashboardSnapshot);}
+         dashboardValid=VRCamera::GetVehicleHudAnchor(dashboardSnapshot);
+         counterSnapshot=queuedAmmoCounter[value];}
         int32_t GetSize() override {return sizeof(EyeMarker);}
         void DrawCommand() override
         {
@@ -2819,6 +2825,7 @@ namespace
                 completedLogDepth[eye]=logDepth;
                 std::memcpy(completedEyeCamera[eye].data(),camera,sizeof(camera));
                 completedWrist[eye]=wristSnapshot;completedWristValid[eye]=wristValid;
+                completedAmmoCounter[eye]=counterSnapshot;
                 completedDashboard[eye]=dashboardSnapshot;completedDashboardValid[eye]=dashboardValid;
                 std::memcpy(completedEyePosition[eye].data(),camera+12,sizeof(VRMath::Vector));
                 if(completedEyes==3)
@@ -2951,6 +2958,11 @@ namespace
         if(buildingScope && buildingStage && VRReloadRuntime::IsScopeOccluder(self))
         {VRDiagnostics::Increment(scopeHiddenObjects);return 0;}
         const auto result=scopeObjectRender.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
+        if(!buildingScope && buildingEye<2 && buildingStage==1)
+        {
+            VRAmmoCounter::Snapshot counter{};
+            if(VRReloadRuntime::GetAmmoCounter(self,counter)) queuedAmmoCounter[buildingEye]=counter;
+        }
         // The attachment can update after SceneSetup. Capture the object
         // transform at the actual main-eye command-building call, so the
         // optical view and aperture use the pose queued for the rifle.
@@ -3331,6 +3343,77 @@ namespace
         device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
     }
 
+    void DrawAmmoCounter(IDirect3DDevice9* device,unsigned eye)
+    {
+        const auto& snapshot=completedAmmoCounter[eye];
+        if(!snapshot.valid || !snapshot.settings.enabled) return;
+        const auto vertices=VRAmmoCounter::Geometry(snapshot);
+        if(vertices.size()<3) return;
+        for(const auto& v:vertices) if(!std::isfinite(v.x+v.y+v.z)) return;
+        const auto& a=vertices[0];const auto& b=vertices[1];const auto& c=vertices[2];
+        const float right[]{b.x-a.x,b.y-a.y,b.z-a.z},up[]{c.x-a.x,c.y-a.y,c.z-a.z};
+        const float normal[]{right[1]*up[2]-right[2]*up[1],right[2]*up[0]-right[0]*up[2],right[0]*up[1]-right[1]*up[0]};
+        const auto& eyePosition=completedEyePosition[eye];
+        if(normal[0]*(eyePosition[0]-a.x)+normal[1]*(eyePosition[1]-a.y)+normal[2]*(eyePosition[2]-a.z)<=0) return;
+        if(!ammoCounterVertexShader || !ammoCounterPixelShader)
+        {
+            constexpr char vs[]="row_major float4x4 vp:register(c0);"
+                "struct O{float4 p:POSITION;float4 color:COLOR0;float2 z:TEXCOORD0;};"
+                "O main(float3 p:POSITION,float4 color:COLOR0){O o;o.p=mul(float4(p,1),vp);o.z=o.p.zw;o.color=color;return o;}";
+            constexpr char ps[]="float4 logDepth:register(c0);"
+                "struct O{float4 color:COLOR0;float depth:DEPTH;};"
+                "O main(float4 color:COLOR0,float2 z:TEXCOORD0){O o;o.color=color;"
+                "o.depth=saturate(log2(z.y*logDepth.x)*logDepth.y);return o;}";
+            ComPtr<ID3DXBuffer> code,errors;
+            if(!ammoCounterVertexShader &&
+                (FAILED(D3DXCompileShader(vs,sizeof(vs)-1,nullptr,nullptr,"main","vs_3_0",0,&code,&errors,nullptr)) ||
+                 FAILED(device->CreateVertexShader(static_cast<const DWORD*>(code->GetBufferPointer()),&ammoCounterVertexShader)))) return;
+            code.Reset();errors.Reset();
+            if(!ammoCounterPixelShader &&
+                (FAILED(D3DXCompileShader(ps,sizeof(ps)-1,nullptr,nullptr,"main","ps_3_0",0,&code,&errors,nullptr)) ||
+                 FAILED(device->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&ammoCounterPixelShader)))) return;
+        }
+        D3DSURFACE_DESC desc{};if(FAILED(resources->finalSurface[eye]->GetDesc(&desc))) return;
+        ComPtr<IDirect3DSurface9> counterDepth;
+        for(const auto& target:resources->targets)
+        {
+            if(target.name!="_DEFERRED_GBUFFER_3_") continue;
+            D3DSURFACE_DESC candidate{};
+            if(SUCCEEDED(target.surface[eye]->GetDesc(&candidate)) && (candidate.Usage&D3DUSAGE_DEPTHSTENCIL) &&
+                candidate.Width==desc.Width && candidate.Height==desc.Height) counterDepth=target.surface[eye];
+        }
+        if(!counterDepth) counterDepth=resources->worldDepth[eye];
+        if(!counterDepth) return;
+        ComPtr<IDirect3DStateBlock9> state;ComPtr<IDirect3DSurface9> targets[4],depth;
+        D3DVIEWPORT9 viewport{};
+        if(FAILED(device->CreateStateBlock(D3DSBT_ALL,&state)) || FAILED(state->Capture())) return;
+        for(unsigned i=0;i<4;++i) device->GetRenderTarget(i,&targets[i]);
+        device->GetDepthStencilSurface(&depth);device->GetViewport(&viewport);
+        for(unsigned i=1;i<4;++i) device->SetRenderTarget(i,nullptr);
+        device->SetDepthStencilSurface(nullptr);device->SetRenderTarget(0,resources->finalSurface[eye].Get());
+        if(SUCCEEDED(device->SetDepthStencilSurface(counterDepth.Get())))
+        {
+            const auto& world=resources->worldViewport[eye];
+            D3DVIEWPORT9 full{0,0,desc.Width,desc.Height,world.MinZ,world.MaxZ};device->SetViewport(&full);
+            device->SetFVF(D3DFVF_XYZ|D3DFVF_DIFFUSE);
+            device->SetVertexShader(ammoCounterVertexShader.Get());device->SetPixelShader(ammoCounterPixelShader.Get());
+            device->SetVertexShaderConstantF(0,completedViewProjection[eye][0].data(),4);
+            device->SetPixelShaderConstantF(0,completedLogDepth[eye].data(),1);
+            device->SetRenderState(D3DRS_ZENABLE,TRUE);device->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);
+            device->SetRenderState(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
+            device->SetRenderState(D3DRS_DEPTHBIAS,0);device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS,0);
+            device->SetRenderState(D3DRS_FOGENABLE,FALSE);device->SetRenderState(D3DRS_CLIPPLANEENABLE,0);
+            device->SetRenderState(D3DRS_STENCILENABLE,FALSE);device->SetRenderState(D3DRS_SCISSORTESTENABLE,FALSE);
+            device->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE);device->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
+            device->SetRenderState(D3DRS_COLORWRITEENABLE,15);device->SetRenderState(D3DRS_SRGBWRITEENABLE,FALSE);
+            device->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE);device->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE);
+            device->DrawPrimitiveUP(D3DPT_TRIANGLELIST,static_cast<unsigned>(vertices.size()/3),vertices.data(),sizeof(VRAmmoCounter::Vertex));
+        }
+        device->SetDepthStencilSurface(nullptr);
+        for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
+        device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
+    }
+
     void PublishEyes(IDirect3DDevice9* device)
     {
         if(!submit || !resources || completedEyes!=3 || publishedFrame==completedFrame) return;
@@ -3341,6 +3424,7 @@ namespace
         VRHud::CaptureRadar(device,resources->originalBack.Get());
         composingHud=true;
         for(unsigned eye=0;eye<2;++eye) DrawScopeLens(device,eye);
+        for(unsigned eye=0;eye<2;++eye) DrawAmmoCounter(device,eye);
         for(unsigned eye=0;eye<2;++eye) VRHud::Draw(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],completedEyePosition[eye],completedWristValid[eye] ? &completedWrist[eye]:nullptr,completedDashboardValid[eye] ? &completedDashboard[eye]:nullptr);
         const auto hudPose=VRMath::BlendRigidPose(completedEyeCamera[0],completedEyeCamera[1],.5f);
         for(unsigned eye=0;eye<2;++eye) VRHud::DrawOverlay(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],hudPose);
@@ -3884,6 +3968,7 @@ namespace
         for(auto& viewport:eyeViewports) ResizeEyeViewport(viewport);
         scopeActive=false;
         queuedScopeGunValid=false;
+        queuedAmmoCounter[0]={};queuedAmmoCounter[1]={};
         ReadScopeSettings();
         if(scopeProbeRequested.exchange(false)) scopeProbeFrames=30;
         VRMath::Matrix gun{};
@@ -4119,6 +4204,7 @@ void VRStereo::Shutdown()
     scopeProbeRequested=false;scopeCaptureRequested=false;scopeProbeFrames=0;
     resolutionCaptureRequested=false;
     scopeLensShader.Reset();scopeLensVertexShader.Reset();delete scopeResources;scopeResources=nullptr;mainResources=nullptr;
+    ammoCounterVertexShader.Reset();ammoCounterPixelShader.Reset();
     cpuOmitRequested=99;cpuOmitMode=0;cpuOmitDeadline=0;cpuOmitHook.reset();
     liveMeshRequested=0;liveMeshMode=0;liveMeshPackets.reset();liveMeshRenderer=VRRigidInstance::Renderer{};liveMeshClear.reset();RemoveLiveMeshResourceHooks();
     billboardInstancingRequested=false;

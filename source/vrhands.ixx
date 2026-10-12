@@ -1657,6 +1657,7 @@ namespace
                 // Proximity permits acquisition; the held grip button owns
                 // release. Do not detach when the physical support Wand moves.
                 supporting=input.support && !VRReloadRuntime::UsesLeftHand() && !VRHandPhysics::IsGrabbing(0) &&
+                    !VRReloadRuntime::CounterGrabPriority(owner,held,targets[0]) &&
                     (supportGripping || distanceSquared<.12f*.12f);
                 if(supporting)
                 {

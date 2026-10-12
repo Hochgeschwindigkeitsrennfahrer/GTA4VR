@@ -3,6 +3,7 @@ module;
 #include "includes/vrmath.hpp"
 #include "includes/vrgrip.hpp"
 #include "includes/vrreload.hpp"
+#include "includes/vrammocounter.hpp"
 #include <atomic>
 #include <cstring>
 #include <string>
@@ -23,6 +24,7 @@ export namespace VRReloadRuntime
     bool UsesLeftHand();
     bool PumpHeld();
     bool HoldsMagazine();
+    bool CounterGrabPriority(void* ped,void* gun,const VRMath::Matrix& hand);
     bool SlideGrip(void* ped,void* gun,VRMath::Matrix& relative);
     bool ReloadConfig();
     bool TestFireAnimation();
@@ -31,6 +33,7 @@ export namespace VRReloadRuntime
     std::array<float,3> SupportOffset(unsigned type);
     unsigned ConfigRevision();
     bool GetRenderedSniperPose(VRMath::Matrix& world);
+    bool GetAmmoCounter(const void* entity,VRAmmoCounter::Snapshot& snapshot);
     const char* ScopeProfileFile();
     bool IsScopeGun(const void* entity);
     bool IsScopeOccluder(const void* entity);
@@ -78,6 +81,7 @@ namespace
     std::atomic<float> recoilKick=6.f,recoilSupportScale=.15f,recoilRecovery=.18f,recoilMaximum=75.f;
     struct Profile
     {
+        VRAmmoCounter::Settings counter{};
         float handRotation[3]{100,180,180},handOffset[3]{.075f,.05f,.04f};
         float insertionRotation[3]{};
         VRMath::Vector axis{.258819f,0,.965926f,0};
@@ -92,9 +96,43 @@ namespace
         VRMath::Vector rocketEntrance{.318807f,.015501f,.062882f,1};
         float rocketLoadedDepth=.03f;
     } profile;
+    std::atomic<bool> counterEditing=false,counterSavePending=false,counterSaveOk=true;
+    struct CounterEdit
+    {
+        VRMath::Matrix hand{},panel{};
+        float width=0,height=0,distance=0;
+        bool resizing=false;
+        unsigned type=0;
+        uint64_t changedAt=0;
+        VRAmmoCounter::Settings pending{};
+    } counterEdit;
+    void SaveCounter(bool force=false)
+    {
+        if(!counterSavePending || (!force && GetTickCount64()-counterEdit.changedAt<400)) return;
+        CIniReader path(ProfileFile(counterEdit.type));
+        mINI::INIFile file(path.GetIniPath());mINI::INIStructure values;
+        bool success=file.read(values);
+        if(success)
+        {
+            const char* offsets[]{"OffsetX","OffsetY","OffsetZ"},*rotations[]{"RotationX","RotationY","RotationZ"};
+            for(unsigned a=0;a<3;++a)
+            {
+                values["AmmoCounter"][offsets[a]]=std::to_string(counterEdit.pending.offset[a]);
+                values["AmmoCounter"][rotations[a]]=std::to_string(counterEdit.pending.rotation[a]);
+            }
+            values["AmmoCounter"]["Width"]=std::to_string(counterEdit.pending.width);
+            values["AmmoCounter"]["Height"]=std::to_string(counterEdit.pending.height);
+            success=file.write(values);
+        }
+        counterSaveOk=success;
+        if(success) counterSavePending=false;else counterEdit.changedAt=GetTickCount64();
+    }
     Profile Defaults(unsigned type)
     {
         Profile value;
+        value.counter.stacked=type==12 || type==13 || type==14 || type==15;
+        if(value.counter.stacked) {value.counter.width=.045f;value.counter.height=.032f;value.counter.offset[0]=-.20f;value.counter.offset[2]=.10f;}
+        if(type==16 || type==17 || type==18) {value.counter.offset[0]=-.25f;value.counter.offset[2]=.13f;}
         if(type==18)
         {
             value.axis={-1,0,0,0};value.tip={.54f,0,.055f,1};value.travel=.15f;
@@ -208,9 +246,9 @@ namespace
         std::error_code error;
         if(!std::filesystem::is_regular_file(ini.GetIniPath(),error)) {configValid=false;return;}
         bool valid=true;
-        auto read=[&](const char* key,float fallback)
+        auto read=[&](const char* key,float fallback,const char* section="Reload")
         {
-            const auto value=ini.ReadString("Reload",key,std::to_string(fallback));
+            const auto value=ini.ReadString(section,key,std::to_string(fallback));
             try
             {
                 size_t end=0;const float parsed=std::stof(value,&end);
@@ -259,8 +297,27 @@ namespace
         next.recoilSupportScale=read("RecoilSupportScale",next.recoilSupportScale);
         next.recoilRecovery=read("RecoilRecoverySeconds",next.recoilRecovery);
         next.recoilMaximum=read("RecoilMaxDegrees",next.recoilMaximum);
+        const float counterEnabled=read("Enabled",1,"AmmoCounter");
+        if(counterEnabled!=0 && counterEnabled!=1) valid=false;
+        next.counter.enabled=counterEnabled!=0;
+        const float counterStacked=read("Stacked",next.counter.stacked ? 1.f:0.f,"AmmoCounter");
+        const float counterEditEnabled=read("EditWithOffHand",0,"AmmoCounter");
+        if((counterStacked!=0 && counterStacked!=1) || (counterEditEnabled!=0 && counterEditEnabled!=1)) valid=false;
+        next.counter.stacked=counterStacked!=0;next.counter.editWithOffHand=counterEditEnabled!=0;
+        next.counter.grabRadius=read("GrabRadius",next.counter.grabRadius,"AmmoCounter");
+        if(next.counter.grabRadius<=0) valid=false;
+        const char* counterOffsets[]{"OffsetX","OffsetY","OffsetZ"};
+        const char* counterRotations[]{"RotationX","RotationY","RotationZ"};
+        for(unsigned a=0;a<3;++a)
+        {
+            next.counter.offset[a]=read(counterOffsets[a],next.counter.offset[a],"AmmoCounter");
+            next.counter.rotation[a]=read(counterRotations[a],next.counter.rotation[a],"AmmoCounter");
+        }
+        next.counter.width=read("Width",next.counter.width,"AmmoCounter");
+        next.counter.height=read("Height",next.counter.height,"AmmoCounter");
+        if(next.counter.width<=0 || next.counter.height<=0) valid=false;
         configValid=valid;
-        if(valid) {profile=next;guide={};insertionProgress=0;refreshHeldPose=true;
+        if(valid) {counterEditing=false;profile=next;guide={};insertionProgress=0;refreshHeldPose=true;
             recoilKick=next.recoilKick;recoilSupportScale=next.recoilSupportScale;
             recoilRecovery=next.recoilRecovery;recoilMaximum=next.recoilMaximum;
             racking=false;slideDistance=0;++configRevision;}
@@ -555,9 +612,15 @@ namespace
     }
     void WriteAmmo(Ped ped)
     {
-        Natives::SetCharAmmo(ped,currentType.load(),ammo.NativeTotal());
         Natives::SetAmmoInClip(ped,currentType.load(),ammo.Clip());
-        previousNativeTotal=ammo.NativeTotal();
+        // CE SET_AMMO_IN_CLIP also adds (newClip-oldClip) to total ammo.
+        // Write the authoritative total last, or a rack/ejection/insert gets
+        // reconciled as an extra reserve change on the following update.
+        // Native inventory owns held ammunition too, even though the storage
+        // display and clip both exclude it. Otherwise its last-magazine
+        // transfer appears as total exhaustion to vanilla weapon selection.
+        Natives::SetCharAmmo(ped,currentType.load(),ammo.Owned());
+        previousNativeTotal=ammo.Owned();
         chamberReady=ammo.Ready();inserted=ammo.inserted;
         reportedClip=ammo.Clip();reportedReserve=ammo.reserve;reportedHeld=ammo.held;reportedDiscarded=ammo.discarded;
         if(currentWeapon)
@@ -568,6 +631,7 @@ namespace
     }
     void Process()
     {
+        SaveCounter();
         if(configPending.exchange(false)) LoadProfile();
         if(enabled && OpenXRVR::IsSessionRunning())
         {
@@ -585,7 +649,7 @@ namespace
                 ammo.ReturnHeld();currentWeapon=nullptr;
                 if(Natives::HasCharGotWeapon(ped,currentType.load())) WriteAmmo(ped);
             }
-            initialized=false;guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;
+            counterEditing=false;initialized=false;guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;
             racking=false;slideDistance=0;leftBusy=false;
             if(magazineObject) DeleteMagazine();
             void* entity=nullptr;void* local=FindPlayerPed ? FindPlayerPed(0):nullptr;
@@ -623,17 +687,17 @@ namespace
             ammo.ReturnHeld();
             if(Natives::HasCharGotWeapon(ped,currentType.load()))
             {
-                Natives::SetCharAmmo(ped,currentType.load(),ammo.NativeTotal());
                 Natives::SetAmmoInClip(ped,currentType.load(),ammo.Clip());
+                Natives::SetCharAmmo(ped,currentType.load(),ammo.Owned());
                 savedAmmo[AmmoIndex(currentType)]={ammo,true};
             }
             initialized=false;racking=false;slideDistance=0;leftBusy=false;DeleteMagazine();
         }
         if(weapon && type!=currentType)
-        {currentType=type;definition=nullptr;profile=Defaults(type);LoadProfile();}
+        {SaveCounter(true);counterEditing=false;currentType=type;definition=nullptr;profile=Defaults(type);LoadProfile();}
         if(!weapon || !ResolveRig(entity))
         {
-            guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;racking=false;leftBusy=false;guide={};
+            counterEditing=false;guardedWeapon=nullptr;nativeRocketVisual=nullptr;visualGun=nullptr;currentWeapon=nullptr;racking=false;leftBusy=false;guide={};
             return;
         }
         currentWeapon=weapon;gunEntity=entity;
@@ -670,7 +734,7 @@ namespace
         OpenXRVR::ControllerInput input{};
         if(!OpenXRVR::HasFocusedViews() || !OpenXRVR::GetControllerInput(input) || input.phoneActive ||
             Natives::IsPauseMenuActive() || !input.gripPoseValid[0] || !input.gripPoseValid[1])
-        {rightGrip=leftGrip=true;racking=false;slideDistance=0;guide={};return;}
+        {counterEditing=false;rightGrip=leftGrip=true;racking=false;slideDistance=0;leftBusy=false;guide={};return;}
         if(fireAnimationTest.exchange(false) && !racking) PlayFireAnimation();
         auto* frame=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
         if(!frame) return;
@@ -686,6 +750,40 @@ namespace
         }
         const bool right=input.grabActive[1] && input.grab[1];
         const bool left=input.grabActive[0] && input.grab[0];
+        if(!left || !profile.counter.editWithOffHand) counterEditing=false;
+        if(left && profile.counter.enabled && profile.counter.editWithOffHand && !ammo.holding &&
+            (counterEditing || VRAmmoCounter::Near(profile.counter,gun,view.wrist[0][3])))
+        {
+            const auto hand=VRMath::Multiply(view.wrist[0],VRMath::InverseRigid(gun));
+            const bool resize=input.triggerActive[0] && input.trigger[0]>.5f;
+            if(!counterEditing || resize!=counterEdit.resizing)
+            {
+                if(!counterEditing) SaveCounter(true);
+                counterEdit.hand=hand;counterEdit.panel=VRAmmoCounter::Frame(profile.counter);
+                counterEdit.width=profile.counter.width;counterEdit.height=profile.counter.height;
+                counterEdit.distance=VRMath::Length3(hand[3]);counterEdit.resizing=resize;
+                counterEditing=true;racking=false;slideDistance=0;guide={};
+            }
+            auto next=profile.counter;
+            if(resize)
+            {
+                if(counterEdit.distance>1.e-5f)
+                {
+                    const float scale=VRMath::Length3(hand[3])/counterEdit.distance;
+                    if(scale>0 && std::isfinite(scale)) {next.width=counterEdit.width*scale;next.height=counterEdit.height*scale;}
+                }
+            }
+            else VRAmmoCounter::SetFrame(next,VRMath::Multiply(VRMath::Multiply(counterEdit.panel,VRMath::InverseRigid(counterEdit.hand)),hand));
+            bool changed=std::abs(next.width-profile.counter.width)>1.e-5f || std::abs(next.height-profile.counter.height)>1.e-5f;
+            for(unsigned a=0;a<3;++a) changed|=std::abs(next.offset[a]-profile.counter.offset[a])>1.e-5f ||
+                std::abs(next.rotation[a]-profile.counter.rotation[a])>.01f;
+            if(changed && std::isfinite(next.width+next.height) && next.width>0 && next.height>0)
+            {
+                profile.counter=next;counterEdit.pending=next;counterEdit.type=type;
+                counterEdit.changedAt=GetTickCount64();counterSavePending=true;
+            }
+            leftBusy=true;leftGrip=left;rightGrip=right;WriteAmmo(ped);return;
+        }
         if(type!=18 && type!=10 && type!=11 && right && !rightGrip && ammo.inserted)
         {
             ammo.Eject();VRDiagnostics::Increment(ejections);
@@ -838,10 +936,16 @@ void VRReloadRuntime::Fired(void* ped,void* weapon)
         }
         return;
     }
-    ammo.Fired();previousNativeTotal=ammo.NativeTotal();chamberReady=ammo.Ready();
+    ammo.Fired();previousNativeTotal=ammo.Owned();chamberReady=ammo.Ready();
     if(currentType!=18) PlayFireAnimation();
 }
-bool VRReloadRuntime::UsesLeftHand() {return leftBusy;}
+bool VRReloadRuntime::UsesLeftHand() {return leftBusy || counterEditing;}
+bool VRReloadRuntime::CounterGrabPriority(void* ped,void* entity,const VRMath::Matrix& hand)
+{
+    if(!profile.counter.enabled || !profile.counter.editWithOffHand || ped!=owner || entity!=visualGun.load() || !entity) return false;
+    auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
+    return counterEditing || (root && VRAmmoCounter::Near(profile.counter,VRMath::AffineXYZ(*root),hand[3]));
+}
 bool VRReloadRuntime::PumpHeld() {return guardedWeapon && currentType==10 && racking;}
 bool VRReloadRuntime::HoldsMagazine() {return guardedWeapon && reportedHeld.load()>0;}
 bool VRReloadRuntime::SlideGrip(void* ped,void* gun,VRMath::Matrix& relative)
@@ -855,6 +959,38 @@ bool VRReloadRuntime::SlideGrip(void* ped,void* gun,VRMath::Matrix& relative)
 bool VRReloadRuntime::ReloadConfig() {if(!enabled) return false;configPending=true;return true;}
 bool VRReloadRuntime::TestFireAnimation() {if(!enabled) return false;fireAnimationTest=true;return true;}
 unsigned VRReloadRuntime::ConfigRevision() {return configRevision.load();}
+
+bool VRReloadRuntime::GetAmmoCounter(const void* entity,VRAmmoCounter::Snapshot& result)
+{
+    result={};
+    if(!enabled || !guardedWeapon.load() || !entity ||
+        entity!=visualGun.load() || !profile.counter.enabled || !OpenXRVR::HasFocusedViews()) return false;
+    auto* root=*reinterpret_cast<VRMath::Matrix* const*>(static_cast<const char*>(entity)+0x20);
+    if(!root) return false;
+    result.gun=VRMath::AffineXYZ(*root);
+    if(!VRGrip::Rigid(result.gun)) return false;
+    // Keep configured offsets in resting weapon coordinates, then apply the
+    // actual animated slide delta (both manual rack and native shot animation).
+    if((currentType==7 || currentType==9) && slideBone<boneCount)
+    {
+        auto* skeleton=*reinterpret_cast<void* const*>(static_cast<const char*>(entity)+0x100);
+        if(skeleton && *reinterpret_cast<void**>(static_cast<char*>(skeleton)+4)==definition &&
+            *reinterpret_cast<unsigned short*>(static_cast<char*>(skeleton)+0x10)==boneCount)
+        {
+            auto* matrices=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(skeleton)+0x14);
+            if(matrices)
+            {
+                auto slide=VRMath::AffineXYZ(matrices[slideBone]);
+                auto restingSlide=VRMath::Multiply(rest[slideBone],result.gun);
+                if(VRGrip::Rigid(slide) && VRGrip::Rigid(restingSlide))
+                    result.gun=VRMath::Multiply(VRMath::Multiply(result.gun,VRMath::InverseRigid(restingSlide)),slide);
+            }
+        }
+    }
+    result.settings=profile.counter;result.rounds=ammo.Clip();result.capacity=ammo.capacity;
+    result.total=ammo.reserve;
+    result.valid=result.capacity>0;return result.valid;
+}
 
 const char* VRReloadRuntime::ScopeProfileFile()
 {return currentType==17 ? "VRWeapons/sniper.ini":"VRWeapons/psg1.ini";}
@@ -936,6 +1072,8 @@ std::string VRReloadRuntime::Status()
         ",\"fireAnimationError\":"+std::to_string(fireAnimationError.load())+
         ",\"configFile\":\""+ProfileFile(currentType.load())+"\",\"clip\":"+std::to_string(reportedClip.load())+",\"reserve\":"+std::to_string(reportedReserve.load())+
         ",\"heldRounds\":"+std::to_string(reportedHeld.load())+",\"discarded\":"+std::to_string(reportedDiscarded.load())+
+        ",\"counterEditing\":"+(counterEditing ? "true":"false")+",\"counterSavePending\":"+(counterSavePending ? "true":"false")+
+        ",\"counterSaveOk\":"+(counterSaveOk ? "true":"false")+
         ",\"poseUpdates\":"+std::to_string(poseUpdates.load())+",\"magazineUpdates\":"+std::to_string(magazineUpdates.load())+
         ",\"nativeRocketVisual\":"+(nativeRocketVisual.load() ? "true":"false")+",\"nativeRocketSkips\":"+std::to_string(nativeRocketSkips.load())+",\"rocketRenderUpdates\":"+std::to_string(rocketRenderUpdates.load())+
         ",\"blockedReloads\":"+std::to_string(blockedReloads.load())+",\"blockedTaskReloads\":"+std::to_string(blockedTaskReloads.load())+
