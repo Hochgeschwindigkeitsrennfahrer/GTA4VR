@@ -16,6 +16,7 @@ import openxrvr;
 import natives;
 import vrhandphysics;
 import vrreload;
+import vrconfig;
 
 export namespace VRHands
 {
@@ -83,6 +84,7 @@ namespace
     float bodyHeightScale=1.f;
     float bodyVerticalOffset=.10f;
     float bodyForwardPlacement=.08f;
+    unsigned bodyConfigRevision=~0u;
     bool trackedBody=false;
     std::atomic<float> torsoDrop=0;
     std::atomic<unsigned> legUpdates=0;
@@ -117,6 +119,16 @@ namespace
     }
     void ResolveBodyHeight(void* skeleton,void* owner)
     {
+        const auto revision=VRConfig::Revision();
+        if(bodyConfigRevision!=revision)
+        {
+            const auto config=VRConfig::Read();
+            const auto height=config.Get(VRConfig::Number::PlayerHeight);
+            if(configuredHeight!=height)bodyDimensionsOwner=nullptr;
+            configuredHeight=height;
+            bodyForwardPlacement=config.Get(VRConfig::Number::BodyForward);
+            bodyConfigRevision=revision;
+        }
         if(!fitBodyHeight) return;
         auto* definition=*reinterpret_cast<void**>(static_cast<char*>(skeleton)+4);
         if(!definition || (definition==bodyDefinition && owner==bodyDimensionsOwner)) return;
@@ -2220,8 +2232,7 @@ void VRHands::Install()
         if(carRender.size()==1) vehicleRenderHook=safetyhook::create_inline(carRender.get_first(),RenderVehicleWheel);
     }
     VRHandPhysics::Install();
-    configuredHeight=ini.ReadFloat("VR","PlayerHeight",1.75f);
-    if(!std::isfinite(configuredHeight) || configuredHeight<1.f || configuredHeight>2.5f) configuredHeight=1.75f;
+    configuredHeight=VRConfig::Read().Get(VRConfig::Number::PlayerHeight);
     fitBodyHeight=ini.ReadInteger("VR","ExperimentalBodyHeight",0)!=0;
     bodyHeadAllowance=ini.ReadFloat("VR","BodyHeadAllowance",.25f);
     bodyHeightScale=ini.ReadFloat("VR","BodyHeightScale",1.f);

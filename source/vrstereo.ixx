@@ -41,7 +41,7 @@ import vrreload;
 export namespace VRStereo
 {
     void Install();
-    void Shutdown(); // Render callback thread, never DllMain.
+    void Shutdown(bool resetHud=true); // Render callback thread, never DllMain.
     bool RestartExperiment();
     bool RequestResolutionCapture();
     bool RequestScopeProbe();
@@ -4199,10 +4199,10 @@ namespace
     }
 }
 
-void VRStereo::Shutdown()
+void VRStereo::Shutdown(bool resetHud)
 {
     shaderEyeSize={};eyeRasterSize=0;screenParameterGeneration.fetch_add(1,std::memory_order_relaxed);
-    VRHud::Reset();
+    if(resetHud)VRHud::Reset();
     scopeActive=buildingScope=false;scopeCompletedFrame=~0u;scopeConfigRevision=~0u;
     scopeProbeRequested=false;scopeCaptureRequested=false;scopeProbeFrames=0;
     resolutionCaptureRequested=false;
@@ -4535,6 +4535,10 @@ void VRStereo::Install()
     maxFrames=std::clamp(ini.ReadInteger("VR","ExperimentalStereoFrames",1),0,600); // Zero runs continuously.
     submit=ini.ReadInteger("VR","ExperimentalSubmit",0)!=0;
     enabled=true;
+    OpenXRVR::SetEyeResolutionResetProvider([](){
+        const bool wanted=enabled;
+        Shutdown(false);enabled=wanted;stereoFrames=0;prepared=false;
+    });
     OpenXRVR::SetEyeImageProvider([]()
     {
         if(!enabled || !RageDirect3DDevice9::m_pRealDevice) return;

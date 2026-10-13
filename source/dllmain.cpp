@@ -16,6 +16,7 @@ import vrhud;
 import vrstereo;
 import vrprofile;
 import vrdiagnostics;
+import vrsettings;
 
 std::vector<std::future<void>> initializationFutures;
 
@@ -61,6 +62,7 @@ void CGameProcessHook()
 void Init()
 {
     VRDiagnostics::Install();
+    VRSettings::Install();
     VRD3D9Ex::Install();
     VRTrace::Install();
     OpenXRVR::Install();

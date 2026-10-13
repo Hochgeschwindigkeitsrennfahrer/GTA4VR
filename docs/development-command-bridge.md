@@ -361,6 +361,11 @@ hand-status includes bodyHeightEnabled/playerHeight/nativeBodyHeight/bodyScale f
 
 ## Wrist HUD diagnostics (#020)
 
+`vr-settings-status` reports native VR-tab registration, calibration outcome and
+persisted standing height/crouch thresholds/configured eye scale. It reads the
+settings snapshot without enabling passive diagnostics. See
+[VR pause-menu settings](vr-pause-settings.md).
+
 `tools/game-command.ps1 hud-status` reports watch enablement, native radar hook calls, capture/draw counts, failures and the source viewport bounds. Inspect with `| ConvertTo-Json -Depth 5`. Draw success does not establish correct position, pixels or readability; inspect a fresh headset/eye image.
 
 `tools/game-command.ps1 hud-capture` requests one source radar and post-draw eye PNG on the next drawable watch frame. Outputs are local `plugins/GTAIV.VR.wrist-radar.png` and `GTAIV.VR.wrist-eye.png`; they remain outside Git. This one-shot readback can hitch and is not a performance capture.

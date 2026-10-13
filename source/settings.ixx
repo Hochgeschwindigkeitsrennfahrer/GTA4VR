@@ -221,6 +221,8 @@ private:
         SettingsTables::Option option;
         std::function<void()> selected;
         int32_t submenu = -1;   // screen of the page the row opens
+        std::function<std::wstring()> labelText;
+        std::function<std::wstring()> valueText,belowText,description;
     };
     static inline std::vector<DynamicOption> dynamicOptions;
 
@@ -230,7 +232,7 @@ private:
     {
         char label[240]{};
         std::wstring text;
-        std::array<SettingsTables::Option, 17> rows{};
+        std::array<SettingsTables::Option, 50> rows{};
         int32_t parent = -1;
         int32_t parentRow = 0;
         bool displayGame = false;
@@ -302,6 +304,64 @@ private:
     static inline SafetyHookMid resetScreenRowsHook;
     static inline SafetyHookMid resetScreenRowsHook2;
     static inline SafetyHookMid pageBackgroundHook;
+    static inline SafetyHookMid customSliderText;
+    static inline int32_t(__cdecl* fontContext)() = nullptr;
+    static inline std::byte* fontParameters = nullptr;
+
+    static DynamicOption* FindDynamicRow(int32_t row)
+    {
+        if (!currentScreen || *currentScreen < 0 || *currentScreen >= 73 || row < 0) return nullptr;
+        auto& options = screens[*currentScreen].options;
+        if (!options.data || row >= options.count) return nullptr;
+        const auto screen = GetLogicalScreen(*currentScreen);
+        for (auto& added : dynamicOptions)
+            if (added.screen == screen && std::strcmp(added.option.label, options.data[row].label) == 0) return &added;
+        return nullptr;
+    }
+
+    static void DrawCustomSliderText(SafetyHookContext& regs)
+    {
+        // CE 008BD530: native bar dispatch at 008BDB1C. No native video-mode
+        // lookup is reused for VR scales; the custom value comes from its owner.
+        const auto row = static_cast<int32_t>(regs.esi);
+        auto option = FindDynamicRow(row);
+        if (!option || !option->valueText || !fontContext || !fontParameters) return;
+        const auto context = fontContext();
+        if (context < 0 || context > 1) return;
+        auto* parameters = fontParameters + context * 0x48;
+        struct Style
+        {
+            std::byte* parameters;
+            std::array<std::byte, 0x48> saved;
+            Style(std::byte* p) : parameters(p) { std::memcpy(saved.data(), p, saved.size()); }
+            ~Style() { std::memcpy(parameters, saved.data(), saved.size()); }
+        } style(parameters);
+        auto stack = reinterpret_cast<const std::byte*>(regs.esp);
+        auto number = [stack](unsigned offset) { float value; std::memcpy(&value, stack + offset, sizeof(value)); return value; };
+        const auto x = number(0x14), y = number(0x18), width = number(0x24), height = number(0x28), padding = number(0x3C);
+        const auto selected = CMenu::m_pMenuID && CMenu::m_pGetSelectedItem ? CMenu::getSelectedItem() : -1;
+        uint32_t color; getHudColour(&color, selected == row ? 62 : 59); setTabColor(color);
+        const auto value = option->valueText();
+        printTab.ccall<void>(x + width + padding * 3, y - height * .5f, value.c_str(), -1, -1);
+        if (option->belowText)
+        {
+            const auto below = option->belowText();
+            printTab.ccall<void>(x, y + height * 1.6f, below.c_str(), -1, -1);
+        }
+        // Paint descriptions once, at the first decorated slider. Font wrap
+        // and color are restored before the native renderer continues.
+        for (int32_t before = 0; before < row; ++before)
+            if (auto earlier = FindDynamicRow(before); earlier && earlier->valueText) return;
+        if (auto focused = FindDynamicRow(selected); focused && focused->description)
+        {
+            const auto description = focused->description();
+            const float left = .57f, right = .985f;
+            std::memcpy(parameters + 0x20, &left, sizeof(left));
+            std::memcpy(parameters + 0x24, &right, sizeof(right));
+            getHudColour(&color, 59); setTabColor(color);
+            printTab.ccall<void>(left, std::max(.08f, y - row * *rowHeight), description.c_str(), -1, -1);
+        }
+    }
     static inline int32_t callbackCount = 0;
     static inline std::map<int32_t, std::vector<SettingsTables::DisplayValue>> dynamicDisplays;
     static inline SettingsTables::Screen* screens = nullptr;
@@ -921,6 +981,18 @@ private:
         {
             if (label != options.data[row].label)
                 continue;
+            const auto screen = FindPage(activePage) ? activePage : *currentScreen;
+            for (const auto& added : dynamicOptions)
+                if (added.screen == screen && std::strcmp(added.option.label, label) == 0 && added.labelText)
+                {
+                    auto rendered = added.labelText();
+                    if (!rendered.empty() && rendered.size() < 60)
+                    {
+                        std::wmemcpy(text, rendered.c_str(), rendered.size() + 1);
+                        return nullptr;
+                    }
+                    break;
+                }
             if (auto button = FindButton(row); button >= 0)
             {
                 if (auto page = FindPage(dynamicOptions[button].submenu))
@@ -1084,6 +1156,17 @@ private:
         });
 
         tabsInitialized = true;
+        if (!legacyExecutable)
+        {
+            auto colorStore = hook::pattern("89 04 D5 ? ? ? ? 0F 2F C1 76 35 C1 E8 18");
+            auto dispatch = hook::pattern("0F B6 44 19 15 83 E8 6B 0F 84");
+            if (colorStore.size() == 1 && dispatch.size() == 1)
+            {
+                fontParameters = *colorStore.get_first<std::byte*>(3);
+                fontContext = reinterpret_cast<decltype(fontContext)>(branch(reinterpret_cast<void*>(setTabColor)));
+                customSliderText = safetyhook::create_mid(dispatch.get_first(), DrawCustomSliderText);
+            }
+        }
     }
 
     static void InitializeMenuAPI()
@@ -1815,6 +1898,55 @@ public:
         if (!callback || dynamicOptions.size() >= SettingsTables::PreferenceCapacity)
             return false;
         return AddOption(screen, label, static_cast<int32_t>(dynamicOptions.size()), 100, std::move(callback));
+    }
+
+    // Native rows copy at most 59 characters into their 60-character buffer.
+    // Evaluate labels on the frontend owner so numeric values need no GXT rebuild.
+    bool SetOptionText(MenuScreen screen, std::string_view key, std::function<std::wstring()> text)
+    {
+        if (!text) return false;
+        auto initial = text();
+        if (initial.empty() || initial.size() >= 60 || initial.find(L'\0') != initial.npos) return false;
+        for (auto& added : dynamicOptions)
+            if (added.screen == static_cast<int32_t>(screen) && key == added.option.label)
+            {
+                CText::menuTexts[GetHash(added.option.label)] = std::move(initial);
+                added.labelText = std::move(text);
+                return true;
+            }
+        return false;
+    }
+
+    bool SetOptionPresentation(MenuScreen screen, std::string_view key,
+        std::function<std::wstring()> value, std::function<std::wstring()> description,
+        std::function<std::wstring()> below = {})
+    {
+        for (auto& added : dynamicOptions)
+            if (added.screen == static_cast<int32_t>(screen) && key == added.option.label)
+            {
+                added.valueText = std::move(value); added.description = std::move(description); added.belowText = std::move(below);
+                return true;
+            }
+        return false;
+    }
+
+    bool AddSpacer(MenuScreen screen)
+    {
+        auto key = std::format("NY_SP_{:04}", dynamicOptions.size());
+        if (!CanAddOption(screen, key)) return false;
+        SettingsTables::Option option; option.display = 100; // MENUOPT_NONE, noninteractive.
+        std::memcpy(option.label, key.data(), key.size());
+        CText::menuTexts[GetHash(key.c_str())] = L" ";
+        dynamicOptions.push_back({ static_cast<int32_t>(screen), option });
+        return true;
+    }
+
+    bool SetSubmenuDescription(MenuScreen child, std::function<std::wstring()> description)
+    {
+        for (auto& added : dynamicOptions)
+            if (added.submenu == static_cast<int32_t>(child))
+            { added.description = std::move(description); return true; }
+        return false;
     }
 
 private:

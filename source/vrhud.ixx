@@ -13,6 +13,7 @@ import openxrvr;
 import d3dx9_43;
 import natives;
 import settings;
+import vrconfig;
 
 export namespace VRHud
 {
@@ -88,6 +89,19 @@ namespace
     float smsBounds[4]{};
     std::atomic<unsigned> smsCaptures{};
     float hudWidth=.64f,hudDistance=2.f;
+    unsigned hudConfigRevision=~0u;
+    void ApplySettings()
+    {
+        const auto revision=VRConfig::Revision();
+        if(hudConfigRevision==revision)return;
+        const auto config=VRConfig::Read();
+        using Number=VRConfig::Number;
+        hudWidth=config.Get(Number::HudWidth);hudDistance=config.Get(Number::HudDistance);
+        size=config.Get(Number::WristSize);back=config.Get(Number::WristBack);lift=config.Get(Number::WristLift);
+        dashboardSize=config.Get(Number::DashboardSize);dashboardForward=config.Get(Number::DashboardForward);
+        dashboardDown=config.Get(Number::DashboardDown);dashboardRight=config.Get(Number::DashboardRight);
+        dashboardTilt=config.Get(Number::DashboardTilt);hudConfigRevision=revision;
+    }
 
     bool Allowed()
     {
@@ -284,6 +298,7 @@ void VRHud::CaptureRadar(IDirect3DDevice9* device,IDirect3DSurface9* source)
 
 void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Vector& eyePosition,const VRMath::Matrix* wristPose,const VRMath::Matrix* dashboardPose)
 {
+    ApplySettings();
     const bool inCar=dashboard && dashboardPose;
     if(!inCar && !wristPose) return;
     if(!Allowed() || !radar || !capturedAt || GetTickCount64()-capturedAt>250 ||
@@ -372,6 +387,7 @@ void VRHud::EndOverlayFrame() {overlayFresh=false;smsFresh=false;}
 
 void VRHud::DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Matrix& headPose)
 {
+    ApplySettings();
     if(!textHud || !Allowed() || !overlayFresh || !overlayTexture || !eye) return;
     if(!overlayShader)
     {
@@ -387,7 +403,10 @@ void VRHud::DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VR
     if(FAILED(eye->GetDesc(&desc))) return;
     D3DSURFACE_DESC hudDesc{};
     if(FAILED(overlaySurface->GetDesc(&hudDesc)) || !hudDesc.Width) return;
-    const float width=2.f*hudDistance*hudWidth,height=width*hudDesc.Height/hudDesc.Width;
+    // Keep the plane's physical size independent of distance. At the original
+    // 2 m default this preserves existing width tuning; moving it farther away
+    // now makes it visibly smaller instead of enlarging it to cancel the move.
+    const float width=4.f*hudWidth,height=width*hudDesc.Height/hudDesc.Width;
     Vertex vertices[4];
     for(unsigned i=0;i<4;++i)
     {
@@ -492,9 +511,7 @@ void VRHud::Install()
     enabled=ini.ReadInteger("VR","WristRadar",0)!=0;
     screens=ini.ReadInteger("VR","WorldSpaceScreens",1)!=0;
     textHud=ini.ReadInteger("VR","ViewHud",1)!=0;
-    const float width=ini.ReadFloat("VR","ViewHudWidth",.64f),distance=ini.ReadFloat("VR","ViewHudDistance",2.f);
-    hudWidth=std::isfinite(width) ? std::clamp(width,.20f,.70f):.64f;
-    hudDistance=std::isfinite(distance) ? std::clamp(distance,1.f,4.f):2.f;
+    ApplySettings();
     // HUD_TEXT_MESSAGE_ICON initialization: obtain the relocated native texture slot.
     auto sms=hook::pattern("8B 0C 85 ? ? ? ? 83 C4 38 A3 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? FF 35 ? ? ? ? FF 35 ? ? ? ? 6A 00 68 ? ? ? ? 68 ? ? ? ? 6A 02");
     if(sms.size()==1) smsTexture=*reinterpret_cast<void***>(sms.get_first<unsigned char>()+16);
@@ -551,17 +568,6 @@ void VRHud::Install()
         wanted=std::min(level,6u);wantedFlashing=Natives::WantedStarsAreFlashing();
     };
     dashboard=ini.ReadInteger("VR","DashboardRadar",1)!=0;
-    auto setting=[&](const char* name,float fallback,float minimum,float maximum){
-        const float value=ini.ReadFloat("VR",name,fallback);return std::isfinite(value) ? std::clamp(value,minimum,maximum):fallback;
-    };
-    dashboardSize=setting("DashboardRadarSize",.16f,.08f,.35f);
-    dashboardForward=setting("DashboardRadarForward",.55f,.15f,1.5f);
-    dashboardDown=setting("DashboardRadarDown",.32f,-.1f,.8f);
-    dashboardRight=setting("DashboardRadarRight",.45f,-2.f,2.f);
-    dashboardTilt=setting("DashboardRadarTilt",12.f,-45.f,60.f);
-    size=std::clamp(ini.ReadFloat("VR","WristRadarSize",.10f),.06f,.30f);
-    back=std::clamp(ini.ReadFloat("VR","WristRadarBackOffset",.075f),0.f,.25f);
-    lift=std::clamp(ini.ReadFloat("VR","WristRadarLift",.04f),.01f,.15f);
     if(!enabled) return;
     auto signature=hook::pattern("83 EC 10 53 6A 00 E8 ? ? ? ? A1 ? ? ? ? 33 C9 85 C0 0F 48 C8 51 6A 01");
     if(signature.size()==1) radarDraw=safetyhook::create_inline(signature.get_first(),RadarDraw);

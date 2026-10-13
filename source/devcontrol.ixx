@@ -23,6 +23,7 @@ import vrreload;
 import vrhandphysics;
 import vrhud;
 import vrprofile;
+import vrsettings;
 import natives;
 
 export namespace DevControl { void Install(); }
@@ -252,6 +253,7 @@ namespace
         {
             response="{\"ok\":true,\"input\":"+OpenXRVR::InputStatus()+"}";
         }
+        else if(command=="vr-settings-status") response="{\"ok\":true,\"settings\":"+VRSettings::Status()+"}";
         else if(command=="hand-status") response="{\"ok\":true,\"hands\":"+VRHands::Status()+"}";
         else if(command=="combat-status") response="{\"ok\":true,\"combat\":"+VRHandPhysics::CombatStatus()+"}";
         else if(command=="melee-test-status") response=MeleeTestStatus();

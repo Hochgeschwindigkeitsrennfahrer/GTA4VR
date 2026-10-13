@@ -21,6 +21,7 @@ module;
 #include "includes/vrmath.hpp"
 #include "includes/vrphoneinput.hpp"
 #include "includes/vrresolution.hpp"
+#include "includes/vrsettingsmodel.hpp"
 
 export module openxrvr;
 
@@ -83,11 +84,15 @@ export namespace OpenXRVR
     bool RequestProducerTest(bool enable);
     std::string ProducerTestStatus();
     bool GetEyeViews(EyeView (&views)[2], long long& displayTime);
+    bool GetFloorHeight(float& height); // Fresh, tracked STAGE pose; never LOCAL/startup height.
     bool HasFocusedViews(); // Fresh pose and focus gate for gameplay direction.
     bool CanAcceptEyeImages(); // Render callback thread; false while stopped or recreating.
     bool PacesGameplay(); // Atomic; true while the runtime requests stereo frames.
     bool IsSessionRunning(); // Atomic; focus/overlay changes do not stop the session.
-    bool GetEyeResolution(unsigned& width,unsigned& height); // Fixed at session creation; independent of desktop.
+    bool GetEyeResolution(unsigned& width,unsigned& height); // Independent of desktop; recreated by explicit scale Apply.
+    bool PreviewEyeResolution(float scale,unsigned& width,unsigned& height);
+    bool RequestEyeRenderScale(float scale); // Apply at EndScene while the pause menu is active.
+    void SetEyeResolutionResetProvider(void (*reset)());
     bool SetEyeImages(const HANDLE (&shared)[2], unsigned width, unsigned height,
         const EyeView (&views)[2], long long poseTime); // Render callback thread after D3D9 GPU completion.
     bool UsesVulkan();
@@ -171,6 +176,7 @@ namespace
     long long eyeDisplayTime = 0;
     bool eyeViewsValid = false;
     bool focusedEyeViews=false;
+    bool floorHeightTracked=false;
     uint64_t eyeSampledAt=0;
     bool controllerEnabled=false,inputReady=false;
     XrActionSet inputActions=XR_NULL_HANDLE;
@@ -239,6 +245,9 @@ namespace
     OpenXRVR::EyeView imageViews[2]{};
     unsigned imageWidth=0,imageHeight=0;
     std::atomic<uint64_t> recommendedEyeSize{0};
+    std::atomic<uint64_t> nativeEyeRecommendation{0},maximumEyeSize{0};
+    std::atomic<float> requestedEyeScale{0};
+    void (*eyeResolutionReset)()=nullptr;
     float eyeRenderScale=1.f;
     bool runtimeEyeResolution=true;
     long long imagePoseTime=0;
@@ -821,6 +830,8 @@ namespace
                 std::max(dimensions[0].recommendedImageRectHeight,dimensions[1].recommendedImageRectHeight)};
             VRResolution::Size maximum{std::min({dimensions[0].maxImageRectWidth,dimensions[1].maxImageRectWidth,unsigned(caps.MaxTextureWidth),65535u}),
                 std::min({dimensions[0].maxImageRectHeight,dimensions[1].maxImageRectHeight,unsigned(caps.MaxTextureHeight),65535u})};
+            nativeEyeRecommendation=(uint64_t(suggested.width)<<32)|suggested.height;
+            maximumEyeSize=(uint64_t(maximum.width)<<32)|maximum.height;
             try
             {
                 const auto size=VRResolution::Recommended(suggested,maximum,eyeRenderScale);
@@ -945,6 +956,39 @@ namespace
     {
         if (!enabled || permanentFailure) return;
         VRProfile::Scope frameProfile(VRProfile::Metric::XRFrameWall);
+        const auto scale=requestedEyeScale.exchange(0);
+        if(scale>0 && running && !pendingRecreate && eyeResolutionReset &&
+            CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive)
+        {
+            unsigned width=0,height=0;
+            if(OpenXRVR::PreviewEyeResolution(scale,width,height))
+            {
+                // No acquired image/frame is active here. Complete old copy
+                // work before retiring its swapchains or native eye textures.
+                if(vulkanBridge)
+                {
+                    if(!vulkanBridge->Destroy()) {Fallback("Eye scale: pending Vulkan copy could not retire");return;}
+                    delete vulkanBridge;vulkanBridge=nullptr;
+                }
+                haveEyeImages=false;
+                for(unsigned eye=0;eyeChains && eye<2;++eye)
+                {
+                    auto& chain=eyeChains[eye];chain.shared.Reset();chain.images.clear();
+                    if(chain.handle!=XR_NULL_HANDLE)api.destroySwapchain(chain.handle);
+                }
+                delete[] eyeChains;eyeChains=nullptr;imageWidth=imageHeight=0;
+                eyeResolutionReset();
+                eyeRenderScale=scale;recommendedEyeSize=(uint64_t(width)<<32)|height;
+                if(vulkanEnabled)
+                {
+                    vulkanBridge=new DxvkVulkan::Bridge;
+                    auto* device9=RageDirect3DDevice9::m_pRealDevice ? *RageDirect3DDevice9::m_pRealDevice:nullptr;
+                    if(!device9 || !vulkanBridge->Attach(device9)) {Fallback("Eye scale: DXVK interop recreation failed");return;}
+                }
+                // Preserve the session, poses, actions, panel and desktop mode.
+                // New eye swapchains are created when rebuilt targets arrive.
+            }
+        }
         if (pendingRecreate)
         {
             if(vulkanEnabled && (!RageDirect3DDevice9::m_pRealDevice || !*RageDirect3DDevice9::m_pRealDevice)) return;
@@ -1041,6 +1085,7 @@ namespace
         AcquireSRWLockExclusive(&eyeLock);
         eyeViewsValid = viewCount == 2 && (viewState.viewStateFlags & required) == required;
         focusedEyeViews=eyeViewsValid && sessionState==XR_SESSION_STATE_FOCUSED;
+        floorHeightTracked=eyeViewsValid && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT)!=0;
         eyeSampledAt=GetTickCount64();
         if (eyeViewsValid)
         {
@@ -1311,6 +1356,26 @@ bool OpenXRVR::GetEyeResolution(unsigned& width,unsigned& height)
     return width && height;
 }
 
+bool OpenXRVR::PreviewEyeResolution(float scale,unsigned& width,unsigned& height)
+{
+    const auto native=nativeEyeRecommendation.load(),maximum=maximumEyeSize.load();
+    if(!native || !maximum || !std::isfinite(scale) || scale<=0)return false;
+    try
+    {
+        const auto size=VRResolution::Recommended({unsigned(native>>32),unsigned(native)},
+            {unsigned(maximum>>32),unsigned(maximum)},scale);
+        width=size.width;height=size.height;return true;
+    }
+    catch(...) {return false;}
+}
+bool OpenXRVR::RequestEyeRenderScale(float scale)
+{
+    unsigned width=0,height=0;
+    if(!running.load() || !eyeResolutionReset || !PreviewEyeResolution(scale,width,height))return false;
+    requestedEyeScale=scale;return true;
+}
+void OpenXRVR::SetEyeResolutionResetProvider(void (*reset)()) {eyeResolutionReset=reset;}
+
 bool OpenXRVR::PacesGameplay()
 {
     // The native renderer can stop executing while simulation continues.
@@ -1336,6 +1401,17 @@ bool OpenXRVR::GetEyeViews(EyeView (&views)[2], long long& displayTime)
     }
     ReleaseSRWLockShared(&eyeLock);
     return valid;
+}
+
+bool OpenXRVR::GetFloorHeight(float& height)
+{
+    AcquireSRWLockShared(&eyeLock);
+    const auto sampled=VRSettingsModel::FloorHeight(eyeViews[0].position[1],eyeViews[1].position[1],
+        eyeViewsValid && eyeViews[0].floorRelative && eyeViews[1].floorRelative,
+        floorHeightTracked && focusedEyeViews,
+        eyeSampledAt && GetTickCount64()-eyeSampledAt<=250);
+    if(sampled)height=*sampled;
+    ReleaseSRWLockShared(&eyeLock);return sampled.has_value();
 }
 
 bool OpenXRVR::GetControllerInput(ControllerInput& input)

@@ -14,6 +14,7 @@ import comvars;
 import openxrvr;
 import natives;
 import vrhands;
+import vrconfig;
 
 export namespace VRCamera
 {
@@ -103,7 +104,7 @@ namespace
     std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
     std::atomic<bool> firstPersonActive{false};
     bool visibilityAvailable=false;
-    bool showBody=true;
+    std::atomic<bool> showBody{true};
     std::atomic<bool> headlessBodyAvailable{false};
     VRMath::Matrix trackingBasis{};
     float headHeight=0;
@@ -129,6 +130,7 @@ namespace
     VRMath::Matrix vehicleHudAnchor{};
     VRMath::Vector seatOffset{};
     float vehicleEyeHeightOffset=.075f;
+    unsigned viewConfigRevision=~0u,crouchConfigRevision=~0u;
     unsigned anchorFrames=0, anchorSamples=0;
     unsigned probeSamples=8;
     using ColliderLookup=void* (__thiscall*)(void*);
@@ -1058,6 +1060,27 @@ namespace
 
     void ProcessPhysicalCrouch()
     {
+        const auto revision=VRConfig::Revision();
+        if(crouchConfigRevision!=revision)
+        {
+            const auto config=VRConfig::Read();
+            physicalCrouchEnabled=firstPerson && config.Get(VRConfig::Flag::PhysicalCrouch);
+            AcquireSRWLockExclusive(&roomLock);
+            physicalCrouch.reference=config.Get(VRConfig::Number::PlayerHeight);
+            ReleaseSRWLockExclusive(&roomLock);
+            if(!physicalCrouchEnabled && physicalCrouchOwnsDuck.load())
+            {
+                using Hash=Natives::NativeHashes;
+                if(NativeInvoke::GetNativeHandler(std::to_underlying(Hash::DOES_CHAR_EXIST)) &&
+                    NativeInvoke::GetNativeHandler(std::to_underlying(Hash::SET_CHAR_DUCKING)) &&
+                    physicalCrouchOwner && Natives::DoesCharExist(physicalCrouchOwner))
+                {
+                    Natives::SetCharDucking(physicalCrouchOwner,false);
+                    physicalCrouchOwnsDuck=false;physicalDuckAcknowledged=false;
+                }
+            }
+            crouchConfigRevision=revision;
+        }
         if(!physicalCrouchEnabled || !firstPersonActive || vehicleView || !OpenXRVR::HasFocusedViews() ||
             (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive)) return;
         using Hash=Natives::NativeHashes;
@@ -1080,7 +1103,7 @@ namespace
         AcquireSRWLockExclusive(&roomLock);
         if(canceled) physicalCrouch.CancelUntilStanding();
         const float height=physicalEyeHeight;
-        const bool valid=std::isfinite(height) && height>=.45f && height<=2.5f;
+        const bool valid=std::isfinite(height) && height>0;
         const bool lowered=valid && physicalCrouch.Update(height);
         ReleaseSRWLockExclusive(&roomLock);
         if(canceled) {physicalCrouchOwnsDuck=false; physicalDuckAcknowledged=false;}
@@ -1466,13 +1489,11 @@ void VRCamera::Install()
     }
     roomScale=firstPerson && ini.ReadInteger("VR","ExperimentalRoomScale",0)!=0;
     physicalCrouchEnabled=firstPerson && ini.ReadInteger("VR","ExperimentalPhysicalCrouch",0)!=0;
-    const float crouchReference=ini.ReadFloat("VR","PlayerHeight",1.75f);
-    const float vehicleHeight=ini.ReadFloat("VR","VehicleEyeHeightOffset",.075f);
-    if(std::isfinite(vehicleHeight)) vehicleEyeHeightOffset=std::clamp(vehicleHeight,-.3f,.5f);
-    if(std::isfinite(crouchReference) && crouchReference>=.45f && crouchReference<=2.5f)
-        physicalCrouch.reference=crouchReference;
+    const auto cameraConfig=VRConfig::Read();
+    physicalCrouch.reference=cameraConfig.Get(VRConfig::Number::PlayerHeight);
+    vehicleEyeHeightOffset=cameraConfig.Get(VRConfig::Number::VehicleEyeHeight);
     if(firstPerson) FusionFix::onGameProcessEvent() += SampleAnimationState;
-    if(physicalCrouchEnabled) FusionFix::onGameProcessEvent() += ProcessPhysicalCrouch;
+    if(firstPerson) FusionFix::onGameProcessEvent() += ProcessPhysicalCrouch;
     headRelativeMovement=firstPerson && ini.ReadInteger("VR","ExperimentalHeadRelativeMovement",0)!=0;
     headsetAim=firstPerson && ini.ReadInteger("VR","ExperimentalHeadsetAim",0)!=0;
     if(headsetAim)
@@ -1601,6 +1622,14 @@ bool VRCamera::GenerateOpticalView(const rage::grcViewport& base,const VRMath::M
 bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (&eyes)[2],
     rage::grcViewport (&output)[2])
 {
+    const auto revision=VRConfig::Revision();
+    if(viewConfigRevision!=revision)
+    {
+        const auto config=VRConfig::Read();
+        vehicleEyeHeightOffset=config.Get(VRConfig::Number::VehicleEyeHeight);
+        showBody=config.Get(VRConfig::Flag::ShowBody);
+        viewConfigRevision=revision;
+    }
     vehicleHudValid=false;
     if (!setCamera || !setProjection || !base.mIsPerspective || base.mInvertZInProjectionMatrix)
         {InvalidateHeading(); StopRoomMotion(); return false;}

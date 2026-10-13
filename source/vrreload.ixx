@@ -13,6 +13,7 @@ import vrdiagnostics;
 import comvars;
 import natives;
 import openxrvr;
+import vrconfig;
 
 export namespace VRReloadRuntime
 {
@@ -750,8 +751,9 @@ namespace
         }
         const bool right=input.grabActive[1] && input.grab[1];
         const bool left=input.grabActive[0] && input.grab[0];
-        if(!left || !profile.counter.editWithOffHand) counterEditing=false;
-        if(left && profile.counter.enabled && profile.counter.editWithOffHand && !ammo.holding &&
+        const bool showCounter=VRConfig::Read().Get(VRConfig::Flag::AmmoCounters);
+        if(!left || !profile.counter.editWithOffHand || !showCounter) counterEditing=false;
+        if(left && showCounter && profile.counter.enabled && profile.counter.editWithOffHand && !ammo.holding &&
             (counterEditing || VRAmmoCounter::Near(profile.counter,gun,view.wrist[0][3])))
         {
             const auto hand=VRMath::Multiply(view.wrist[0],VRMath::InverseRigid(gun));
@@ -942,7 +944,8 @@ void VRReloadRuntime::Fired(void* ped,void* weapon)
 bool VRReloadRuntime::UsesLeftHand() {return leftBusy || counterEditing;}
 bool VRReloadRuntime::CounterGrabPriority(void* ped,void* entity,const VRMath::Matrix& hand)
 {
-    if(!profile.counter.enabled || !profile.counter.editWithOffHand || ped!=owner || entity!=visualGun.load() || !entity) return false;
+    if(!profile.counter.enabled || !profile.counter.editWithOffHand || ped!=owner || entity!=visualGun.load() || !entity ||
+        !VRConfig::Read().Get(VRConfig::Flag::AmmoCounters)) return false;
     auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(entity)+0x20);
     return counterEditing || (root && VRAmmoCounter::Near(profile.counter,VRMath::AffineXYZ(*root),hand[3]));
 }
@@ -964,7 +967,8 @@ bool VRReloadRuntime::GetAmmoCounter(const void* entity,VRAmmoCounter::Snapshot&
 {
     result={};
     if(!enabled || !guardedWeapon.load() || !entity ||
-        entity!=visualGun.load() || !profile.counter.enabled || !OpenXRVR::HasFocusedViews()) return false;
+        entity!=visualGun.load() || !profile.counter.enabled || !OpenXRVR::HasFocusedViews() ||
+        !VRConfig::Read().Get(VRConfig::Flag::AmmoCounters)) return false;
     auto* root=*reinterpret_cast<VRMath::Matrix* const*>(static_cast<const char*>(entity)+0x20);
     if(!root) return false;
     result.gun=VRMath::AffineXYZ(*root);
