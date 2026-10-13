@@ -3426,7 +3426,21 @@ namespace
         composingHud=true;
         for(unsigned eye=0;eye<2;++eye) DrawScopeLens(device,eye);
         for(unsigned eye=0;eye<2;++eye) DrawAmmoCounter(device,eye);
-        for(unsigned eye=0;eye<2;++eye) VRHud::Draw(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],completedEyePosition[eye],completedWristValid[eye] ? &completedWrist[eye]:nullptr,completedDashboardValid[eye] ? &completedDashboard[eye]:nullptr);
+        for(unsigned eye=0;eye<2;++eye)
+        {
+            // Same opaque per-eye depth used by scope lenses and weapon displays.
+            ComPtr<IDirect3DSurface9> hudDepth=resources->worldDepth[eye];
+            for(const auto& target:resources->targets)
+            {
+                if(target.name!="_DEFERRED_GBUFFER_3_")continue;
+                D3DSURFACE_DESC desc{};
+                if(SUCCEEDED(target.surface[eye]->GetDesc(&desc)) && (desc.Usage&D3DUSAGE_DEPTHSTENCIL) &&
+                    desc.Width==resources->eyeSize.width && desc.Height==resources->eyeSize.height)hudDepth=target.surface[eye];
+            }
+            VRHud::Draw(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],completedEyePosition[eye],
+                completedWristValid[eye] ? &completedWrist[eye]:nullptr,completedDashboardValid[eye] ? &completedDashboard[eye]:nullptr,
+                hudDepth.Get(),completedLogDepth[eye],resources->worldViewport[eye]);
+        }
         const auto hudPose=VRMath::BlendRigidPose(completedEyeCamera[0],completedEyeCamera[1],.5f);
         for(unsigned eye=0;eye<2;++eye) VRHud::DrawOverlay(device,resources->finalSurface[eye].Get(),completedViewProjection[eye],hudPose);
         VRHud::EndOverlayFrame();

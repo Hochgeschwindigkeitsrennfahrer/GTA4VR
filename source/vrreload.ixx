@@ -14,6 +14,7 @@ import comvars;
 import natives;
 import openxrvr;
 import vrconfig;
+import vrhud;
 
 export namespace VRReloadRuntime
 {
@@ -613,6 +614,7 @@ namespace
     }
     void WriteAmmo(Ped ped)
     {
+        if(reportedClip.load()!=ammo.Clip() || reportedReserve.load()!=ammo.reserve)VRHud::AmmoChanged();
         Natives::SetAmmoInClip(ped,currentType.load(),ammo.Clip());
         // CE SET_AMMO_IN_CLIP also adds (newClip-oldClip) to total ammo.
         // Write the authoritative total last, or a rack/ejection/insert gets
@@ -929,6 +931,7 @@ void VRReloadRuntime::EmptyTrigger(void* ped,void* weapon)
 }
 void VRReloadRuntime::Fired(void* ped,void* weapon)
 {
+    if(ped && FindPlayerPed && ped==FindPlayerPed(0))VRHud::AmmoChanged();
     if(weapon!=guardedWeapon.load())
     {
         if(vehicleMode.load() && ped && FindPlayerPed && ped==FindPlayerPed(0))
