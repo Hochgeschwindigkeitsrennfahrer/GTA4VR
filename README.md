@@ -14,7 +14,7 @@ The Lost and Damned and The Ballad of Gay Tony have **not** been tested at all.
 - **First-person stereo rendering:** independent eye views, headset rotation, room-scale movement with body collision and physical crouching.
 - **Tracked hands and arms:** character-rig IK follows the controllers, with button-driven finger poses and physical hand/forearm contact.
 - **Locomotion:** head-relative touchpad movement, jogging, sprinting, jumping and strafing/backward movement.
-- **Physical firearms:** controller-directed shooting, two-hand aiming, recoil, magazines/shells/rockets, charging handles and slides. The pump shotgun requires pumping after each shot. Sniper scopes render a magnified view inside the scope.
+- **Physical firearms:** controller-directed shooting, two-hand aiming, recoil, physical weapon realoding and diegetic ammo counters. The pump shotgun requires pumping after each shot. Sniper scopes render a magnified view inside the scope.
 - **Melee and throwing:** tracked punches, knife/bat strikes, and physical grenade/Molotov throws.
 - **Physics interaction:** grab, move and throw props; use one or two hands; manipulate car doors, bonnets and trunks; grab ragdolled NPCs. Object weight and arm strength affect movement.
 - **Cars:** freely tracked hands, physical steering-wheel grip and rotation, basic driving controls, left-hand drive-by weapon handling and the native phone. Other vehicle classes and combined gameplay routes need more testing.
@@ -29,6 +29,8 @@ Short clips of the current build; these demonstrate individual features, not a c
 
 **Firearms and physical reloads**  
 
+![Pistol handling and diegetic ammo counter](docs/media/pistol-ammo-counter.gif)
+![Pump shotgun handling](docs/media/pump-shotgun.gif)
 ![Tracked shooting and weapon handling](docs/media/firearms.gif)
 
 **Physical combat**  
