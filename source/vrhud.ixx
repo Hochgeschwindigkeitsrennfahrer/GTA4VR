@@ -525,10 +525,10 @@ void VRHud::Install()
         if(window.size()==1) popupWindow=safetyhook::create_inline(window.get_first(),PopupWindow);
         if(!fontDraw) textHud=false;
     }
-    if(screens) CSettings::SetVRMenuPointerProvider([](float& u,float& v,bool& select,bool& back,uint64_t& stamp){
+    if(screens) CSettings::SetVRMenuPointerProvider([](float& u,float& v,bool& select,bool& back,bool& waypoint,uint64_t& stamp){
         OpenXRVR::PanelPointer pointer{};
         if(!OpenXRVR::GetPanelPointer(pointer))return false;
-        stamp=pointer.sampledAt;select=pointer.down;back=pointer.back;
+        stamp=pointer.sampledAt;select=pointer.down;back=pointer.back;waypoint=pointer.waypoint;
         u=pointer.hit ? pointer.u:-1.f;v=pointer.hit ? pointer.v:-1.f;
         return pointer.active || pointer.back;
     });

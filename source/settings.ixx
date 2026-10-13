@@ -563,19 +563,22 @@ private:
         return selectOption.ccall<uint8_t>(menu, row, adjusted);
     }
 
-    static inline std::function<bool(float&,float&,bool&,bool&,uint64_t&)> vrMenuPointer;
+    static inline std::function<bool(float&,float&,bool&,bool&,bool&,uint64_t&)> vrMenuPointer;
+    static inline SafetyHookMid vrMapCursor;
     static inline uint64_t vrMouseSample=0;
     static inline unsigned vrMouseCurrent=0,vrMousePrevious=0;
-    static inline bool vrMouseOwned=false;
+    static inline bool vrMouseOwned=false,vrMouseHit=false;
     static void ApplyVRMenuPointer()
     {
         if(!vrMenuPointer || !mousePosition || !mouseScale) return;
-        float u=0,v=0;bool select=false,back=false;uint64_t stamp=0;
-        const bool valid=vrMenuPointer(u,v,select,back,stamp);
+        float u=0,v=0;bool select=false,back=false,waypoint=false;uint64_t stamp=0;
+        const bool valid=vrMenuPointer(u,v,select,back,waypoint,stamp);
+        vrMouseHit=valid && u>=0 && v>=0;
+        waypoint &= currentScreen && *currentScreen==3 && u>=0 && v>=0;
         if(!valid && !vrMouseOwned)return;
         if(stamp!=vrMouseSample || !valid)
         {
-            vrMousePrevious=vrMouseCurrent;vrMouseCurrent=valid ? (select ? 1u:0u)|(back ? 8u:0u):0;
+            vrMousePrevious=vrMouseCurrent;vrMouseCurrent=valid ? (select ? 1u:0u)|(back ? 8u:0u)|(waypoint ? 2u:0u):0;
             vrMouseSample=stamp;
         }
         if(valid && u>=0 && v>=0 && mouseScale[0]>0 && mouseScale[2]>0)
@@ -583,8 +586,8 @@ private:
             mousePosition[0]=static_cast<int32_t>(std::lround(u/mouseScale[0]));
             mousePosition[3]=static_cast<int32_t>(std::lround(v/mouseScale[2]));
         }
-        mousePosition[1]=(mousePosition[1]&~9)|vrMousePrevious;
-        mousePosition[2]=(mousePosition[2]&~9)|vrMouseCurrent;
+        mousePosition[1]=(mousePosition[1]&~11)|vrMousePrevious;
+        mousePosition[2]=(mousePosition[2]&~11)|vrMouseCurrent;
         vrMouseOwned=valid;
     }
 
@@ -1158,6 +1161,14 @@ private:
         tabsInitialized = true;
         if (!legacyExecutable)
         {
+            // CE 005B2875: native waypoint placement must use the ray cursor,
+            // even if a physical gamepad was the most recent input device.
+            // Change this branch only; retain native device ownership globally.
+            auto cursorGate=hook::pattern("80 B8 8D 32 00 00 00 0F 84 ? ? ? ? 66 0F 6E 05 ? ? ? ? 0F 5B C0 8D 44 24 18");
+            if(cursorGate.size()==1)vrMapCursor=safetyhook::create_mid(cursorGate.get_first(7),[](SafetyHookContext& regs){
+                ApplyVRMenuPointer();
+                if(vrMouseHit && currentScreen && *currentScreen==3)regs.eflags &= ~uintptr_t(0x40);
+            });
             auto colorStore = hook::pattern("89 04 D5 ? ? ? ? 0F 2F C1 76 35 C1 E8 18");
             auto dispatch = hook::pattern("0F B6 44 19 15 83 E8 6B 0F 84");
             if (colorStore.size() == 1 && dispatch.size() == 1)
@@ -1638,7 +1649,7 @@ public:
     }
 public:
     // A custom screen is shown in place of the Display screen
-    static void SetVRMenuPointerProvider(std::function<bool(float&,float&,bool&,bool&,uint64_t&)> provider)
+    static void SetVRMenuPointerProvider(std::function<bool(float&,float&,bool&,bool&,bool&,uint64_t&)> provider)
     { vrMenuPointer=std::move(provider); }
     static bool IsCustomScreenActive() { return activePage != -1; }
     // Before the game frees the screens' rows (frontend XML reload)

@@ -61,14 +61,14 @@ export namespace OpenXRVR
         float phoneDirection[2]{};
         bool phoneUp=false,phoneDown=false,phoneLeft=false,phoneRight=false,phoneAccept=false;
         uint64_t phonePresses[6]{};
-        bool contextInteract=false,scriptMenuActive=false;
+        bool contextInteract=false,confirm=false,scriptMenuActive=false;
         bool scriptUp=false,scriptDown=false,scriptLeft=false,scriptRight=false,scriptAccept=false,scriptBack=false;
-        uint64_t scriptPresses[6]{},contextPresses=0;
+        uint64_t scriptPresses[6]{},contextPresses=0,confirmPresses=0;
         unsigned long long sampledAt=0;
     };
     struct PanelPointer
     {
-        bool active=false,hit=false,down=false,back=false;
+        bool active=false,hit=false,down=false,back=false,waypoint=false;
         float u=0,v=0;
         float origin[3]{},end[3]{};
         unsigned long long sampledAt=0;
@@ -185,7 +185,7 @@ namespace
         Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
         PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,
         DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,DrivePhoneOpen,
-        ContextInteract,DriveContextInteract,ScriptDirection,ScriptClick,ScriptUp,ScriptDown,ScriptLeft,ScriptRight,ScriptAccept,ScriptBack,Count};
+        ContextInteract,DriveContextInteract,Confirm,DriveConfirm,Waypoint,ScriptDirection,ScriptClick,ScriptUp,ScriptDown,ScriptLeft,ScriptRight,ScriptAccept,ScriptBack,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
     std::atomic<bool> scriptMenuInput=false;
@@ -199,7 +199,7 @@ namespace
     XrSpace gripSpaces[2]{XR_NULL_HANDLE,XR_NULL_HANDLE};
     OpenXRVR::ControllerInput controllerInput{}; // Published with eyeLock.
     VRPhoneInput::Edges phoneEdges{}; // Render-thread input edges survive between simulation ticks.
-    VRPhoneInput::Edges scriptEdges{},contextEdges{};
+    VRPhoneInput::Edges scriptEdges{},contextEdges{},confirmEdges{};
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -537,6 +537,9 @@ namespace
             !game(Action::DriveHorn,drivingActions,"horn","Car horn",boolean,1,"/input/trackpad/click") ||
             !game(Action::DrivePhoneOpen,drivingActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
             !game(Action::DriveContextInteract,drivingActions,"context_interact","Context interaction",boolean,0,nullptr) ||
+            !game(Action::Confirm,gameplayActions,"confirm","Confirm / accept",boolean,1,nullptr) ||
+            !game(Action::DriveConfirm,drivingActions,"confirm","Confirm / accept",boolean,1,nullptr) ||
+            !game(Action::Waypoint,menuActions,"set_waypoint","Set / remove map waypoint",boolean,1,"/input/trackpad/click") ||
             !game(Action::Pause,systemActions,"pause","Pause / skip cutscene (tap)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneOpen,systemActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneDirection,phoneActions,"phone_direction","Phone navigation direction",vector,1,"/input/trackpad") ||
@@ -585,12 +588,14 @@ namespace
         if(inputReady && sessionState==XR_SESSION_STATE_FOCUSED)
         {
             const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
-            const bool scripted=!menu && scriptMenuInput.load();
+            const bool phone=!menu && CPhoneMgr::bDisplayMobile && *CPhoneMgr::bDisplayMobile;
+            const bool scripted=!menu && !phone && scriptMenuInput.load();
             XrActiveActionSet active[]{{inputActions,XR_NULL_PATH},{systemActions,XR_NULL_PATH},
                 {(menu || scripted) ? menuActions : drivingInput.load() ? drivingActions : gameplayActions,XR_NULL_PATH},
-                {phoneActions,XR_NULL_PATH}};
-            const bool phone=!menu && CPhoneMgr::bDisplayMobile && *CPhoneMgr::bDisplayMobile;
-            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=phone ? 4:3; sync.activeActionSets=active;
+                {scripted ? (drivingInput.load() ? drivingActions:gameplayActions):phoneActions,XR_NULL_PATH}};
+            // Script previews still need contextual gameplay confirmation;
+            // higher-priority Menus retains ownership of its navigation inputs.
+            XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO}; sync.countActiveActionSets=(phone || scripted) ? 4:3; sync.activeActionSets=active;
             if(api.syncActions(session,&sync)==XR_SUCCESS)
             {
                 auto getBool=[&](Action id,bool* available=nullptr,XrPath path=XR_NULL_PATH){
@@ -643,6 +648,7 @@ namespace
                 }
                 sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
                 sample.contextInteract=!menu && !phone && getBool(sample.driving ? Action::DriveContextInteract : Action::ContextInteract);
+                sample.confirm=!menu && !phone && getBool(sample.driving ? Action::DriveConfirm : Action::Confirm);
                 sample.scriptMenuActive=scripted && !phone;
                 if(sample.scriptMenuActive)
                 {
@@ -742,6 +748,8 @@ namespace
         std::copy(scriptEdges.presses.begin(),scriptEdges.presses.end(),sample.scriptPresses);
         contextEdges.Sample({sample.contextInteract,false,false,false,false,false});
         sample.contextPresses=contextEdges.presses[0];
+        confirmEdges.Sample({sample.confirm,false,false,false,false,false});
+        sample.confirmPresses=confirmEdges.presses[0];
         AcquireSRWLockExclusive(&eyeLock); controllerInput=sample; ReleaseSRWLockExclusive(&eyeLock);
     }
 
@@ -751,6 +759,12 @@ namespace
         const auto& input=controllerInput; // Same render callback that publishes it.
         const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
         pointer.back=menu && input.back;
+        if(menu && inputReady && sessionState==XR_SESSION_STATE_FOCUSED)
+        {
+            XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};get.action=actions[static_cast<unsigned>(Action::Waypoint)];
+            XrActionStateBoolean value{XR_TYPE_ACTION_STATE_BOOLEAN};
+            pointer.waypoint=api.getBoolean(session,&get,&value)==XR_SUCCESS && value.isActive && value.currentState;
+        }
         const unsigned hand=input.poseValid[1] ? 1:0;
         if(menu && panelActive && panelAnchored && sessionState==XR_SESSION_STATE_FOCUSED && input.poseValid[hand])
         {
@@ -764,6 +778,7 @@ namespace
             pointer.hit=VRMath::RayPanel(panel,aim[3],direction,2.4f,2.4f*(panelHeight-4)/panelWidth,pointer.u,pointer.v,distance);
             if(!pointer.hit)distance=2.f;
             pointer.down=pointer.hit && input.select[hand];
+            pointer.waypoint &= pointer.hit;
             for(unsigned a=0;a<3;++a){pointer.origin[a]=aim[3][a];pointer.end[a]=aim[3][a]+distance*direction[a];}
         }
         AcquireSRWLockExclusive(&eyeLock);panelPointer=pointer;ReleaseSRWLockExclusive(&eyeLock);

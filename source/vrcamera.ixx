@@ -101,6 +101,7 @@ namespace
     void* scriptCameraManager=nullptr;
     ScriptCameraAccessor scriptCameraRoot=nullptr,scriptCameraDraw=nullptr;
     std::atomic<unsigned> scriptRawDown{0},scriptRawRising{0};
+    std::atomic<bool> confirmRawDown{false},confirmRawRising{false};
     std::atomic<float> padSteering{0},padThrottle{0},padBrake{0};
     std::atomic<bool> firstPersonActive{false};
     bool visibilityAvailable=false;
@@ -608,9 +609,11 @@ namespace
         constexpr unsigned ids[]{8,9,10,11,16,17}; // D-pad, A, B
         const bool phone=CPhoneMgr::bDisplayMobile && *CPhoneMgr::bDisplayMobile;
         const bool scripted=scriptCameraActive.load() && !phone;
-        if(pad>1 || (!phone && !scripted) ||
+        if(pad>1 ||
             (CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive) ||
             !OpenXRVR::HasFocusedViews() || GetTickCount64()-phoneRawSampledAt.load()>250) return 0;
+        if(button==16 && (rising ? confirmRawRising.load():confirmRawDown.load())) return 1;
+        if(!phone && !scripted)return 0;
         for(unsigned i=0;i<6;++i) if(button==ids[i])
         {
             VRDiagnostics::Increment(phoneRawQueries);
@@ -790,8 +793,13 @@ namespace
         previousCutsceneSkip=cutsceneSkip;
         // Script actions work outside the first-person movement gate. Preserve
         // native input, prices, task ownership and mission-side bookkeeping.
-        static VRPhoneInput::Pulse contextPulse{},scriptPulses[6]{};
-        static bool previousContext=false,previousScript[6]{};
+        static VRPhoneInput::Pulse contextPulse{},confirmPulse{},scriptPulses[6]{};
+        static bool previousContext=false,previousConfirm=false,previousScript[6]{};
+        const bool wasConfirm=confirmPulse.down;
+        const bool confirm=confirmPulse.Update(input.confirmPresses,input.confirm,
+            inputFresh && !inMenu && !inCutscene && !input.phoneActive,now);
+        confirmRawDown=confirm;confirmRawRising=confirm && !wasConfirm;
+        mergeButton(77,confirm,previousConfirm);previousConfirm=confirm;
         const bool scriptEnabled=inputFresh && !inMenu && !inCutscene && !input.phoneActive &&
             scripted && input.scriptMenuActive;
         const bool scriptHeld[]{input.scriptUp,input.scriptDown,input.scriptLeft,input.scriptRight,input.scriptAccept,input.scriptBack};
@@ -804,8 +812,10 @@ namespace
             if(scriptButtons[i] && !wasDown) scriptRising|=1u<<i;
         }
         scriptRawDown=scriptDown;scriptRawRising=scriptRising;
+        // The gun-store ammo purchase uses INPUT_CONTEXT (23), whereas other
+        // confirmations use INPUT_FRONTEND_ACCEPT (77) or raw gamepad A.
         const bool context=contextPulse.Update(input.contextPresses,input.contextInteract,
-            inputFresh && !inMenu && !inCutscene && !input.phoneActive,now) || scriptButtons[5];
+            inputFresh && !inMenu && !inCutscene && !input.phoneActive,now) || scriptButtons[5] || confirm;
         mergeButton(23,context,previousContext);previousContext=context;
         constexpr unsigned scriptIds[]{65,64,66,67,77,78};
         for(unsigned i=0;i<6;++i)
