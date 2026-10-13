@@ -82,7 +82,7 @@ Use the [GitHub tracker](https://github.com/bordplate/GTA4VR/issues) for tasks, 
 
 A full VR-only playthrough is not currently possible. Required cover, clothing purchases, NPC service interactions and minigames can require keyboard/gamepad input or temporarily disabling VR and completing the section on a flat screen. These are progression blockers, not completed gameplay support.
 
-Performance work remains shelved at the user's request on 2026-10-05, without an all-scene 90 Hz claim. Preserve shaders, experiments and measured evidence. The [checkpoint](docs/performance-013-checkpoint.md) records stable settings and how to resume; see [Vulkan integration and limits](docs/vulkan-openxr-feasibility.md). Distributed VR defaults are enabled with DisableOpenXR=1 opting out with the D3D9Ex/D3D11 fallback.
+Performance work resumed on 2026-10-12 under [#2](https://github.com/bordplate/GTA4VR/issues/2). Prepared screen-dimension mapping preserves the existing shader-constant signatures and improves matched flyover throughput by approximately 4%; see [configuration, measurements and limits](docs/vr-resolution-performance.md). Native G-buffer/DrawScene execution remains the larger bottleneck, and no all-scene 90 Hz result is claimed. Preserve shaders and experiments and the [earlier checkpoint](docs/performance-013-checkpoint.md); see [Vulkan integration and limits](docs/vulkan-openxr-feasibility.md). Distributed VR defaults remain enabled with DisableOpenXR=1 opting out with the D3D9Ex/D3D11 fallback.
 
 Until in-game height calibration exists, the INI configures player height and physical crouch enters/exits at 65%/75%. Settings UI does not block the accepted configured-height camera route.
 

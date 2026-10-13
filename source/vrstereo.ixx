@@ -97,6 +97,7 @@ namespace
     struct Resources
     {
         VRResolution::Size desktopSize{},eyeSize{};
+        VRResolution::ScreenMapper screenToEye,screenToDesktop;
         VRTextureRouting::Cache<IDirect3DBaseTexture9*> textureRoutes;
         struct GPUTiming
         {
@@ -238,6 +239,7 @@ namespace
         // as the eyes; only render while the eyepiece is in use.
         auto owned=std::make_unique<Resources>();
         owned->desktopSize=resources->desktopSize;owned->eyeSize=resources->eyeSize;
+        owned->screenToEye=resources->screenToEye;owned->screenToDesktop=resources->screenToDesktop;
         owned->originalBack=resources->originalBack;
         D3DSURFACE_DESC back{};
         if(FAILED(owned->originalBack->GetDesc(&back)) ||
@@ -2007,11 +2009,10 @@ namespace
             for(UINT reg=start;reg<start+count;++reg)
                 {
                     const float* original=data+(reg-start)*4;float value[4]{};
-                    const auto native=resources->desktopSize,eye=resources->eyeSize;
                     // CE shaders assign the same screen-size parameter to
                     // different registers. Match its complete value signature,
                     // rather than assuming a particular register layout.
-                    if(!VRResolution::ScreenSize(original,native,eye,value)) continue;
+                    if(!resources->screenToEye.Map(original,value)) continue;
                     if(resized.empty()) resized.assign(data,data+count*4);
                     std::memcpy(resized.data()+(reg-start)*4,value,sizeof(value));
                 }
@@ -2397,11 +2398,10 @@ namespace
         std::vector<float> resized;
         if(OnRoutingThread() && !composingHud && renderEye>=0 && resources)
         {
-            const auto native=resources->desktopSize,eye=resources->eyeSize;
             for(UINT reg=start;reg<start+count;++reg)
             {
                 const float* original=data+(reg-start)*4;float value[4]{};
-                if(!VRResolution::ScreenSize(original,native,eye,value)) continue;
+                if(!resources->screenToEye.Map(original,value)) continue;
                 if(resized.empty()) resized.assign(data,data+count*4);
                 std::memcpy(resized.data()+(reg-start)*4,value,sizeof(value));
             }
@@ -2475,18 +2475,19 @@ namespace
         if(resources)
         {
             const auto size=resources->eyeSize,native=resources->desktopSize;
-            const auto from=eye<0 ? size:native,to=eye<0 ? native:size;
+            const auto to=eye<0 ? native:size;
+            const auto& mapper=eye<0 ? resources->screenToDesktop:resources->screenToEye;
             float value[4]{float(to.width),float(to.height),1.f/to.width,1.f/to.height};
             float current[256*4]{};
             D3DCAPS9 caps{};device->GetDeviceCaps(&caps);
             const UINT vertexRegisters=std::min<UINT>(caps.MaxVertexShaderConst,256);
             if(SUCCEEDED(device->GetVertexShaderConstantF(0,current,vertexRegisters)))
             for(UINT reg=0;reg<vertexRegisters;++reg)
-                if(VRResolution::ScreenSize(current+reg*4,from,to,value))
+                if(mapper.Map(current+reg*4,value))
                     setVertexConstants.unsafe_stdcall<HRESULT>(device,reg,value,1);
             if(SUCCEEDED(device->GetPixelShaderConstantF(0,current,224)))
             for(UINT reg=0;reg<224;++reg)
-                if(VRResolution::ScreenSize(current+reg*4,from,to,value))
+                if(mapper.Map(current+reg*4,value))
                     setPixelConstants.unsafe_stdcall<HRESULT>(device,reg,value,1);
         }
     }
@@ -3496,6 +3497,8 @@ namespace
         owned->desktopSize={back.Width,back.Height};owned->eyeSize=owned->desktopSize;
         unsigned eyeWidth=0,eyeHeight=0;
         if(OpenXRVR::GetEyeResolution(eyeWidth,eyeHeight)) owned->eyeSize={eyeWidth,eyeHeight};
+        owned->screenToEye=VRResolution::ScreenMapper(owned->desktopSize,owned->eyeSize);
+        owned->screenToDesktop=VRResolution::ScreenMapper(owned->eyeSize,owned->desktopSize);
         worldTargetAspect=float(owned->eyeSize.width)/owned->eyeSize.height;
         ComPtr<IDirect3DSwapChain9> desktopChain;
         D3DPRESENT_PARAMETERS desktopParameters{};

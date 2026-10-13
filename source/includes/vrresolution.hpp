@@ -48,6 +48,42 @@ namespace VRResolution
         return std::min(requested,maximum);
     }
 
+    class ScreenMapper
+    {
+        float width=0,height=0,inverseWidth=0,inverseHeight=0;
+        float nextWidth=0,nextHeight=0,nextInverseWidth=0,nextInverseHeight=0;
+        bool valid=false;
+    public:
+        ScreenMapper()=default;
+        ScreenMapper(Size from,Size to)
+        {
+            valid=from.width && from.height && to.width && to.height;
+            if(!valid) return;
+            width=float(from.width);height=float(from.height);
+            inverseWidth=1.f/from.width;inverseHeight=1.f/from.height;
+            nextWidth=float(to.width);nextHeight=float(to.height);
+            nextInverseWidth=1.f/to.width;nextInverseHeight=1.f/to.height;
+        }
+        bool Map(const float* input,float* output) const
+        {
+            if(!valid) return false;
+            // Native post-processing texel offsets put inverse dimensions in xy.
+            // Preserve this encoding; the deferred-lighting encoding uses zw.
+            // Positive <= comparisons also reject NaNs/infinities without CRT
+            // classification calls. All comparison values are finite dimensions.
+            if(input[2]==0.f && input[3]==0.f &&
+                std::abs(input[0]-inverseWidth)<=1e-7f && std::abs(input[1]-inverseHeight)<=1e-7f)
+            {output[0]=nextInverseWidth;output[1]=nextInverseHeight;output[2]=output[3]=0.f;return true;}
+            const bool dimensions=input[0]==width && input[1]==height;
+            const bool origin=input[0]==0.f && input[1]==0.f;
+            if((!dimensions && !origin) ||
+                !(std::abs(input[2]-inverseWidth)<=1e-7f && std::abs(input[3]-inverseHeight)<=1e-7f)) return false;
+            output[0]=dimensions ? nextWidth:0.f;output[1]=dimensions ? nextHeight:0.f;
+            output[2]=nextInverseWidth;output[3]=nextInverseHeight;
+            return true;
+        }
+    };
+
     inline bool ScreenSize(const float* input,Size from,Size to,float* output)
     {
         if(!from.width || !from.height || !to.width || !to.height) return false;

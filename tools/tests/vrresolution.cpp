@@ -42,6 +42,43 @@ int main()
     assert(!ScreenSize(packed,{2560,1440},{1974,2192},output));
     float other[]{1,0,1.f/2560,1.f/1440};
     assert(!ScreenSize(other,{2560,1440},{2848,3168},output));
+    // The prepared matcher retains tolerance and rejects invalid constants;
+    // it is reused for both mapping directions and recreated on device reset.
+    const ScreenMapper cached({2560,1440},{1974,2192});
+    assert(cached.Map(full,output) && output[0]==1974 && output[1]==2192);
+    assert(cached.Map(origin,output) && output[0]==0 && output[2]==1.f/1974);
+    assert(cached.Map(texel,output) && output[1]==1.f/2192);
+    const ScreenMapper reverse({1974,2192},{2560,1440});
+    assert(reverse.Map(output,output) && output[0]==texel[0] && output[1]==texel[1]);
+    assert(!cached.Map(packed,output) && !cached.Map(other,output));
+    // Every supported signature survives a round trip, including in-place
+    // writes and rebuilding the mapper for a different desktop resolution.
+    for(Size desktop: {Size{2560,1440},Size{1920,1080},Size{1280,720}})
+    {
+        const ScreenMapper forward(desktop,{1974,2192}),backward({1974,2192},desktop);
+        const float inputs[3][4]{{float(desktop.width),float(desktop.height),1.f/desktop.width,1.f/desktop.height},
+            {0,0,1.f/desktop.width,1.f/desktop.height},{1.f/desktop.width,1.f/desktop.height,0,0}};
+        for(const auto& input:inputs)
+        {
+            float expected[4]{};
+            assert(ScreenSize(input,desktop,{1974,2192},expected) && forward.Map(input,output));
+            for(unsigned i=0;i<4;++i)assert(expected[i]==output[i]);
+            assert(backward.Map(output,output));
+            for(unsigned i=0;i<4;++i)assert(input[i]==output[i]);
+        }
+    }
+    for(unsigned component=0;component<4;++component)
+        for(float invalid:{std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()})
+        {
+            float brokenFull[]{full[0],full[1],full[2],full[3]};brokenFull[component]=invalid;
+            float brokenTexel[]{texel[0],texel[1],texel[2],texel[3]};brokenTexel[component]=invalid;
+            assert(!cached.Map(brokenFull,output) && !cached.Map(brokenTexel,output));
+        }
+    float close[]{full[0],full[1],full[2]+.5e-7f,full[3]-.5e-7f};
+    assert(cached.Map(close,output));
+    close[2]=full[2]+2e-7f;assert(!cached.Map(close,output));
+    assert(!ScreenMapper({0,1440},{1974,2192}).Map(full,output));
     for(float scale:{0.f,-1.f,std::numeric_limits<float>::infinity()})
     {bool rejected=false;try{Recommended({1,1},{2,2},scale);}catch(...){rejected=true;}assert(rejected);}
 }
