@@ -180,6 +180,26 @@ namespace
     float headHeading=0,lastOriginalHeading=0,lastAppliedHeading=0;
     uint64_t headingSampledAt=0;
     unsigned headingQueries=0,headingOverrides=0;
+    SafetyHookInline vehicleEntryQuery{};
+    void* vehicleEntryReturns[2]{};
+    VRMath::Vector vehicleEntryForward{}; // Published with the current on-foot view.
+    void* __cdecl SelectVehicleForEntry(void* ped,const float* direction,int mode)
+    {
+        const auto caller=_ReturnAddress();
+        alignas(16) VRMath::Vector forward{};
+        bool apply=false;
+        if((caller==vehicleEntryReturns[0] || caller==vehicleEntryReturns[1]) &&
+            firstPersonActive && !vehicleView && !animatedView && !ragdollView && OpenXRVR::HasFocusedViews())
+        {
+            AcquireSRWLockShared(&headingLock);
+            apply=headingValid && headingOwner==ped && GetTickCount64()-headingSampledAt<=250;
+            if(apply)forward=vehicleEntryForward;
+            ReleaseSRWLockShared(&headingLock);
+        }
+        // Preserve native proximity, eligibility, occupancy and door/path tasks.
+        // Only the two player-input callers substitute the headset's heading.
+        return vehicleEntryQuery.unsafe_ccall<void*>(ped,apply ? forward.data():direction,mode);
+    }
     bool headsetAim=false;
     SafetyHookInline weaponCameraUpdate{};
     SafetyHookMid weaponBasis[2]{};
@@ -1543,6 +1563,19 @@ void VRCamera::Install()
         }
         else headsetAim=false;
     }
+    if(firstPerson)
+    {
+        auto query=hook::pattern("55 8B EC 83 E4 F0 83 EC 78 56 8B 75 08 57 F7 86 68 02 00 00 00 20 00 00");
+        auto enter=hook::pattern("E8 ? ? ? ? 83 C4 0C 89 44 24 24 EB 02 33 C0 8B");
+        auto action=hook::pattern("E8 ? ? ? ? 83 C4 0C EB 02 33 C0 56 50 FF 74 24");
+        if(query.size()==1 && enter.size()==1 && action.size()==1 &&
+            injector::GetBranchDestination(enter.get_first()).get()==query.get_first() &&
+            injector::GetBranchDestination(action.get_first()).get()==query.get_first())
+        {
+            vehicleEntryReturns[0]=enter.get_first(5);vehicleEntryReturns[1]=action.get_first(5);
+            vehicleEntryQuery=safetyhook::create_inline(query.get_first(),SelectVehicleForEntry);
+        }
+    }
     if(headRelativeMovement)
     {
         auto heading=hook::pattern("56 57 6A 00 8B F9 8B 0D ? ? ? ? 6A 01 E8 ? ? ? ? 8B F0 85 F6 74 75 8B 16 8B CE FF 52 0C");
@@ -1834,7 +1867,11 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
             const bool level=VRMath::LevelHeading(headCamera,angle);
             void* owner=FindPlayerPed ? FindPlayerPed(0) : nullptr;
             AcquireSRWLockExclusive(&headingLock);
-            if(level) {headHeading=angle; headingValid=true;}
+            if(level)
+            {
+                headHeading=angle; headingValid=true;
+                vehicleEntryForward={-headCamera[2][0],-headCamera[2][1],0,0};
+            }
             headingOwner=owner;
             headingSampledAt=GetTickCount64();
             ReleaseSRWLockExclusive(&headingLock);

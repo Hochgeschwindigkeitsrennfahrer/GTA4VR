@@ -374,7 +374,29 @@ model substitution exercises subway_hi/model210 and restores the consist
 before returning. Native creation readback must match the requested hash.
 Train speed, boarding and cleanup use native functions on the simulation
 callback. No ambient trains are removed or given test input. Runtime validation
-of all three rail entries remains pending.
+of all three rail entries is complete for the native test harness.
 The stock cablecars script checks wanted level zero before offering boarding. Rail tests temporarily suppress wanted levels and restore the maximum on safe exit/cleanup. Native train occupancy complements car occupancy in VR camera/action routing.
 A one-time maximum-wanted change is insufficient against locked-island scripts. Rail tests lazily install scoped ALTER_WANTED_LEVEL/NO_DROP filters once the native table is ready, maintain police-ignore/invincibility during the test and restore normal behavior on exit. Explicit rail status reports health, wanted and actual boarding state; protection is not inferred from command acceptance.
 Cable-car passengers retain native seated travel and freely tracked hands, with radar on the wrist. The on-foot cabin experiment was withdrawn: touchpad and room-scale movement expelled the player from the cabin. Walkable interiors are out of scope; the exact collision shape was not established.
+
+
+## Vehicle entry direction
+
+Tracked under [vehicle interactions #3](https://github.com/bordplate/GTA4VR/issues/3).
+CE 1.2.0.59 player entry callers at analysis `00A7252D` and `00A6FDC5`
+invoke `008D30B0` with a direction copied from the ped or its task. The spatial
+query stays centered on the ped. Candidate callback `008D1920` preserves vehicle
+eligibility; `008D16D0` scores nearby candidates using distance and the supplied
+horizontal heading. This is not a headset-origin ray cast. The normal player
+caller can retain the character direction while the headset turns independently.
+
+VR substitutes the current on-foot headset forward direction only for those two
+player-input callers. Script and other task callers keep their original input.
+Native proximity, vehicle eligibility, entry-door selection and pathfinding are
+retained, so reaching the driver's door can still require walking around a car.
+The hook requires matching call targets and fresh focused tracking owned by the
+same local ped; inactive VR and animated transitions retain native behavior.
+Live signatures were checked at module base `00C00000` (PID 38296); addresses
+above use Ghidra image base `00400000`. The x86 Release build passes; headset
+checks confirm selection follows head direction with Vive Pro/Wands on SteamVR
+2.17.10.
