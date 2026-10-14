@@ -5,6 +5,10 @@ module;
 #include <d3dx9tex.h>
 #include "includes/vrmath.hpp"
 #include <atomic>
+#include "includes/vrvehiclepanels.hpp"
+#include <map>
+#include <mutex>
+#include <filesystem>
 export module vrhud;
 import common;
 import vrdiagnostics;
@@ -29,6 +33,8 @@ export namespace VRHud
     void DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& viewProjection,const VRMath::Matrix& headPose);
     void EndOverlayFrame();
     void AmmoChanged(); // Atomic request consumed by the native weapon-HUD updater.
+    VRMath::Matrix PublishVehicle(unsigned model,const VRMath::Matrix& anchor,const VRMath::Matrix& vehicle,bool active);
+    void InteractVehiclePanels(const VRMath::Matrix (&hands)[2],const VRMath::Matrix& vehicle,const OpenXRVR::ControllerInput& input,bool (&busy)[2]);
 }
 
 namespace
@@ -37,6 +43,128 @@ namespace
     bool enabled=false;
     bool screens=true,dashboard=true;
     float dashboardSize=.16f,dashboardForward=.55f,dashboardDown=.32f,dashboardRight=.45f,dashboardTilt=12.f;
+    using VehiclePanel=VRVehiclePanels::Panel;
+    struct VehicleLayout {VehiclePanel panels[2];VRMath::Vector mount{};bool mountValid=false;bool custom[2]{},dirty=false;uint64_t changedAt=0;};
+    std::mutex vehiclePanelLock;
+    std::map<unsigned,VehicleLayout> vehicleLayouts;
+    unsigned vehicleModel=0;
+    VRMath::Matrix vehiclePanelAnchor=VRMath::Identity();
+    VRMath::Matrix vehiclePanelVehicle=VRMath::Identity();
+    uint64_t vehiclePanelAt=0;
+    struct PanelGrip {int panel=-1;bool editing=false;VRMath::Matrix hand{},panelFrame{};VehiclePanel acquired{};float station=0;} panelGrips[2];
+    bool panelGripPrevious[2]{true,true};
+    std::atomic<int> requestedStation{-1};
+    float radioCursor=20;
+    unsigned radioStation=20;
+    bool radioDragging=false;
+    ComPtr<IDirect3DTexture9> radioImage;
+    ComPtr<IDirect3DSurface9> radioSurface;
+    bool radioFresh=false;uint64_t radioAt=0;
+    float radioRect[4]{.15f,0.f,.70f,.18f};
+    SafetyHookInline radioRender{},radioCarDraw{},radioCanDraw{};
+    thread_local bool producingVehicleRadio=false;
+    unsigned (__cdecl* nativeRadioCount)()=nullptr;
+    void* (__cdecl* nativeRadioByIndex)(unsigned)=nullptr;
+    float (__cdecl* nativeRadioWidth)(unsigned)=nullptr;
+    void* (__cdecl* nativeRadioVehicle)(unsigned)=nullptr;
+    std::atomic<bool> vehicleRadioAvailable=false;
+    bool VehicleHasRadio()
+    {
+        auto* vehicle=nativeRadioVehicle ? static_cast<unsigned char*>(nativeRadioVehicle(0)):nullptr;
+        // Native radio audio update (CE 009A3EF0): FE means no radio;
+        // FF is merely switched off and must retain the station selector.
+        return vehicle && vehicle[0xD10]!=0xFE;
+    }
+    unsigned* nativeRadioState=nullptr;unsigned* nativeRadioMode=nullptr;unsigned* nativeRadioStation=nullptr;
+    float* nativeRadioScroll=nullptr;
+    std::atomic<unsigned> radioCount{0},radioCaptures{0},radioDraws{0};
+    std::string radioPlayingName,radioRequestedName;
+    int radioPendingStation=-1;
+    uint64_t radioRequestedAt=0;
+    const char* NativeRadioName(unsigned station)
+    {
+        auto* object=nativeRadioByIndex ? nativeRadioByIndex(station):nullptr;
+        return object ? static_cast<const char*>(object)+0x17FC:nullptr;
+    }
+    uint64_t stationPresses[2]{};
+    bool vehicleProfileSaveOk=true;
+
+    std::string VehicleProfile(unsigned model) {return std::format("VRVehicles/{:08X}.ini",model);}
+    VehiclePanel DefaultVehiclePanel(unsigned kind)
+    {
+        return VRVehiclePanels::Default(dashboardRight,dashboardDown-(kind ? .19f:0.f),dashboardForward,
+            dashboardTilt,kind ? .36f:dashboardSize,kind ? .09f:dashboardSize);
+    }
+    VehicleLayout& VehicleLayoutFor(unsigned model)
+    {
+        auto [it,added]=vehicleLayouts.try_emplace(model);
+        auto& layout=it->second;
+        if(added)
+        {
+            CIniReader ini(VehicleProfile(model));
+            const char* mountKeys[]{"PositionX","PositionY","PositionZ"};
+            layout.mount[3]=1;layout.mountValid=true;
+            for(unsigned axis=0;axis<3;++axis)
+            {
+                const auto text=ini.ReadString("Mount",mountKeys[axis],"");char* end=nullptr;
+                layout.mount[axis]=strtof(text.c_str(),&end);
+                layout.mountValid &= end!=text.c_str() && *end==0 && std::isfinite(layout.mount[axis]);
+            }
+            for(unsigned kind=0;kind<2;++kind)
+            {
+                const char* section=kind ? "Radio":"Radar";
+                auto p=DefaultVehiclePanel(kind);
+                if(ini.ReadString(section,"PositionX","").empty()) {layout.panels[kind]=p;continue;}
+                auto number=[&](const char* key) {
+                    const auto text=ini.ReadString(section,key,"");char* end=nullptr;
+                    const float value=strtof(text.c_str(),&end);
+                    return end!=text.c_str() && *end==0 && std::isfinite(value) ? value:NAN;
+                };
+                float position[]{number("PositionX"),number("PositionY"),number("PositionZ")};
+                float q[]{number("RotationX"),number("RotationY"),number("RotationZ"),number("RotationW")};
+                const float norm=std::hypot(std::hypot(q[0],q[1]),std::hypot(q[2],q[3]));
+                if(!std::isfinite(norm) || norm==0) {layout.panels[kind]=p;continue;}
+                for(float& v:q)v/=norm;
+                p.frame=VRMath::Pose(position,q);p.width=number("Width");p.height=number("Height");
+                if(VRVehiclePanels::Valid(p)) {layout.panels[kind]=p;layout.custom[kind]=true;}
+                else layout.panels[kind]=DefaultVehiclePanel(kind);
+            }
+        }
+        for(unsigned kind=0;kind<2;++kind)if(!layout.custom[kind])layout.panels[kind]=DefaultVehiclePanel(kind);
+        return layout;
+    }
+    void SaveVehicleLayouts()
+    {
+        std::lock_guard guard(vehiclePanelLock);
+        for(auto& [model,layout]:vehicleLayouts)
+        {
+            if(!layout.dirty || GetTickCount64()-layout.changedAt<500)continue;
+            try
+            {
+                CIniReader path(VehicleProfile(model));
+                std::filesystem::create_directories(path.GetIniPath().parent_path());
+                mINI::INIFile file(path.GetIniPath());mINI::INIStructure values;file.read(values);
+                if(layout.mountValid)
+                {
+                    const char* positions[]{"PositionX","PositionY","PositionZ"};
+                    for(unsigned axis=0;axis<3;++axis)values["Mount"][positions[axis]]=std::format("{:.9g}",layout.mount[axis]);
+                }
+                for(unsigned kind=0;kind<2;++kind)if(layout.custom[kind])
+                {
+                    auto& section=values[kind ? "Radio":"Radar"];
+                    const auto& p=layout.panels[kind];const auto q=VRMath::Quaternion(p.frame);
+                    const char* positions[]{"PositionX","PositionY","PositionZ"};
+                    const char* rotations[]{"RotationX","RotationY","RotationZ","RotationW"};
+                    for(unsigned a=0;a<3;++a)section[positions[a]]=std::format("{:.9g}",p.frame[3][a]);
+                    for(unsigned a=0;a<4;++a)section[rotations[a]]=std::format("{:.9g}",q[a]);
+                    section["Width"]=std::format("{:.9g}",p.width);section["Height"]=std::format("{:.9g}",p.height);
+                }
+                vehicleProfileSaveOk=file.write(values);
+                if(vehicleProfileSaveOk)layout.dirty=false;else layout.changedAt=GetTickCount64();
+            }
+            catch(...) {vehicleProfileSaveOk=false;layout.changedAt=GetTickCount64();}
+        }
+    }
     std::atomic<unsigned> dashboardDraws{};
     SafetyHookMid radarHeadingHook{};
     std::atomic<float> carRadarHeading{},originalRadarHeading{},appliedRadarHeading{};
@@ -156,13 +284,14 @@ namespace
 
     // Replay resolved drawing only: never advance the HUD records or consume
     // a render-command stream twice. The desktop pass still executes once.
-    template<class Draw> void CaptureOverlay(Draw&& draw,bool sms=false)
+    template<class Draw> void CaptureOverlay(Draw&& draw,unsigned kind=0)
     {
-        if((sms ? !enabled:!textHud) || replayingOverlay || !Allowed() || !overlayRouting ||
+        const bool sms=kind==1,radio=kind==2;
+        if(((sms || radio) ? !enabled:!textHud) || replayingOverlay || !Allowed() || !overlayRouting ||
             !RageDirect3DDevice9::m_pRealDevice || !overlayRouting(true)) return;
-        auto& texture=sms ? smsImage:overlayTexture;
-        auto& surface=sms ? smsSurface:overlaySurface;
-        auto& fresh=sms ? smsFresh:overlayFresh;
+        auto& texture=radio ? radioImage:(sms ? smsImage:overlayTexture);
+        auto& surface=radio ? radioSurface:(sms ? smsSurface:overlaySurface);
+        auto& fresh=radio ? radioFresh:(sms ? smsFresh:overlayFresh);
         auto* device=*RageDirect3DDevice9::m_pRealDevice;
         // PHONE_SCREEN already supplies the native held phone. Capturing its
         // offscreen text/sprites here duplicates them on the view HUD plane.
@@ -215,7 +344,8 @@ namespace
                     device->SetRenderState(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD);
                     replayingOverlay=true;draw();replayingOverlay=false;
                     fresh=true;
-                    if(sms) {smsAt=GetTickCount64();VRDiagnostics::Increment(smsCaptures);} else VRDiagnostics::Increment(textCaptures);
+                    if(radio) {radioAt=GetTickCount64();VRDiagnostics::Increment(radioCaptures);}
+                    else if(sms) {smsAt=GetTickCount64();VRDiagnostics::Increment(smsCaptures);} else VRDiagnostics::Increment(textCaptures);
                 }
             }
             for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
@@ -258,6 +388,40 @@ namespace
         CaptureOverlay([&](){popupWindow.unsafe_fastcall(self,edx);});
     }
 
+    void __fastcall RadioRender(void* self,void* edx)
+    {
+        radioRender.unsafe_fastcall(self,edx);
+        {std::lock_guard guard(vehiclePanelLock);if(!vehiclePanelAt || GetTickCount64()-vehiclePanelAt>150)return;}
+        CaptureOverlay([&](){radioRender.unsafe_fastcall(self,edx);},2);
+    }
+    bool __cdecl RadioCanDraw(unsigned viewport)
+    {
+        if(producingVehicleRadio)return vehicleRadioAvailable.load();
+        return radioCanDraw.unsafe_ccall<bool>(viewport);
+    }
+    void __cdecl RadioCarDraw(unsigned viewport)
+    {
+        unsigned station=0;float cursor=0;bool dragging=false,active=false;
+        {std::lock_guard guard(vehiclePanelLock);station=radioStation;cursor=radioCursor;dragging=radioDragging;
+            active=vehiclePanelAt && GetTickCount64()-vehiclePanelAt<150;}
+        vehicleRadioAvailable=active && VehicleHasRadio();
+        if(!active || !vehicleRadioAvailable || !dashboard || !Allowed() || !nativeRadioCount)
+        {radioCarDraw.unsafe_ccall(viewport);return;}
+        const unsigned count=nativeRadioCount();radioCount=count;
+        if(!count || station>=count) {radioCarDraw.unsafe_ccall(viewport);return;}
+        // Scope presentation overrides to this native producer only. Simulation,
+        // retuning, frontend state and queued render commands retain their owners.
+        const unsigned state=*nativeRadioState,mode=*nativeRadioMode,selected=*nativeRadioStation;
+        const float scroll=*nativeRadioScroll;
+        *nativeRadioMode=3;*nativeRadioStation=station;*nativeRadioState=dragging ? 4:3;
+        float residual=cursor-float(station);
+        if(residual>count*.5f)residual-=float(count);
+        if(residual<-float(count)*.5f)residual+=float(count);
+        *nativeRadioScroll=dragging ? -residual*(nativeRadioWidth(3)+.003f):0;
+        producingVehicleRadio=true;radioCarDraw.unsafe_ccall(viewport);producingVehicleRadio=false;
+        *nativeRadioState=state;*nativeRadioMode=mode;*nativeRadioStation=selected;*nativeRadioScroll=scroll;
+    }
+
     uint64_t nativeRadarAt=0;
     void __cdecl RadarDraw()
     {
@@ -285,7 +449,13 @@ namespace
             float4 wantedState : register(c0);
             float4 smsRect : register(c1);
             float4 logDepth : register(c2);
+            float4 radioState : register(c3);
             float4 Shade(float2 uv) {
+                if(wantedState.w>1.5) {
+                    float4 image=tex2D(radar,radioState.xy+uv*radioState.zw);
+                    clip(image.a-.01);
+                    return float4(image.rgb/max(image.a,.01),image.a);
+                }
                 if(uv.y>1) {
                     clip(wantedState.z-.5);
                     float2 p=float2((uv.x-.35)/.30,(uv.y-1.05)/.25);
@@ -328,6 +498,98 @@ namespace
     }
 }
 
+VRMath::Matrix VRHud::PublishVehicle(unsigned model,const VRMath::Matrix& anchor,const VRMath::Matrix& vehicle,bool active)
+{
+    std::lock_guard guard(vehiclePanelLock);
+    if(!active)
+    {
+        vehiclePanelAt=0;radioDragging=false;radioPendingStation=-1;requestedStation=-1;
+        for(auto& grip:panelGrips)grip={};
+        panelGripPrevious[0]=panelGripPrevious[1]=true;return anchor;
+    }
+    if(vehicleModel!=model)
+    {
+        for(auto& grip:panelGrips)grip={};radioDragging=false;
+        radioPendingStation=-1;requestedStation=-1;
+        panelGripPrevious[0]=panelGripPrevious[1]=true;
+    }
+    auto& layout=VehicleLayoutFor(model);
+    if(!layout.mountValid)
+    {
+        // Preserve legacy panel offsets by recording their original seat reference
+        // once. Subsequent entries must not recalibrate the vehicle panel mount.
+        layout.mount=VRVehiclePanels::MountOffset(anchor,vehicle[3]);
+        layout.mountValid=std::isfinite(layout.mount[0]) && std::isfinite(layout.mount[1]) && std::isfinite(layout.mount[2]);
+        if(layout.mountValid){layout.dirty=true;layout.changedAt=GetTickCount64();}
+    }
+    const auto fixed=layout.mountValid ? VRVehiclePanels::FixedMount(anchor,vehicle[3],layout.mount):anchor;
+    vehicleModel=model;vehiclePanelAnchor=fixed;vehiclePanelVehicle=vehicle;vehiclePanelAt=GetTickCount64();
+    return fixed;
+}
+void VRHud::InteractVehiclePanels(const VRMath::Matrix (&hands)[2],const VRMath::Matrix& vehicle,const OpenXRVR::ControllerInput& input,bool (&busy)[2])
+{
+    const bool editing=VRConfig::Read().Get(VRConfig::Flag::VehiclePanelEditing);
+    std::lock_guard guard(vehiclePanelLock);
+    if(!dashboard || !Allowed() || !vehiclePanelAt || GetTickCount64()-vehiclePanelAt>150)return;
+    auto& layout=VehicleLayoutFor(vehicleModel);
+    const unsigned stationCount=radioCount.load();
+    const auto currentAnchor=VRMath::Multiply(VRMath::Multiply(vehiclePanelAnchor,VRMath::InverseRigid(vehiclePanelVehicle)),vehicle);
+    const auto inverse=VRMath::InverseRigid(currentAnchor);
+    const bool wasDragging=radioDragging;radioDragging=false;
+    for(unsigned hand=0;hand<2;++hand)
+    {
+        auto& grip=panelGrips[hand];
+        const bool pressed=input.gripActive[hand] && input.gripped[hand];
+        const bool edge=pressed && !panelGripPrevious[hand];panelGripPrevious[hand]=pressed;
+        if(!pressed || !input.gripPoseValid[hand] || input.phoneActive || !input.driving || (grip.panel==1 && !vehicleRadioAvailable) || (grip.panel>=0 && grip.editing!=editing))
+        {grip={};continue;}
+        const auto localHand=VRMath::Multiply(hands[hand],inverse);
+        if(grip.panel<0 && edge && !busy[hand])
+        {
+            float nearest=.12f;int selected=-1;
+            for(unsigned kind=editing ? 0:1;kind<2;++kind)
+            {
+                if(kind==1 && !vehicleRadioAvailable)continue;
+                if(panelGrips[1-hand].panel==int(kind))continue;
+                const float distance=VRVehiclePanels::Distance(layout.panels[kind],localHand[3]);
+                if(distance<nearest){nearest=distance;selected=int(kind);}
+            }
+            if(selected>=0)
+            {
+                grip.panel=selected;grip.editing=editing;grip.hand=localHand;
+                grip.acquired=layout.panels[selected];grip.panelFrame=grip.acquired.frame;
+                grip.station=float(radioStation);
+            }
+        }
+        if(grip.panel<0)continue;
+        busy[hand]=true;
+        if(editing)
+        {
+            auto next=grip.acquired;next.frame=VRVehiclePanels::Drag(grip.panelFrame,grip.hand,localHand);
+            if(VRVehiclePanels::Valid(next))
+            {
+                layout.panels[grip.panel]=next;layout.custom[grip.panel]=true;
+                layout.dirty=true;layout.changedAt=GetTickCount64();
+            }
+        }
+        else
+        {
+            if(!stationCount) {grip={};continue;}
+            radioDragging=true;
+            const float position=grip.station+VRVehiclePanels::StationsDragged(grip.acquired,grip.hand[3],localHand[3]);
+            if(!std::isfinite(position))continue;
+            radioCursor=position-std::floor(position/stationCount)*stationCount;
+            const unsigned selected=unsigned(std::floor(radioCursor+.5f))%stationCount;
+            if(selected!=radioStation){radioStation=selected;requestedStation=int(selected);}
+        }
+    }
+    if(!radioDragging)
+    {
+        radioCursor=float(radioStation);
+        if(wasDragging)requestedStation=int(radioStation);
+    }
+}
+
 void VRHud::CaptureRadar(IDirect3DDevice9* device,IDirect3DSurface9* source)
 {
     if(!Allowed() || !nativeRadarAt || GetTickCount64()-nativeRadarAt>250) return;
@@ -348,12 +610,12 @@ void VRHud::CaptureRadar(IDirect3DDevice9* device,IDirect3DSurface9* source)
     {capturedAt=GetTickCount64();VRDiagnostics::Increment(captures);} else VRDiagnostics::Increment(failures);
 }
 
-void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Vector& eyePosition,const VRMath::Matrix* wristPose,const VRMath::Matrix* dashboardPose,IDirect3DSurface9* sceneDepth,const VRMath::Vector& logDepth,const D3DVIEWPORT9& depthViewport)
+static void DrawPanel(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Vector& eyePosition,const VRMath::Matrix* wristPose,const VRMath::Matrix* dashboardPose,IDirect3DSurface9* sceneDepth,const VRMath::Vector& logDepth,const D3DVIEWPORT9& depthViewport,bool radioPanel)
 {
     ApplySettings();
     const bool inCar=dashboard && dashboardPose;
     if(!inCar && !wristPose) return;
-    if(!Allowed() || !radar || !capturedAt || GetTickCount64()-capturedAt>250 ||
+    if(!Allowed() || (radioPanel ? (!inCar || !vehicleRadioAvailable || !radioImage || !radioAt || GetTickCount64()-radioAt>250):(!radar || !capturedAt || GetTickCount64()-capturedAt>250)) ||
         !CreateShader(device)) return;
     const auto& mount=inCar ? *dashboardPose:*wristPose;
     D3DSURFACE_DESC desc{};
@@ -365,22 +627,23 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
             depthDesc.Width!=desc.Width || depthDesc.Height!=desc.Height ||
             !std::isfinite(logDepth[0]+logDepth[1]) || logDepth[0]<=0 || logDepth[1]<=0) return;
     }
-    const auto center=VRMath::Transform(inCar ? VRMath::Vector{dashboardRight,-dashboardDown,-dashboardForward,1}:
+    VehiclePanel panel=DefaultVehiclePanel(radioPanel ? 1:0);float cursor=0;
+    if(inCar){std::lock_guard guard(vehiclePanelLock);panel=VehicleLayoutFor(vehicleModel).panels[radioPanel ? 1:0];cursor=radioCursor;}
+    const auto panelWorld=VRMath::Multiply(panel.frame,mount);
+    const auto center=VRMath::Transform(inCar ? panel.frame[3]:
         VRMath::Vector{-back,-lift,0,1},mount);
-    const float tilt=dashboardTilt*.01745329252f,cosine=std::cos(tilt),sine=std::sin(tilt);
     VRMath::Vector normal{};
-    for(unsigned a=0;a<3;++a)normal[a]=inCar ? mount[2][a]*cosine+mount[1][a]*sine:-mount[1][a];
+    for(unsigned a=0;a<3;++a)normal[a]=inCar ? panelWorld[2][a]:-mount[1][a];
     if(VRMath::Dot3(normal,VRMath::Difference3(eyePosition,center))<=0) return;
     Vertex vertices[4];
-    const bool smsVisible=smsImage && smsAt && GetTickCount64()-smsAt<250;
+    const bool smsVisible=!radioPanel && smsImage && smsAt && GetTickCount64()-smsAt<250;
     for(unsigned i=0;i<4;++i)
     {
-        const float u=(i&1) ? 1.f:0.f,v=(i&2) ? (smsVisible ? 1.30f:1.f):(wanted.load() ? -.30f:0.f);
+        const float u=(i&1) ? 1.f:0.f,v=(i&2) ? (smsVisible ? 1.30f:1.f):(!radioPanel && wanted.load() ? -.30f:0.f);
         VRMath::Vector local{};
         if(inCar)
         {
-            const float vertical=(.5f-v)*dashboardSize;
-            local={dashboardRight+(u-.5f)*dashboardSize,-dashboardDown+vertical*cosine,-dashboardForward-vertical*sine,1};
+            local=VRMath::Transform({(u-.5f)*panel.width,(.5f-v)*panel.height,0,1},panel.frame);
         }
         else local={-back+(0.5f-v)*size,-lift,(u-0.5f)*size,1};
         const auto world=VRMath::Transform(local,mount);
@@ -408,11 +671,12 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
     const D3DVIEWPORT9 panelViewport{0,0,desc.Width,desc.Height,inCar ? depthViewport.MinZ:0.f,inCar ? depthViewport.MaxZ:1.f}; device->SetViewport(&panelViewport);
     device->SetVertexShader(nullptr);device->SetPixelShader(shader.Get());
     const float brightness=wantedFlashing.load() && (GetTickCount64()/300)%2 ? .35f:1.f;
-    const float wantedState[4]{static_cast<float>(wanted.load()),brightness,smsVisible ? 1.f:0.f,inCar ? 1.f:0.f};
+    const float wantedState[4]{static_cast<float>(wanted.load()),brightness,smsVisible ? 1.f:0.f,radioPanel ? 2.f:(inCar ? 1.f:0.f)};
     device->SetPixelShaderConstantF(0,wantedState,1);
     device->SetPixelShaderConstantF(1,smsBounds,1);
     device->SetPixelShaderConstantF(2,logDepth.data(),1);
-    device->SetFVF(D3DFVF_XYZRHW|D3DFVF_TEX2|D3DFVF_TEXCOORDSIZE1(1));device->SetTexture(0,radar.Get());
+    device->SetPixelShaderConstantF(3,radioRect,1);
+    device->SetFVF(D3DFVF_XYZRHW|D3DFVF_TEX2|D3DFVF_TEXCOORDSIZE1(1));device->SetTexture(0,radioPanel ? radioImage.Get():radar.Get());
     device->SetTexture(1,smsImage.Get());
     device->SetTextureStageState(0,D3DTSS_TEXCOORDINDEX,0);
     device->SetTextureStageState(0,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
@@ -434,11 +698,11 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
     device->SetSamplerState(1,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);device->SetSamplerState(1,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
     device->SetSamplerState(1,D3DSAMP_MIPFILTER,D3DTEXF_NONE);device->SetSamplerState(1,D3DSAMP_SRGBTEXTURE,FALSE);
     device->SetSamplerState(1,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);device->SetSamplerState(1,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);
-    if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) {VRDiagnostics::Increment(draws);if(inCar)VRDiagnostics::Increment(dashboardDraws);} else VRDiagnostics::Increment(failures);
+    if(SUCCEEDED(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,vertices,sizeof(Vertex)))) {VRDiagnostics::Increment(draws);if(inCar)VRDiagnostics::Increment(dashboardDraws);if(radioPanel)VRDiagnostics::Increment(radioDraws);} else VRDiagnostics::Increment(failures);
     device->SetDepthStencilSurface(nullptr);
     for(unsigned i=0;i<4;++i) device->SetRenderTarget(i,targets[i].Get());
     device->SetDepthStencilSurface(depth.Get());state->Apply();device->SetViewport(&viewport);
-    if(captureRequested.exchange(false))
+    if(!radioPanel && captureRequested.exchange(false))
     {
         wchar_t path[MAX_PATH]{}; GetModuleFileNameW(nullptr,path,MAX_PATH);
         auto* name=wcsrchr(path,L'\\'); if(name) name[1]=0;
@@ -448,10 +712,15 @@ void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::M
     }
 }
 
+void VRHud::Draw(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Vector& eyePosition,const VRMath::Matrix* wristPose,const VRMath::Matrix* dashboardPose,IDirect3DSurface9* sceneDepth,const VRMath::Vector& logDepth,const D3DVIEWPORT9& depthViewport)
+{
+    DrawPanel(device,eye,vp,eyePosition,wristPose,dashboardPose,sceneDepth,logDepth,depthViewport,false);
+    if(dashboard && dashboardPose)DrawPanel(device,eye,vp,eyePosition,wristPose,dashboardPose,sceneDepth,logDepth,depthViewport,true);
+}
 void VRHud::Capture() {captureRequested=true;}
 
 void VRHud::SetOverlayRouting(bool (*route)(bool)) {overlayRouting=route;}
-void VRHud::EndOverlayFrame() {overlayFresh=false;smsFresh=false;}
+void VRHud::EndOverlayFrame() {overlayFresh=false;smsFresh=false;radioFresh=false;}
 void VRHud::AmmoChanged() {ammoChanged=true;}
 
 void VRHud::DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VRMath::Matrix& vp,const VRMath::Matrix& headPose)
@@ -513,7 +782,7 @@ void VRHud::DrawOverlay(IDirect3DDevice9* device,IDirect3DSurface9* eye,const VR
 }
 
 void VRHud::Reset()
-{radarSurface.Reset();radar.Reset();shader.Reset();capturedAt=0;
+{radioSurface.Reset();radioImage.Reset();radioFresh=false;radioAt=0;radarSurface.Reset();radar.Reset();shader.Reset();capturedAt=0;
  overlaySurface.Reset();overlayTexture.Reset();overlayShader.Reset();overlayFresh=false;
  smsSurface.Reset();smsImage.Reset();smsFresh=false;smsAt=0;
  screenSurface.Reset();screenTexture.Reset();screenShared=nullptr;screenWidth=screenHeight=0;}
@@ -571,7 +840,11 @@ std::string VRHud::Status()
         lastBounds[0].load(),lastBounds[1].load(),lastBounds[2].load(),lastBounds[3].load(),lastPanel[0].load(),lastPanel[1].load(),lastPanel[2].load(),lastPanel[3].load(),wanted.load(),dashboard ? "true":"false",dashboardDraws.load(),radarHeadingHook ? "true":"false",radarHeadingOverrides.load(),originalRadarHeading.load(),appliedRadarHeading.load(),fontDraw ? "true":"false",popupSprite ? "true":"false",popupWindow ? "true":"false",textCaptures.load(),textDraws.load(),hudWidth,smsTexture ? "true":"false",smsCaptures.load(),smsBounds[0],smsBounds[1],smsBounds[2],smsBounds[3]);
     std::string result=text;result.pop_back();result+=",\"phoneTargets\":[";
     for(unsigned kind=0;kind<3;++kind) { if(kind) result+=",";result+="[";for(unsigned i=0;i<6;++i) {if(i) result+=",";result+=std::to_string(phoneCaptureTargets[kind][i].load());}result+="]";}
-    return result+"]}";
+    std::lock_guard guard(vehiclePanelLock);
+    return result+"]"+std::format(",\"vehicleModel\":\"{:08X}\",\"vehicleProfile\":\"{}\",\"vehicleProfileSaveOk\":{},\"radioHookReady\":{},\"radioCount\":{},\"radioStation\":{},\"radioCaptures\":{},\"radioEyeDraws\":{},\"radioFresh\":{},\"panelGrips\":[{},{}],\"radioPlayingName\":\"{}\",\"radioRequestedName\":\"{}\",\"radioPendingStation\":{}}}",
+        vehicleModel,VehicleProfile(vehicleModel),vehicleProfileSaveOk,radioRender && radioCarDraw && radioCanDraw,
+        radioCount.load(),radioStation,radioCaptures.load(),radioDraws.load(),radioAt && GetTickCount64()-radioAt<250,panelGrips[0].panel,panelGrips[1].panel,
+        radioPlayingName,radioRequestedName,radioPendingStation);
 }
 
 void VRHud::Install()
@@ -581,6 +854,30 @@ void VRHud::Install()
     screens=ini.ReadInteger("VR","WorldSpaceScreens",1)!=0;
     textHud=ini.ReadInteger("VR","ViewHud",1)!=0;
     ApplySettings();
+    // CE native vehicle carousel and its resolved CDrawRadioHudTextDC renderer.
+    auto carRadio=hook::pattern("83 EC 18 FF 74 24 1C E8 ? ? ? ? 83 C4 04 84 C0 0F 84 ? ? ? ? 8D 44 24 10 6A 06");
+    auto canRadio=hook::pattern("A1 ? ? ? ? 8B 4C 24 04 3B 88 40 05 00 00 74 0D 80 3D ? ? ? ? 00");
+    auto radioCommand=hook::pattern("83 EC 2C A1 ? ? ? ? 33 C4 89 44 24 28 C7 04 24 00 00 00 00 8B 04 24 89 44 24 08");
+    auto radioCountFn=hook::pattern("E8 ? ? ? ? 39 05 ? ? ? ? 0F 42 05 ? ? ? ? C3 CC CC CC");
+    auto radioWidthFn=hook::pattern("83 EC 18 A1 ? ? ? ? 48 C7 44 24 08 00 00 00 00 C7 44 24 0C 00 00 00 00 83 F8 03 77 2B");
+    auto radioLookupFn=hook::pattern("0F B6 05 ? ? ? ? 8B 4C 24 04 3B C8 73 09 A1 ? ? ? ? 8B 04 88 C3 33 C0 C3");
+    auto radioVehicleFn=hook::pattern("E8 ? ? ? ? 85 C0 74 10 F6 80 6C 02 00 00 04 74 07 8B 80 30 0B 00 00 C3 33 C0 C3");
+    if(carRadio.size()==1 && canRadio.size()==1 && radioCommand.size()==1 && radioCountFn.size()==1 && radioWidthFn.size()==1 && radioLookupFn.size()==1 && radioVehicleFn.size()==1)
+    {
+        const auto base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        nativeRadioCount=reinterpret_cast<decltype(nativeRadioCount)>(radioCountFn.get_first());
+        nativeRadioByIndex=reinterpret_cast<decltype(nativeRadioByIndex)>(radioLookupFn.get_first());
+        nativeRadioWidth=reinterpret_cast<decltype(nativeRadioWidth)>(radioWidthFn.get_first());
+        nativeRadioVehicle=reinterpret_cast<decltype(nativeRadioVehicle)>(radioVehicleFn.get_first());
+        nativeRadioMode=*reinterpret_cast<unsigned**>(carRadio.get_first<unsigned char>()+88);
+        nativeRadioState=*reinterpret_cast<unsigned**>(canRadio.get_first<unsigned char>()+32);
+        nativeRadioStation=*reinterpret_cast<unsigned**>(canRadio.get_first<unsigned char>()+46);
+        // Shared scroll value is scoped to the producer; resolved commands copy vertices.
+        nativeRadioScroll=reinterpret_cast<float*>(base+(0x011A4F0C-0x00400000));
+        radioCanDraw=safetyhook::create_inline(canRadio.get_first(),RadioCanDraw);
+        radioCarDraw=safetyhook::create_inline(carRadio.get_first(),RadioCarDraw);
+        radioRender=safetyhook::create_inline(radioCommand.get_first(),RadioRender);
+    }
     // Filter specific native records before font/sprite commands are queued.
     // Keep their fade state advancing, and leave flat-screen rendering native.
     constexpr auto textSlot="6A 05 68 ? ? ? ? E8 ? ? ? ? A3 ? ? ? ?";
@@ -621,6 +918,48 @@ void VRHud::Install()
     });
     FusionFix::onBeforeReset()+=[](){Reset();};
     if(enabled) FusionFix::onGameProcessEvent() += [](){
+        SaveVehicleLayouts();
+        vehicleRadioAvailable=Allowed() && VehicleHasRadio();
+        OpenXRVR::ControllerInput input{};
+        if(OpenXRVR::GetControllerInput(input))
+        {
+            const bool next=input.radioPresses[0]!=stationPresses[0],previous=input.radioPresses[1]!=stationPresses[1];
+            stationPresses[0]=input.radioPresses[0];stationPresses[1]=input.radioPresses[1];
+            if(input.driving && Allowed() && vehicleRadioAvailable && !input.phoneActive)
+            {
+                using H=Natives::NativeHashes;
+                if(next && NativeInvoke::GetNativeHandler(std::to_underlying(H::RETUNE_RADIO_UP)))Natives::RetuneRadioUp();
+                if(previous && NativeInvoke::GetNativeHandler(std::to_underlying(H::RETUNE_RADIO_DOWN)))Natives::RetuneRadioDown();
+                const int station=requestedStation.exchange(-1);
+                if(station>=0 && unsigned(station)<radioCount && NativeInvoke::GetNativeHandler(std::to_underlying(H::RETUNE_RADIO_TO_STATION_NAME)))
+                {
+                    const auto* name=NativeRadioName(unsigned(station));
+                    if(name && *name)
+                    {
+                        const std::string requested=name;
+                        Natives::RetuneRadioToStationName(const_cast<char*>(requested.c_str()));
+                        std::lock_guard guard(vehiclePanelLock);
+                        radioRequestedName=requested;radioPendingStation=station;radioRequestedAt=GetTickCount64();
+                    }
+                }
+                if(NativeInvoke::GetNativeHandler(std::to_underlying(H::GET_PLAYER_RADIO_STATION_NAME)))
+                {
+                    const auto* name=Natives::GetPlayerRadioStationName();
+                    const std::string playing=name && *name ? name:"OFF";
+                    const unsigned count=radioCount;int current=-1;
+                    for(unsigned i=0;i<count;++i)
+                        if(const auto* candidate=NativeRadioName(i);candidate && _stricmp(candidate,playing.c_str())==0)
+                        {current=int(i);break;}
+                    std::lock_guard guard(vehiclePanelLock);radioPlayingName=playing;
+                    // The script index getter aliases several native entries to
+                    // 16. Reconcile by identity, and allow native retuning to finish.
+                    if(radioPendingStation>=0 && (current==radioPendingStation || GetTickCount64()-radioRequestedAt>3000))radioPendingStation=-1;
+                    if(!radioDragging && radioPendingStation<0 && current>=0)
+                    {radioStation=unsigned(current);radioCursor=float(radioStation);}
+                }
+            }
+            else requestedStation=-1;
+        }
         carRadarAt=0;
         if(dashboard && Allowed())
         {
@@ -628,18 +967,18 @@ void VRHud::Install()
             bool handlers=true;
             for(auto hash:{Hash::GET_PLAYER_ID,Hash::GET_PLAYER_CHAR,Hash::DOES_CHAR_EXIST,
                 Hash::IS_CHAR_SITTING_IN_ANY_CAR,Hash::GET_CAR_CHAR_IS_USING,Hash::DOES_VEHICLE_EXIST,
-                Hash::GET_CAR_MODEL,Hash::IS_THIS_MODEL_A_CAR,Hash::GET_CAR_HEADING})
+                Hash::GET_CAR_MODEL,Hash::GET_CAR_HEADING})
                 handlers &= NativeInvoke::GetNativeHandler(std::to_underlying(hash))!=nullptr;
             if(handlers)
             {
                 Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
-                if(ped && Natives::DoesCharExist(ped) && Natives::IsCharSittingInAnyCar(ped))
+                if(ped && Natives::DoesCharExist(ped) && (Natives::IsCharSittingInAnyCar(ped) || Natives::IsCharInAnyTrain(ped)))
                 {
                     Vehicle car=0;Natives::GetCarCharIsUsing(ped,&car);
                     if(car && Natives::DoesVehicleExist(car))
                     {
                         uint32_t model=0;Natives::GetCarModel(car,&model);
-                        if(Natives::IsThisModelACar(model))
+                        if(model)
                         {
                             float heading=NAN;Natives::GetCarHeading(car,&heading);
                             if(std::isfinite(heading))

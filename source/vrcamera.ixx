@@ -15,6 +15,7 @@ import openxrvr;
 import natives;
 import vrhands;
 import vrconfig;
+import vrhud;
 
 export namespace VRCamera
 {
@@ -38,6 +39,13 @@ export namespace VRCamera
 
 namespace
 {
+    bool InTrackedVehicle(Ped ped)
+    {
+        return Natives::IsCharInAnyCar(ped) ||
+            (NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_CHAR_IN_ANY_TRAIN)) && Natives::IsCharInAnyTrain(ped));
+    }
+    bool SeatedTrackedVehicle(Ped ped)
+    {return Natives::IsCharSittingInAnyCar(ped) || (NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_CHAR_IN_ANY_TRAIN)) && Natives::IsCharInAnyTrain(ped));}
     using Setter=void (__thiscall*)(rage::grcViewport*,const void*);
     Setter setCamera=nullptr, setProjection=nullptr;
     SafetyHookInline audioUpdate{};
@@ -127,7 +135,9 @@ namespace
     Vehicle seatVehicle=0;
     Ped seatPed=0;
     bool seatAnchorValid=false;
-    bool seatIsCar=false,vehicleHudValid=false;
+    bool seatIsCar=false,seatIsBike=false,seatIsHeli=false,seatIsBoat=false,seatIsRail=false,vehicleHudValid=false;
+    unsigned seatModel=0;
+    VRMath::Vector vehicleRootOrigin{};
     VRMath::Matrix vehicleHudAnchor{};
     VRMath::Vector seatOffset{};
     float vehicleEyeHeightOffset=.075f;
@@ -401,7 +411,7 @@ namespace
             if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return;
         Ped ped=0;
         Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
-        if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharInAnyCar(ped) ||
+        if(!ped || !Natives::DoesCharExist(ped) || InTrackedVehicle(ped) ||
             Natives::IsCharDead(ped) ||
             (Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished())) return;
         void* owner=FindPlayerPed ? FindPlayerPed(0) : nullptr;
@@ -767,7 +777,7 @@ namespace
         if(open && !previousOpen && input.driving && !input.phoneActive)
         {
             Ped ped=0;Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
-            if(ped && Natives::DoesCharExist(ped) && !Natives::IsCharDead(ped) && Natives::IsCharInAnyCar(ped))
+            if(ped && Natives::DoesCharExist(ped) && !Natives::IsCharDead(ped) && InTrackedVehicle(ped))
             {
                 Natives::TaskUseMobilePhone(ped,true);
                 carPhonePed=ped;carPhoneStarted=now;carPhoneSeen=false;
@@ -924,6 +934,13 @@ namespace
             for(unsigned id:{30u,31u,111u}) analog(id,encodedSteer);
             analog(40,static_cast<unsigned char>(std::lround(throttle*255.f)));
             analog(41,static_cast<unsigned char>(std::lround(brake*255.f)));
+            if(seatIsHeli)
+            {
+                const bool flight=!input.phoneActive && !input.scriptMenuActive;
+                // CE B6AA00 reads lift from pad+2A08/2A18 (55/56).
+                analog(55,flight ? static_cast<unsigned char>(std::lround(throttle*255.f)):0);
+                analog(56,flight ? static_cast<unsigned char>(std::lround(input.brake*255.f)):0);
+            }
             padSteering=steering; padThrottle=throttle; padBrake=brake;
             VRDiagnostics::Increment(padDrivingUpdates);
         }
@@ -1099,7 +1116,7 @@ namespace
             Hash::HAS_CUTSCENE_LOADED,Hash::HAS_CUTSCENE_FINISHED})
             if(!NativeInvoke::GetNativeHandler(std::to_underlying(hash))) return;
         Ped ped=0; Natives::GetPlayerChar(Natives::GetPlayerId(),&ped);
-        if(!ped || !Natives::DoesCharExist(ped) || Natives::IsCharInAnyCar(ped) || Natives::IsCharDead(ped) || Natives::IsCharInAir(ped) ||
+        if(!ped || !Natives::DoesCharExist(ped) || InTrackedVehicle(ped) || Natives::IsCharDead(ped) || Natives::IsCharInAir(ped) ||
             (Natives::HasCutsceneLoaded() && !Natives::HasCutsceneFinished())) return;
         bool ragdoll=false;
         if(AnimationControlsBody(ped,FindPlayerPed ? FindPlayerPed(0) : nullptr,ragdoll)) return;
@@ -1180,7 +1197,7 @@ namespace
         height=head.fZ-position[2];
         ducking=NativeInvoke::GetNativeHandler(std::to_underlying(Hash::IS_CHAR_DUCKING)) && Natives::IsCharDucking(ped);
         airborne=NativeInvoke::GetNativeHandler(std::to_underlying(Hash::IS_CHAR_IN_AIR)) && Natives::IsCharInAir(ped);
-        if((!animated || exiting) && !ragdoll && Natives::IsCharInAnyCar(ped))
+        if((!animated || exiting) && !ragdoll && InTrackedVehicle(ped))
         {
             for(auto hash:{Hash::GET_CAR_CHAR_IS_USING,Hash::GET_CAR_HEADING,Hash::DOES_VEHICLE_EXIST,
                 Hash::GET_OFFSET_FROM_CAR_IN_WORLD_COORDS,Hash::GET_OFFSET_FROM_CAR_GIVEN_WORLD_COORDS,
@@ -1191,24 +1208,26 @@ namespace
             Natives::GetCarHeading(vehicle,&heading);
             if(seatVehicle!=vehicle || seatPed!=ped)
             {
-                seatVehicle=vehicle; seatPed=ped; seatAnchorValid=false;seatIsCar=false;
+                seatVehicle=vehicle; seatPed=ped; seatAnchorValid=false;seatIsCar=false;seatIsBike=false;seatIsHeli=false;seatIsBoat=false;seatIsRail=false;seatModel=0;
                 if(NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::GET_CAR_MODEL)) &&
                     NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_THIS_MODEL_A_CAR)))
                 {
-                    uint32_t model=0;Natives::GetCarModel(vehicle,&model);seatIsCar=Natives::IsThisModelACar(model);
+                    uint32_t model=0;Natives::GetCarModel(vehicle,&model);seatModel=model;seatIsCar=Natives::IsThisModelACar(model);
+                    if(NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_THIS_MODEL_A_BIKE)))seatIsBike=Natives::IsThisModelABike(model);
+                    if(NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_THIS_MODEL_A_HELI)))seatIsHeli=Natives::IsThisModelAHeli(model);
+                    if(NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_THIS_MODEL_A_BOAT)))seatIsBoat=Natives::IsThisModelABoat(model);
+                    if(NativeInvoke::GetNativeHandler(std::to_underlying(Natives::NativeHashes::IS_THIS_MODEL_A_TRAIN)))seatIsRail=Natives::IsThisModelATrain(model);
                 }
             }
             // Calibrate once after the ped is seated. Animated bone transforms
             // can lag the vehicle and must not supply the moving camera origin.
-            if(!seatAnchorValid && Natives::IsCharSittingInAnyCar(ped) &&
-                std::isfinite(head.fX+head.fY+head.fZ) &&
-                std::hypot(head.fX-position[0],head.fY-position[1])<5 && std::abs(height)<5)
+            if(!seatAnchorValid && SeatedTrackedVehicle(ped) &&
+                std::isfinite(head.fX+head.fY+head.fZ))
             {
                 seatOffset={NAN,NAN,NAN,1};
                 Natives::GetOffsetFromCarGivenWorldCoords(vehicle,head.fX,head.fY,head.fZ,
                     &seatOffset[0],&seatOffset[1],&seatOffset[2]);
-                seatAnchorValid=std::isfinite(seatOffset[0]+seatOffset[1]+seatOffset[2]) &&
-                    std::hypot(seatOffset[0],seatOffset[1])<5 && std::abs(seatOffset[2])<5;
+                seatAnchorValid=std::isfinite(seatOffset[0]+seatOffset[1]+seatOffset[2]);
             }
             auto carPoint=[vehicle](float x,float y,float z)
             {
@@ -1217,6 +1236,7 @@ namespace
                 return point;
             };
             const auto origin=carPoint(0,0,0);
+            vehicleRootOrigin=origin;
             const auto right=carPoint(1,0,0),up=carPoint(0,0,1),back=carPoint(0,-1,0);
             vehicleBasis=VRMath::Identity();
             for(unsigned axis=0;axis<3;++axis)
@@ -1286,7 +1306,7 @@ namespace
         if(_wfopen_s(&file,path,anchorSamples ? L"a" : L"w")) return;
         fprintf(file,"issue014 sample=%u frame=%u pedHandle=%d pedPointer=%p inVehicle=%u char=(%.6f %.6f %.6f) heading=%.6f\n",
             anchorSamples,anchorFrames,ped,FindPlayerPed ? FindPlayerPed(0) : nullptr,
-            Natives::IsCharInAnyCar(ped),position[0],position[1],position[2],heading);
+            InTrackedVehicle(ped),position[0],position[1],position[2],heading);
         fprintf(file,"candidateHeadBone1205=(%.6f %.6f %.6f)\n",head.fX,head.fY,head.fZ);
         fprintf(file,"firstPersonConfigured=%u firstPersonActive=%u\n",firstPerson,firstPersonActive.load());
         AcquireSRWLockShared(&motionLock);
@@ -1407,6 +1427,7 @@ std::string VRCamera::AudioStatus()
         native[3][0],native[3][1],native[3][2],native[1][0],native[1][1],native[1][2]);
     return text;
 }
+
 
 void VRCamera::Install()
 {
@@ -1667,8 +1688,12 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
         VRMath::Matrix vehicleBasis{};
         const bool useFirstPerson=firstPerson && visibilityAvailable && !scriptCameraActive &&
             GameplayAnchor(anchor,heading,measuredHeight,groundZ,vehicle,ducking,airborne,vehicleBasis,animated,ragdoll,exiting);
-        vehicleHudValid=useFirstPerson && vehicle && seatAnchorValid && seatIsCar && !exiting;
+        vehicleHudValid=useFirstPerson && vehicle && seatModel!=0xC6C3242D && seatAnchorValid && (seatIsCar || seatIsBike || seatIsHeli || seatIsBoat || seatIsRail) && !exiting;
         if(vehicleHudValid){vehicleHudAnchor=vehicleBasis;vehicleHudAnchor[3]=anchor;}
+        auto nativeVehicle=vehicleBasis;
+        nativeVehicle[1]={-vehicleBasis[2][0],-vehicleBasis[2][1],-vehicleBasis[2][2],0};
+        nativeVehicle[2]=vehicleBasis[1];nativeVehicle[3]=vehicleRootOrigin;
+        vehicleHudAnchor=VRHud::PublishVehicle(seatModel,vehicleHudAnchor,nativeVehicle,vehicleHudValid);
         auto bodyAnchor=anchor;
         if(useFirstPerson!=firstPersonActive || vehicle!=anchorVehicle) recenter=true;
         anchorVehicle=vehicle;
@@ -1776,7 +1801,7 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
                 if(!std::isfinite(value)) throw std::invalid_argument("Invalid game camera");
         VRHands::PublishTrackingTransform(VRMath::Multiply(referenceInverse,gameCamera),
             FindPlayerPed ? FindPlayerPed(0) : nullptr,useFirstPerson && !animated && !exiting && !ragdoll &&
-            (!vehicle || seatIsCar) && OpenXRVR::HasFocusedViews(),vehicle!=0);
+            (!vehicle || seatIsCar || seatIsBike || seatIsHeli || seatIsBoat || seatIsRail) && OpenXRVR::HasFocusedViews(),vehicle!=0,seatIsBike,seatIsHeli,seatIsRail);
         // Eye translation comes only from the native anchor and OpenXR pose.
         // VRHands applies configured head/body placement to the visible rig;
         // head yaw must never rotate a positional offset around these eyes.

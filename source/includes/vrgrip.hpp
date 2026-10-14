@@ -6,6 +6,53 @@
 // controller deltas into an attachment, which would permit accumulated drift.
 namespace VRGrip
 {
+    inline std::array<float,2> CyclicAngles(const VRMath::Vector& point)
+    {return {std::atan2(point[1],std::hypot(point[0],point[2])),std::atan2(point[0],point[2])};}
+    inline VRMath::Matrix CyclicHandle(float pitch,float roll,float shaft)
+    {
+        const VRMath::Vector direction{std::sin(roll)*std::cos(pitch),std::sin(pitch),std::cos(roll)*std::cos(pitch),0};
+        auto frame=VRMath::SegmentRotation({0,0,1,0},direction);
+        frame[3]={shaft*direction[0],shaft*direction[1],shaft*direction[2],1};return frame;
+    }
+    // A stable body-relative pole replaces animation-derived elbow selection.
+    // Outside the reachable interval keep the limb extended/folded on the ray;
+    // the caller retains ownership of the tracked wrist endpoint.
+    inline bool StableElbow(const VRMath::Vector& shoulder,const VRMath::Vector& target,
+        const VRMath::Vector& pole,float upper,float lower,VRMath::Vector& elbow)
+    {
+        auto ray=VRMath::Difference3(target,shoulder);
+        const float distance=VRMath::Length3(ray);
+        if(!std::isfinite(distance+upper+lower) || distance<1.e-6f || upper<=0 || lower<=0)return false;
+        for(float v:pole)if(!std::isfinite(v))return false;
+        for(unsigned axis=0;axis<3;++axis)ray[axis]/=distance;
+        const float reach=std::clamp(distance,std::abs(upper-lower),upper+lower);
+        if(reach<1.e-6f)return false;
+        auto bend=pole;
+        const float parallel=VRMath::Dot3(bend,ray);
+        for(unsigned axis=0;axis<3;++axis)bend[axis]-=parallel*ray[axis];
+        float length=VRMath::Length3(bend);
+        if(length<1.e-6f)
+        {
+            unsigned axis=0;for(unsigned a=1;a<3;++a)if(std::abs(ray[a])<std::abs(ray[axis]))axis=a;
+            bend={};bend[axis]=1;
+            for(unsigned a=0;a<3;++a)bend[a]-=ray[axis]*ray[a];
+            length=VRMath::Length3(bend);
+        }
+        const float along=(upper*upper-lower*lower+reach*reach)/(2*reach);
+        const float across=std::sqrt(std::max(0.f,upper*upper-along*along));
+        elbow=shoulder;
+        for(unsigned a=0;a<3;++a)elbow[a]+=along*ray[a]+across*bend[a]/length;
+        return std::isfinite(VRMath::Length3(elbow));
+    }
+    // Capture wrist orientation but seat its palm exactly on an animated grip.
+    // Following the native grip afterward retains suspension/steering motion.
+    inline VRMath::Matrix PalmAttachment(const VRMath::Matrix& wrist,const VRMath::Vector& palm,const VRMath::Matrix& grip)
+    {
+        auto relative=VRMath::Multiply(wrist,VRMath::InverseRigid(grip));
+        auto direction=palm;direction[3]=0;
+        const auto offset=VRMath::Transform(direction,relative);
+        relative[3]={-offset[0],-offset[1],-offset[2],1};return relative;
+    }
     // Absolute circular grab reference. Evaluate each physical hand against
     // its acquisition ray, then fit one common hinge angle. In particular,
     // clamping at a stop must not consume controller motion or move the zero.

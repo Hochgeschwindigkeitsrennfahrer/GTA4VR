@@ -25,6 +25,7 @@ import vrhud;
 import vrprofile;
 import vrsettings;
 import natives;
+import devvehicles;
 
 export namespace DevControl { void Install(); }
 
@@ -304,6 +305,28 @@ namespace
                 : "{\"ok\":false,\"error\":\"expected enabled hand IK and integer x y z rotations in [-180,180]\"}";
         }
         else if(command=="location-status") response=LocationStatus();
+        else if(command=="vehicle-test-status") response=VRDevVehicles::Status();
+        else if(command=="vehicle-test-rail-exit") response=VRDevVehicles::Queue(VRDevVehicles::Operation::RailExit);
+        else if(command=="vehicle-test-remove") response=VRDevVehicles::Queue(VRDevVehicles::Operation::Remove);
+        else if(command.rfind("vehicle-test-spawn ",0)==0)
+        {
+            const auto text=std::string_view(command).substr(19);unsigned model=0;
+            const auto parsed=std::from_chars(text.data(),text.data()+text.size(),model,16);
+            response=text.size()==8 && parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size() && model
+                ? VRDevVehicles::Queue(VRDevVehicles::Operation::Spawn,model):"{\"ok\":false,\"error\":\"expected eight-digit vehicle model hash\"}";
+        }
+        else if(command.rfind("vehicle-test-anchor ",0)==0)
+        {
+            VRDevLocation::Position value;
+            response=VRDevLocation::Parse(std::string_view(command).substr(20),value)
+                ? VRDevVehicles::Queue(VRDevVehicles::Operation::Anchor,0,value):"{\"ok\":false,\"error\":\"expected finite x y z heading\"}";
+        }
+        else if(command.rfind("vehicle-test-heli-point ",0)==0)
+        {
+            VRDevLocation::Position value;
+            response=VRDevLocation::Parse(std::string_view(command).substr(24),value)
+                ? VRDevVehicles::Queue(VRDevVehicles::Operation::HelicopterPoint,0,value):"{\"ok\":false,\"error\":\"expected finite x y z heading\"}";
+        }
         else if(command=="location-capture") response=QueueLocation(LocationOperation::Capture);
         else if(command.rfind("location-restore ",0)==0)
         {
@@ -538,6 +561,7 @@ void DevControl::Install()
     Connect();
     FusionFix::onGameProcessEvent() += ProcessLocation;
     FusionFix::onGameProcessEvent() += ProcessMeleeTest;
+    VRDevVehicles::Install();
     FusionFix::onEndScene() += []() { Pump(); };
     FusionFix::onShutdownEvent() += []()
     {

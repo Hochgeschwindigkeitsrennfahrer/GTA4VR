@@ -87,6 +87,7 @@ namespace
             case Flag::DisableOpenXR:return std::wstring(L"Enables VR on the next game launch. Switch off to launch flat screen. Changing this option does not end the current session.");
             case Flag::PhysicalCrouch:return std::wstring(L"Your tracked head height controls native crouching. Entry is 65% and standing is 75% of configured standing eye height.");
             case Flag::AmmoCounters:return std::wstring(L"Shows the round pins and reserve ammunition display attached to supported weapons. Individual weapon profiles retain their display settings when switched off.");
+            case Flag::VehiclePanelEditing:return std::wstring(L"Grip the radar or radio to move and rotate it. Release to save placement for this vehicle model. With editing off, grip and drag the radio's station strip to tune the station in the centre.");
             default:return std::wstring(L"Displays the tracked first-person character body in VR.");
             }
         });
@@ -138,6 +139,7 @@ namespace
         if(vehicle==Screen::Invalid)return;
         FusionFixSettings.SetSubmenuDescription(vehicle,[](){return std::wstring(L"Adjust the seated camera and the radar panel inside vehicles.");});
         for(auto id:{Number::VehicleEyeHeight,Number::DashboardSize,Number::DashboardForward,Number::DashboardDown,Number::DashboardRight,Number::DashboardTilt})ready&=Numeric(vehicle,id);
+        ready&=Toggle(vehicle,Flag::VehiclePanelEditing,L"Grip to move vehicle panels");
         registered=ready;
     }
 }

@@ -46,6 +46,95 @@ releases wheel grips. Native pad steering still owns the car's driving physics.
 
 ### Native wheel mesh — experimental
 
+#### Component isolation correction (2026-10-14, issue #3)
+
+The Admiral revealed that fitting all vertices in one material geometry could
+select a dashboard circle and rotate parts of the instrument cluster. Its CE
+model84 skeleton has no separate `steeringwheel` bone. The replacement fits
+triangle-connected components, welding duplicated positions at mesh seams.
+Candidates must fit entirely inside the rim's local disc; nearby dashboard
+components are excluded as a whole. Coplanar hub/spoke components are included,
+while the shaft and stalks remain fixed.
+
+The captured Admiral selects 173 rim/hub vertices in geometry4, with 63 rim
+samples, instead of the former 258-vertex spatial selection. The fitted centre
+also changes to the actual wheel. A deterministic fixture checks adjacent
+dashboard exclusion, stalk exclusion, hub inclusion and invalid indices. The
+x86 Release build passes; headset verification and other models remain pending.
+Native geometry inspection confirmed its index buffer at geometry `+1C`, count
+at buffer `+4`, and CPU backing indices at `+10`. Captures remain outside Git.
+The binary importer failed because of a Java class-version mismatch; these new
+findings have not been added to the Ghidra project.
+
+The Ambulance model86 uses a higher driver-seat origin: the old 20cm lower
+search cutoff removed the bottom of the wheel and prevented a complete rim
+fit. A generic 5cm cutoff preserves the complete rim. Its connected-component
+fit selects 84 wheel vertices in geometry3; no vehicle-specific offset is used.
+The deterministic fixture also covers this lower wheel-to-seat relationship.
+Headset verification remains pending.
+
+The subsequent centre correction grows from the rim into nearby components
+inside a tapered envelope, with additional depth toward the wheel axis. This
+includes dished spokes and horn pads without widening the rim plane into the
+stalks. Captured selections increase from136 to256 vertices for the Blista,
+and84 to128 for the Ambulance; the Admiral retains173. The regression fixture
+checks a separate dished spoke/centre badge and detached stalk. These captures
+and math checks do not establish headset acceptance for every model.
+
+Wheel completion now operates across all supported material geometries rather
+than only the geometry containing the strongest rim fit. A combined 32-bit
+triangle index space and model-space seam welding let hub/spoke components in
+another material join the same tapered assembly. The native adapter validates
+rigid chassis weights and acquires all affected vertex buffers before writing,
+then rebinds every selected material part to the same wheel transform.
+The captured Airtug adds90 centre vertices in geometry2 to208 rim vertices in
+geometry3. Admiral173, Ambulance128 and Blista256 selections remain unchanged.
+No model-specific wheel rules are used. Unsupported native vertex/palette
+layouts still retain static geometry; universal vehicle coverage is not claimed.
+
+The Benson exposed a remaining adapter restriction: material geometries with
+eight or more palette entries were excluded before assembly selection. The
+adapter now admits the native supported palette range when the checked spare
+entry is present, retaining the rigid-weight/buffer checks. Its spokes/hub use
+two13-entry palettes. Dish depth now scales with fitted radius rather than a
+fixed8cm allowance. The captured Benson selects298 vertices across geometries
+2,3 and6, including the90 centre vertices. Airtug298, Admiral173 and
+Ambulance128 remain unchanged; Blista includes an additional12 centre-collar
+vertices. The long steering shaft and detached stalks remain excluded by
+component extent/contact tests. Runtime model coverage remains in progress.
+
+The Bus revealed that a full native palette has no append space at all. Wheel
+rebinding now uses a module-owned expanded palette for each affected geometry,
+without inspecting or writing allocation padding. Before native geometry
+destruction, its original palette pointer/count are restored and the module's
+storage/cache records are released. This lets full palettes participate in the
+same multi-material wheel assembly; the captured Bus selects292 vertices,
+including48 spoke vertices in its formerly excluded8-entry material.
+
+The destructor's allocation ownership was traced from a bounded decrypted
+runtime capture in Ghidra: native `0045F540` frees geometry `+38` through its TLS
+allocator. The deleting wrapper `0045F470` calls it at `+3`. Installation checks
+both signatures through the live geometry vtable. Findings are saved in the
+`wheel-native.bin` capture program under `VRWheelPaletteOwnershipIssue3`;
+capture offset `540` maps to native `0045F540`. The imported executable's bytes
+in this region are encrypted/misdecoded, so that stored static extent was not
+repaired or reused. Captures remain ignored and are not distributed.
+
+The Forklift uses shared19-entry palettes listing every vehicle bone, including
+the driver seat, even though the high-detail vertices never use that bone.
+The adapter now checks actual nonzero skin weights across all three scene LODs
+instead of rejecting palette membership. A discarded CPU backing copy uses a
+read-only native GPU-buffer lock for this one-time model preparation check.
+Unknown layouts or an actually weighted seat bone retain static geometry.
+Its captured high-detail assembly contains128 wheel vertices in geometry5;
+headset verification remains pending.
+
+The first shared-palette build still rejected the Forklift's unuploaded second
+LOD, where vertex buffer `+8` and GPU interface `+1C` are null. The native
+backing store at `+20` remains populated. Read-only inspection of all scene
+LODs found8641/4781/522 vertices and no driver-seat weights. Ownership checks
+now use that native backing store before attempting a GPU-buffer read.
+
 The new build searches the high-detail car geometry for a complete circular rim
 near the authored driver seat. A deterministic geometric fit supplies the centre,
 plane and radius for both hand snapping and visible rotation. Native seated palms
@@ -159,6 +248,82 @@ remain on foot. User accepted left-hand drive-by attachment and manual car phone
 use on 2026-10-10. Firing/ammo transitions and broader phone lifecycle remain
 pending; bikes/passengers/episodes are not inferred covered.
 
+## Motorcycle handlebars and worn helmet
+
+Tracked under [vehicle interactions #3](https://github.com/bordplate/GTA4VR/issues/3).
+Bike hand targets use the authored `hbgrip_l` / `hbgrip_r` bones and `forks_u`
+pivot, with parent-composed bind transforms. Either grip acquires the matching
+handle within WheelGripRadius; both hands fit one absolute steering angle about
+the fork axis. Hand attachments follow the native animated grip bones, including
+fork and suspension motion, rather than a separately rotated bind pose.
+Acquired palm offsets keep the wrist aligned without accumulating drift.
+Releasing returns steering to the touchpad. Phone, panel editing and the
+drive-by hand retain priority. Steering travel comes from each bike's native
+handling data (+DC8 pointer, +84 radians), rather than a fixed 35-degree scale.
+CE `00CECBE0` smooths and signed-squares pad steering before writing +1088.
+The local tracked driver's held-handle adapter overrides the resulting +1080
+normalized input and +1088 angle after that handler, retaining throttle/brake
+and native control when no hand is held, tracking is stale or VR loses focus.
+Native bike physics controls lean and balance;
+this does not introduce body-lean steering or a physical throttle twist.
+
+The first-person helmet filter operates on copied native prop draw records,
+without removing the helmet or changing its protection/state. CE 1.2.0.59
+`009E9560` checks the worn flag at CPed+264 bit8000. `008DB1F0` constructs
+CDrawPedPropsDC from two 0x40 records; `00AB9B10` rejects drawable index -1.
+`00AB9BC0` distinguishes default attachment (+14==-1) from an animated bone
+override. The eye-only constructor filter omits the local worn head prop on
+the default attachment, retaining the putting-on/removed animation attachment,
+other characters, scripted third-person views and shared shadow builds. Findings
+are saved in Ghidra under `VRBikeHelmetIssue3`. Runtime headset validation and
+coverage of the remaining bike models are pending. The initial indirect pad
+steering produced nonlinear response and hand/handle separation; direct steering
+and animated handle attachment are the current correction under validation.
+
+Native arm solver `00C9F720` calls `00C95F90` to choose an elbow from the
+animation's old shoulder/elbow/wrist plane. Near straight-arm poses this plane
+can become unstable. Tracked bike solves now scope a body-relative outward/back
+elbow pole around that helper, retaining native upper/forearm rotation and final
+twist-bone processing. It applies to tracked bike arms under either touchpad or
+held-handle steering; other native solves retain their own elbow selection.
+The helper ABI was checked live (nine stack arguments, RET24, output pointer
+in EAX). Geometry fixtures cover steering-sweep continuity, segment lengths,
+unreachable targets and a collinear pole. The corrected full-lock arm behavior
+passed the Bobber headset check with touchpad and grip steering; the current
+base-game bike sequence is complete. Other episodes remain untested.
+
+## Helicopter flight — initial adapter
+
+Helicopters now enter the freely tracked vehicle-hand and dashboard-panel paths.
+The existing Driving accelerator/brake actions supply native lift up/down
+(right/left trigger in the Wand defaults). With no cyclic grip, the left
+touchpad supplies pitch/roll. Grip the cyclic with the right hand to control
+pitch/roll physically; left/right on the left touchpad then supplies yaw.
+Release returns to touchpad cyclic control. Phone/menu activity releases the
+cyclic and suppresses injected flight controls.
+
+CE 1.2.0.59 `00B6AA00` is the pilot input handler, virtual+158, one stack
+argument. It reads lift at pad+2A08/2A18 (55/56), unlike car controls40/41.
+The local-driver adapter retains native lift/hover processing and replaces
+the pitch/roll outputs +1EB8/+1EBC and yaw +1EB4. Physics forces, rotor startup,
+flight assistance and landing remain native. Other drivers and unfocused VR
+retain their native input handler.
+
+The tested Annihilator skeleton has no authored cyclic bone. Its initial grip
+position is learned from the native seated pilot's right palm before tracked
+IK when no mesh fit is available. A recognized stick supplies its bottom-end pivot and grip centre; `HelicopterCyclicShaftLength` supplies the fallback pivot below the native grip;
+`HelicopterCyclicTravelDegrees` controls centre-to-full-input tilt. Acquisition
+captures one reference; subsequent tilt uses absolute vehicle-relative angles.
+The hand and isolated stock stick geometry follow the same virtual pivot.
+The mesh adapter selects complete welded slender shaft/grip components near
+an authored pilot seat, joins grip components only near the shaft upper endpoint, validates rigid chassis weights, and borrows an unused
+seat bone through the existing owned-palette lifetime adapter. The skeleton
+matrix is overridden only during the local vehicle draw and restored afterward.
+Touchpad pitch/roll also tilts the visible cyclic. Unsupported meshes remain
+static rather than rotating neighbouring cockpit geometry.
+Flight controls have been checked in the Annihilator. Visible cyclic alignment
+and other helicopter models/episodes remain pending. Ghidra bookmark: `VRHelicopterCyclicIssue3`.
+
 ## Analysis record (native wheel)
 
 Ghidra bookmark `Issue019WheelRender` at A3D980 records the verified runtime
@@ -167,3 +332,49 @@ PID10124 module base005C0000 placed that entry at00BFD980. The imported program
 still contains packed bytes in this code region, so its static pseudocode is
 not evidence for the implementation. The bookmark was previewed, read back
 and saved; local native vertex captures remain ignored under `build/`.
+
+## Boats
+
+Boat classification now enables seated tracked hands and vehicle panels through
+native `IS_THIS_MODEL_A_BOAT`, independently of the car/bike/helicopter gates.
+Boats share the physical wheel solver, mesh fitting, grip priorities and release
+to touchpad steering with cars. Native throttle/reverse and rudder simulation
+remain responsible for movement; no boat forces are synthesized. Where wheel
+geometry cannot be safely fitted, grip placement falls back to the settled
+native driver's hand pose and the visual wheel remains static.
+Base-game boat validation starts with the Dinghy; other models and episodes
+remain pending.
+
+Large helm wheels use a wider geometric search only when the car-sized search
+fails. This retains the original rim/connected-component validation and avoids
+per-model wheel positions. The Marquis capture fits a 0.485 m radius wheel.
+Seated camera anchors accept finite native vehicle-local offsets rather than
+rejecting seats beyond five metres from a large vehicle's origin. Radar heading
+follows any valid seated vehicle instead of being limited to car/bike models.
+Rigid wheel parts weighted to a separate `bodyshell` bone are accepted only when its bind frame is identity; other articulated joints remain excluded.
+Rim fitting permits front/back samples from a thick steering-wheel rim to
+contribute to the same circle. The Reefer's separated depth faces otherwise
+leave too few inliers per face. Whole-component depth/radius checks still
+exclude neighbouring geometry; the captured Reefer wheel now passes.
+Sparse full-circle rim components can seed wheel selection with 24 vertices,
+while retaining seven-of-eight angular coverage and complete-component checks.
+This supports the tugboat's rim faces split across material geometry; the full
+assembly still passes rigid-weight validation before any buffer is modified.
+
+## Rail test setup (CE 1.2.0.59)
+
+Ghidra bookmark `VRRailTestingIssue3` records live disassembly at native
+`BC54A0` -> `BC9A20` -> `C39570` (analysis addresses; observed process base
+00C00000). Native consists are 16-int rows at analysis016D0D58; type9 is cable
+model208, type12 is a singleton subway model209. Route counts and pointers at
+016D1198/016D11C8 describe six routes with 12-byte nodes: signed shorts XYZ,
+scaled .125/.125/.03125. Native C3A300 performs nearest-node selection.
+The bridge uses route4 for cable and route0 for subway tests. A scoped type12
+model substitution exercises subway_hi/model210 and restores the consist
+before returning. Native creation readback must match the requested hash.
+Train speed, boarding and cleanup use native functions on the simulation
+callback. No ambient trains are removed or given test input. Runtime validation
+of all three rail entries remains pending.
+The stock cablecars script checks wanted level zero before offering boarding. Rail tests temporarily suppress wanted levels and restore the maximum on safe exit/cleanup. Native train occupancy complements car occupancy in VR camera/action routing.
+A one-time maximum-wanted change is insufficient against locked-island scripts. Rail tests lazily install scoped ALTER_WANTED_LEVEL/NO_DROP filters once the native table is ready, maintain police-ignore/invincibility during the test and restore normal behavior on exit. Explicit rail status reports health, wanted and actual boarding state; protection is not inferred from command acceptance.
+Cable-car passengers retain native seated travel and freely tracked hands, with radar on the wrist. The on-foot cabin experiment was withdrawn: touchpad and room-scale movement expelled the player from the cabin. Walkable interiors are out of scope; the exact collision shape was not established.

@@ -388,11 +388,13 @@ namespace
     SafetyHookInline scopeObjectRender{};
     std::atomic<unsigned> scopeHiddenObjects=0;
     SafetyHookInline playerDrawCtor{},playerDrawExecute{},playerDrawDestroy{};
+    SafetyHookInline pedPropsDrawCtor{};
     SafetyHookInline retainModel{};
     VRModelRefs::Batch modelReferences[4]{};
     SRWLOCK modelReferencesLock=SRWLOCK_INIT;
     unsigned retainedModelPeak=0,duplicateModelReferences=0;
     thread_local bool buildingLocalBody=false;
+    thread_local bool buildingWornHelmet=false;
     thread_local bool renderingLocalBody=false;
     unsigned bodyMaterialCaptures[2]{};
     SRWLOCK bodyCommandsLock=SRWLOCK_INIT;
@@ -2851,6 +2853,28 @@ namespace
     // CE CDrawPlayerDC: constructor ret 0x28; executor ret; destructor ret 4.
     // Tag commands while the local ped builds an eye stream. A matching model
     // index alone would also affect other entities using the player's model.
+    void* __fastcall PedPropsDrawCtor(void* self,void* edx,uintptr_t model,uintptr_t skeleton,void* props,
+        uintptr_t flags,uintptr_t a,uintptr_t b,uintptr_t c,uintptr_t d,uintptr_t e,uintptr_t f)
+    {
+        // CE CDrawPedPropsDC copies two 0x40 prop records synchronously.
+        // Omit a worn head prop only in the local first-person eye stream.
+        // Bone override +14 != -1 means an animated attachment (e.g. hand).
+        alignas(16) std::array<std::byte,0x80> filtered;
+        if(buildingWornHelmet && props)
+        {
+            std::memcpy(filtered.data(),props,filtered.size());
+            for(unsigned slot=0;slot<2;++slot)
+            {
+                auto* record=filtered.data()+slot*0x40;
+                int type=0,bone=0;std::memcpy(&type,record,4);std::memcpy(&bone,record+0x14,4);
+                if(type==0 && bone==-1)
+                {const int absent=-1;std::memcpy(record+4,&absent,4);}
+            }
+            props=filtered.data();
+        }
+        return pedPropsDrawCtor.unsafe_fastcall<void*>(self,edx,model,skeleton,props,flags,a,b,c,d,e,f);
+    }
+
     void* __fastcall PlayerDrawCtor(void* self,void* edx,uintptr_t a,uintptr_t b,
         uintptr_t c,uintptr_t d,uintptr_t e,uintptr_t f,uintptr_t g,uintptr_t h,
         uintptr_t i,uintptr_t j)
@@ -2997,9 +3021,13 @@ namespace
             return 0;
         }
         const bool previous=buildingLocalBody;
+        const bool previousHelmet=buildingWornHelmet;
         buildingLocalBody=buildingEye>=0 && buildingStage && VRCamera::ShowLocalBody(self);
+        buildingWornHelmet=buildingLocalBody &&
+            (*reinterpret_cast<const unsigned*>(static_cast<const char*>(self)+0x264)&0x8000)!=0;
         const auto result=pedRender.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
         buildingLocalBody=previous;
+        buildingWornHelmet=previousHelmet;
         return result;
     }
 
@@ -4541,6 +4569,8 @@ void VRStereo::Install()
                 playerDrawDestroy=safetyhook::create_inline(destroy.get_first(),PlayerDrawDestroy);
             }
             const bool bodyReady=playerDrawCtor && playerDrawExecute && playerDrawDestroy;
+            auto props=hook::pattern("83 EC 08 53 55 56 57 8B F9 8B 47 04 C7 07 ? ? ? ? 33 05 ? ? ? ? 8D 4F 10");
+            if(props.size()==1)pedPropsDrawCtor=safetyhook::create_inline(props.get_first(),PedPropsDrawCtor);
             VRCamera::SetHeadlessBodyAvailable(bodyReady);
             Log(bodyReady ? "First-person headless body filter installed" : "First-person body unavailable; whole-player hiding retained");
         }

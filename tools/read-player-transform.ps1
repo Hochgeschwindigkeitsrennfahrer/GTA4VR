@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][int]$GameProcessId, [switch]$CollisionShape, [switch]$Rig, [switch]$FingerRig, [switch]$BodyRig)
+param([Parameter(Mandatory=$true)][int]$GameProcessId, [switch]$CollisionShape, [switch]$Rig, [switch]$FingerRig, [switch]$BodyRig, [switch]$LocationOnly)
 $ErrorActionPreference = 'Stop'
 if($FingerRig -or $BodyRig) {$Rig=$true}
 # Read-only CE 1.2.0.59 diagnostic. No process writes, calls or suspension.
@@ -35,6 +35,20 @@ try {
     if ($taskIndex -lt 0 -or $taskIndex -gt 31) { throw 'No valid local player slot' }
     $taskInfo = [BitConverter]::ToUInt32((Read-GameBytes ($taskTableAddress + 4*$taskIndex) 4),0)
     $taskPed = [BitConverter]::ToUInt32((Read-GameBytes ($taskInfo + 0x598) 4),0)
+    if($LocationOnly) {
+        $taskPositionEntity=$taskPed
+        $taskVehicle=[BitConverter]::ToUInt32((Read-GameBytes ($taskPed+0xB30) 4),0)
+        $taskSeated=(([BitConverter]::ToUInt32((Read-GameBytes ($taskPed+0x26C) 4),0) -band 4) -ne 0) -and $taskVehicle
+        if($taskSeated) {$taskPositionEntity=$taskVehicle}
+        $taskMatrixPointer=[BitConverter]::ToUInt32((Read-GameBytes ($taskPositionEntity+0x20) 4),0)
+        $taskMatrix=Read-GameBytes $taskMatrixPointer 64
+        $taskHeading=[Math]::Atan2(-[BitConverter]::ToSingle($taskMatrix,16),[BitConverter]::ToSingle($taskMatrix,20))*180/[Math]::PI
+        if($taskHeading -lt 0) {$taskHeading+=360}
+        $taskPosition=[ordered]@{x=[BitConverter]::ToSingle($taskMatrix,48);y=[BitConverter]::ToSingle($taskMatrix,52);z=[BitConverter]::ToSingle($taskMatrix,56);heading=$taskHeading}
+        foreach($taskValue in $taskPosition.Values) {if([double]::IsNaN($taskValue) -or [double]::IsInfinity($taskValue)) {throw 'Invalid native position'}}
+        [ordered]@{schema=1;capturedAt=[DateTime]::UtcNow.ToString('o');pid=$GameProcessId;source= $(if($taskSeated){'vehicle root'}else{'player root'});moduleBase=('0x{0:X8}' -f $taskBase);position=$taskPosition;rotationRows=@(foreach($taskRow in 0..2){,@(foreach($taskAxis in 0..2){[BitConverter]::ToSingle($taskMatrix,16*$taskRow+4*$taskAxis)})})}
+        return
+    }
     if($BodyRig) {
         # CE post-update call+10 -> fixed GetPad (B8 imm32 C3), read only.
         $taskPadCall=$taskBase+0x8F4D00-0x400000+10

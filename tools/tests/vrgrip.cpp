@@ -15,6 +15,59 @@ int main()
 {
     constexpr float pi=3.141592654f;
     {
+        auto frame=VRGrip::CyclicHandle(.2f,-.3f,.32f);
+        const auto angles=VRGrip::CyclicAngles(frame[3]);
+        Near(angles[0],.2f);Near(angles[1],-.3f);
+        Near(VRMath::Length3(frame[3]),.32f);
+        const auto neutral=VRGrip::CyclicHandle(0,0,.32f);
+        Near(neutral[3][0],0);Near(neutral[3][1],0);Near(neutral[3][2],.32f);
+    }
+    {
+        // Sweep a reachable handle across the rider and through near-full
+        // extension: elbow direction must not flip with the animation pose.
+        const VRMath::Vector shoulder{0,0,0,1},pole{-.7f,-.6f,-.15f,0};
+        VRMath::Vector previous{};
+        for(int i=0;i<=200;++i)
+        {
+            const float a=(i-100)*.006f;
+            const VRMath::Vector target{.25f*std::sin(a),.42f+.13f*std::cos(a),-.1f,1};
+            VRMath::Vector elbow{};
+            if(!VRGrip::StableElbow(shoulder,target,pole,.31f,.29f,elbow))return 1;
+            Near(VRMath::Length3(VRMath::Difference3(elbow,shoulder)),.31f);
+            Near(VRMath::Length3(VRMath::Difference3(target,elbow)),.29f);
+            if(i && VRMath::Length3(VRMath::Difference3(elbow,previous))>.01f)return 1;
+            previous=elbow;
+        }
+        VRMath::Vector elbow{};
+        if(!VRGrip::StableElbow(shoulder,{0,2,0,1},pole,.31f,.29f,elbow))return 1;
+        Near(elbow[1],.31f); // Unreachable target: finite extended upper arm.
+        if(!VRGrip::StableElbow(shoulder,{0,.4f,0,1},{0,1,0,0},.31f,.29f,elbow))return 1;
+    }
+    {
+        auto wrist=VRMath::Identity(),handle=wrist;
+        wrist[3]={4,2,1,1};handle[3]={4.2f,2,1,1};
+        const VRMath::Vector palm{.03f,.08f,.01f,1};
+        const auto attachment=VRGrip::PalmAttachment(wrist,palm,handle);
+        const float p[]{8,9,3},q[]{0,0,.38268343f,.92387953f};
+        handle=VRMath::Pose(p,q); // Native steering, suspension and chassis motion.
+        const auto snapped=VRMath::Multiply(attachment,handle);
+        const auto contact=VRMath::Transform(palm,snapped);
+        for(unsigned axis=0;axis<3;++axis)Near(contact[axis],handle[3][axis]);
+    }
+    {
+        // Motorcycle hands start on opposite ends of a handlebar; the left
+        // grip crosses atan2's branch cut during a normal steering movement.
+        const float limit=35*pi/180;
+        float reference[]{pi,0},acquired[]{0,0},current[]{pi+.3f,.3f};
+        bool held[]{true,true};
+        current[0]=std::remainder(current[0],2*pi);
+        Near(VRGrip::WheelAngle(current,reference,acquired,held,0,limit),.3f);
+        current[0]=pi;current[1]=0;
+        Near(VRGrip::WheelAngle(current,reference,acquired,held,.3f,limit),0);
+        held[1]=false;current[0]=std::remainder(pi+1.f,2*pi);
+        Near(VRGrip::WheelAngle(current,reference,acquired,held,0,limit),limit);
+    }
+    {
         const VRMath::Vector seat{-.4f,-.2f,-.2f,1};
         auto frame=VRMath::Identity();
         frame[1]={0,std::sin(pi/9),std::cos(pi/9),0};

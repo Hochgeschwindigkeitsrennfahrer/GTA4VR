@@ -11,7 +11,7 @@ namespace VRSettingsModel
         WristSize, WristBack, WristLift, DashboardSize, DashboardForward,
         DashboardDown, DashboardRight, DashboardTilt, BodyForward, Count
     };
-    enum class Flag : unsigned { DisableOpenXR, PhysicalCrouch, ShowBody, AmmoCounters, Count };
+    enum class Flag : unsigned { DisableOpenXR, PhysicalCrouch, ShowBody, AmmoCounters, VehiclePanelEditing, Count };
     struct NumberSpec
     {
         const char* key;
@@ -37,7 +37,7 @@ namespace VRSettingsModel
         {"FirstPersonForwardOffset",L"Body behind eyes",L"m",.08f,-.5f,.5f,.005f,false}
     }};
     inline constexpr std::array<const char*,unsigned(Flag::Count)> flags{
-        "DisableOpenXR","ExperimentalPhysicalCrouch","ShowFirstPersonBody","DiegeticAmmoCounters"};
+        "DisableOpenXR","ExperimentalPhysicalCrouch","ShowFirstPersonBody","DiegeticAmmoCounters","EditVehiclePanels"};
     inline bool Valid(Number id,float value)
     {
         const auto index=unsigned(id);
@@ -46,7 +46,7 @@ namespace VRSettingsModel
     struct Values
     {
         std::array<float,unsigned(Number::Count)> values{};
-        std::array<bool,unsigned(Flag::Count)> enabled{false,true,true,true};
+        std::array<bool,unsigned(Flag::Count)> enabled{false,true,true,true,false};
         Values() {for(unsigned i=0;i<values.size();++i)values[i]=numbers[i].fallback;}
         float Get(Number id) const {return values[unsigned(id)];}
         bool Get(Flag id) const {return enabled[unsigned(id)];}

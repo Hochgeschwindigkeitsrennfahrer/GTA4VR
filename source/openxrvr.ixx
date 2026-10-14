@@ -51,7 +51,7 @@ export namespace OpenXRVR
         float trigger[2]{};
         // Gameplay actions are independent of the finger/pose observations above.
         bool moveActive=false,moveEnabled=false,sprint=false,jump=false,interact=false;
-        float move[2]{},fire=0,steer=0,accelerate=0,brake=0,weaponBrake=0;
+        float move[2]{},fire=0,steer=0,steerForward=0,accelerate=0,brake=0,weaponBrake=0;
         bool fireActive=false,support=false,handbrake=false,exitVehicle=false,driving=false,horn=false;
         bool grab[2]{},grabActive[2]{};
         bool cycle=false,nextWeapon=false,previousWeapon=false;
@@ -64,6 +64,8 @@ export namespace OpenXRVR
         bool contextInteract=false,confirm=false,scriptMenuActive=false;
         bool scriptUp=false,scriptDown=false,scriptLeft=false,scriptRight=false,scriptAccept=false,scriptBack=false;
         uint64_t scriptPresses[6]{},contextPresses=0,confirmPresses=0;
+        bool radioNext=false,radioPrevious=false;
+        uint64_t radioPresses[2]{};
         unsigned long long sampledAt=0;
     };
     struct PanelPointer
@@ -185,7 +187,7 @@ namespace
         Steer,SteerEnable,Accelerate,Brake,Handbrake,Exit,Pause,Select,Back,PhoneOpen,PhoneDirection,PhoneClick,PhoneBack,
         PhoneUp,PhoneDown,PhoneLeft,PhoneRight,PhoneAccept,GrabLeft,GrabRight,
         DriveFire,DriveCycle,DriveDirection,DriveNext,DrivePrevious,DriveArmedBrake,DriveHorn,DrivePhoneOpen,
-        ContextInteract,DriveContextInteract,Confirm,DriveConfirm,Waypoint,ScriptDirection,ScriptClick,ScriptUp,ScriptDown,ScriptLeft,ScriptRight,ScriptAccept,ScriptBack,Count};
+        ContextInteract,DriveContextInteract,Confirm,DriveConfirm,Waypoint,ScriptDirection,ScriptClick,ScriptUp,ScriptDown,ScriptLeft,ScriptRight,ScriptAccept,ScriptBack,DriveRadioNext,DriveRadioPrevious,Count};
     XrAction actions[static_cast<unsigned>(Action::Count)]{};
     std::atomic<bool> drivingInput=false;
     std::atomic<bool> scriptMenuInput=false;
@@ -200,6 +202,7 @@ namespace
     OpenXRVR::ControllerInput controllerInput{}; // Published with eyeLock.
     VRPhoneInput::Edges phoneEdges{}; // Render-thread input edges survive between simulation ticks.
     VRPhoneInput::Edges scriptEdges{},contextEdges{},confirmEdges{};
+    VRPhoneInput::Edges radioEdges{};
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -539,6 +542,8 @@ namespace
             !game(Action::DriveContextInteract,drivingActions,"context_interact","Context interaction",boolean,0,nullptr) ||
             !game(Action::Confirm,gameplayActions,"confirm","Confirm / accept",boolean,1,nullptr) ||
             !game(Action::DriveConfirm,drivingActions,"confirm","Confirm / accept",boolean,1,nullptr) ||
+            !game(Action::DriveRadioNext,drivingActions,"radio_next","Next radio station",boolean,1,nullptr) ||
+            !game(Action::DriveRadioPrevious,drivingActions,"radio_previous","Previous radio station",boolean,1,nullptr) ||
             !game(Action::Waypoint,menuActions,"set_waypoint","Set / remove map waypoint",boolean,1,"/input/trackpad/click") ||
             !game(Action::Pause,systemActions,"pause","Pause / skip cutscene (tap)",boolean,0,"/input/menu/click") ||
             !game(Action::PhoneOpen,systemActions,"open_phone","Open phone (hold)",boolean,0,"/input/menu/click") ||
@@ -630,7 +635,8 @@ namespace
                 sample.jump=getBool(Action::Jump) && (!sample.cycle || std::hypot(direction[0],direction[1])<.35f);
                 const auto steer=getVector(Action::Steer);
                 enableActive=false;const bool steering=getBool(Action::SteerEnable,&enableActive)||!enableActive;
-                sample.steer=steering ? VRMath::TouchpadMovement(steer[0],steer[1])[0]:0;
+                const auto steeringAxes=VRMath::TouchpadMovement(steer[0],steer[1]);
+                sample.steer=steering ? steeringAxes[0]:0;sample.steerForward=steering ? steeringAxes[1]:0;
                 sample.accelerate=getFloat(Action::Accelerate);sample.brake=getFloat(Action::Brake);
                 sample.handbrake=getBool(Action::Handbrake);sample.exitVehicle=getBool(Action::Exit);
                 sample.driving=drivingInput.load();
@@ -649,6 +655,8 @@ namespace
                 sample.pause=getBool(Action::Pause);sample.back=getBool(Action::Back);
                 sample.contextInteract=!menu && !phone && getBool(sample.driving ? Action::DriveContextInteract : Action::ContextInteract);
                 sample.confirm=!menu && !phone && getBool(sample.driving ? Action::DriveConfirm : Action::Confirm);
+                sample.radioNext=sample.driving && !menu && !phone && getBool(Action::DriveRadioNext);
+                sample.radioPrevious=sample.driving && !menu && !phone && getBool(Action::DriveRadioPrevious);
                 sample.scriptMenuActive=scripted && !phone;
                 if(sample.scriptMenuActive)
                 {
@@ -750,6 +758,8 @@ namespace
         sample.contextPresses=contextEdges.presses[0];
         confirmEdges.Sample({sample.confirm,false,false,false,false,false});
         sample.confirmPresses=confirmEdges.presses[0];
+        radioEdges.Sample({sample.radioNext,sample.radioPrevious,false,false,false,false});
+        sample.radioPresses[0]=radioEdges.presses[0];sample.radioPresses[1]=radioEdges.presses[1];
         AcquireSRWLockExclusive(&eyeLock); controllerInput=sample; ReleaseSRWLockExclusive(&eyeLock);
     }
 

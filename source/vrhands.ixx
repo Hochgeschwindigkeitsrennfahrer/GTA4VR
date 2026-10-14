@@ -8,6 +8,7 @@ module;
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 export module vrhands;
 import common;
 import vrdiagnostics;
@@ -17,11 +18,12 @@ import natives;
 import vrhandphysics;
 import vrreload;
 import vrconfig;
+import vrhud;
 
 export namespace VRHands
 {
     void Install();
-    void PublishTrackingTransform(const VRMath::Matrix& trackingToWorld,void* owner,bool active,bool seated=false);
+    void PublishTrackingTransform(const VRMath::Matrix& trackingToWorld,void* owner,bool active,bool seated=false,bool bike=false,bool helicopter=false,bool rail=false);
     bool WheelSteering(float& steering);
     bool DrivingWeaponActive();
     bool ExecutionInteractionActive();
@@ -363,6 +365,9 @@ namespace
     }
     SafetyHookInline updateHook{};
     SafetyHookInline finishPoseHook{};
+    SafetyHookInline elbowPoleHook{};
+    thread_local bool useStableBikeElbow=false;
+    thread_local VRMath::Vector bikeElbowPole{};
     thread_local bool deferFinishPose=false;
     thread_local void* deferredPose=nullptr;
     std::atomic<unsigned> finishPoseUpdates{0};
@@ -388,9 +393,27 @@ namespace
     };
     using ArmSolver=bool (__thiscall*)(void*,int,const void*,const void*);
     ArmSolver solveArm=nullptr;
+    float* __fastcall StableBikeElbow(void* self,void* edx,float* output,const float* oldShoulder,
+        const float* oldElbow,const float* oldWrist,const float* shoulder,void* unknown,
+        const float* target,float upper,float lower)
+    {
+        auto* result=elbowPoleHook.unsafe_fastcall<float*>(self,edx,output,oldShoulder,oldElbow,oldWrist,
+            shoulder,unknown,target,upper,lower);
+        if(useStableBikeElbow && output && shoulder && target)
+        {
+            VRMath::Vector elbow{};
+            if(VRGrip::StableElbow({shoulder[0],shoulder[1],shoulder[2],1},
+                {target[0],target[1],target[2],1},bikeElbowPole,upper,lower,elbow))
+                for(unsigned axis=0;axis<3;++axis)output[axis]=elbow[axis];
+        }
+        return result;
+    }
     VRMath::Matrix trackingToWorld{};
     VRMath::Vector trackingBodyPosition{};
     void* trackingVehicle=nullptr;
+    bool trackingBike=false;
+    bool trackingHelicopter=false;
+    bool trackingRail=false;
     VRMath::Matrix trackingVehicleFrame=VRMath::Identity();
     struct WheelTracking
     {
@@ -405,10 +428,22 @@ namespace
         float radius=.17f;
         bool mesh=false;
         VRMath::Matrix attachment[2]{};
+        int bikeHandleBones[2]{-1,-1},bikeForkBone=-1;
+        float bikeLimit=0;
+        VRMath::Matrix cyclicFrame{};
+        float cyclicLength=.32f;
+        float cyclicPitch=0,cyclicRoll=0;
+        bool bikeResolved=false;
     } wheel;
     std::atomic<float> wheelSteer=0;
     std::atomic<uint64_t> wheelAt=0;
     float wheelGripRadius=.18f,wheelSteeringDegrees=180.f;
+    SafetyHookInline bikeControlHook{};
+    std::atomic<float> bikeRequestedAngle=0;
+    SafetyHookInline helicopterControlHook{};
+    std::atomic<float> cyclicPitch=0,cyclicRoll=0;
+    std::atomic<uint64_t> cyclicAt=0;
+    float cyclicTravelDegrees=20.f,cyclicShaftLength=.32f;
     float wheelRadius=.17f,wheelTiltDegrees=20.f;
     VRMath::Vector wheelCenterOffset{};
     struct WheelMesh
@@ -424,7 +459,17 @@ namespace
     std::vector<WheelMesh> wheelMeshes;
     SRWLOCK wheelMeshLock=SRWLOCK_INIT;
     SafetyHookInline vehicleRenderHook{};
+    SafetyHookInline wheelGeometryDestroyHook{};
+    struct WheelPalette
+    {
+        void* drawable;
+        unsigned short* original;
+        unsigned short count;
+        std::vector<unsigned short> extended;
+    };
+    std::map<void*,WheelPalette> wheelPalettes;
     std::atomic<float> wheelVisualAngle=0;
+    std::atomic<bool> wheelBike=false;
     std::atomic<unsigned> wheelVisualCalls=0;
     std::atomic<bool> wheelReady=false,wheelHeld[2]{};
     std::atomic<float> wheelDistances[2]{-1.f,-1.f},wheelCenter[3]{};
@@ -1254,7 +1299,97 @@ namespace
         return rotation;
     }
 
-    void PrepareWheelMesh(void* vehicle)
+    void __fastcall DestroyWheelGeometry(void* geometry,void*)
+    {
+        AcquireSRWLockExclusive(&wheelMeshLock);
+        if(auto it=wheelPalettes.find(geometry);it!=wheelPalettes.end())
+        {
+            // The native destructor frees +38 through its TLS allocator.
+            // Restore its original allocation before it runs; our vector
+            // remains owned and freed by this module.
+            *reinterpret_cast<unsigned short**>(static_cast<char*>(geometry)+0x38)=it->second.original;
+            *reinterpret_cast<unsigned short*>(static_cast<char*>(geometry)+0x3E)=it->second.count;
+            const auto drawable=it->second.drawable;
+            std::erase_if(wheelMeshes,[&](const auto& mesh){return mesh.drawable==drawable;});
+            if(wheelMesh.drawable==drawable)wheelMesh={};
+            wheelPalettes.erase(it);
+        }
+        ReleaseSRWLockExclusive(&wheelMeshLock);
+        wheelGeometryDestroyHook.unsafe_thiscall(geometry);
+    }
+    bool EnsureWheelPaletteLifetime(void* geometry)
+    {
+        if(wheelGeometryDestroyHook)return true;
+        auto* wrapper=**reinterpret_cast<unsigned char***>(geometry);
+        constexpr unsigned char deletingPrefix[]{0x56,0x8B,0xF1,0xE8};
+        if(std::memcmp(wrapper,deletingPrefix,sizeof(deletingPrefix)))return false;
+        auto* destructor=wrapper+8+*reinterpret_cast<int32_t*>(wrapper+4);
+        constexpr unsigned char destructorPrefix[]{0x53,0x56,0x8B,0xD9,0x57,0xFF,0x73,0x40};
+        if(std::memcmp(destructor,destructorPrefix,sizeof(destructorPrefix)))return false;
+        wheelGeometryDestroyHook=safetyhook::create_inline(destructor,DestroyWheelGeometry);
+        return bool(wheelGeometryDestroyHook);
+    }
+
+    bool CanBorrowWheelBone(char* drawable,unsigned bone)
+    {
+        // A shared palette may list every vehicle bone while using only a few.
+        // Check weights in every scene LOD, not palette membership alone.
+        for(unsigned level=0;level<3;++level)
+        {
+            auto* lod=*reinterpret_cast<char**>(drawable+0x40+level*4);
+            if(!lod)continue;
+            const unsigned models=*reinterpret_cast<unsigned short*>(lod+4);
+            auto** items=*reinterpret_cast<char***>(lod);
+            if(!items || models>128)return false;
+            for(unsigned m=0;m<models;++m)
+            {
+                auto* sub=items[m];if(!sub)continue;
+                const unsigned geos=*reinterpret_cast<unsigned short*>(sub+8);
+                auto** list=*reinterpret_cast<char***>(sub+4);
+                if(!list || geos>128)return false;
+                for(unsigned g=0;g<geos;++g)
+                {
+                    auto* geo=list[g];if(!geo)continue;
+                    auto* palette=*reinterpret_cast<unsigned short**>(geo+0x38);
+                    const unsigned size=*reinterpret_cast<unsigned short*>(geo+0x3E);
+                    if(!size)continue;
+                    if(!palette || size>64)return false;
+                    if(std::find(palette,palette+size,bone)==palette+size)continue;
+                    auto* vb=*reinterpret_cast<char**>(geo+0xC);
+                    if(!vb)return false;
+                    const unsigned count=*reinterpret_cast<unsigned short*>(vb+4);
+                    const unsigned stride=*reinterpret_cast<unsigned short*>(vb+0xC);
+                    auto* data=*reinterpret_cast<unsigned char**>(vb+8);
+                    if(!data)data=*reinterpret_cast<unsigned char**>(vb+0x20);
+                    if(stride!=44 && stride!=52 && stride!=60 && stride!=68)return false;
+                    if(!count)continue;
+                    // Unuploaded LODs use the native backing store at +20.
+                    // If neither CPU pointer exists, read the GPU buffer once;
+                    // never infer bone usage from palette membership.
+                    void* mapped=nullptr;
+                    auto* buffer=*reinterpret_cast<IDirect3DVertexBuffer9**>(vb+0x1C);
+                    if(!data)
+                    {
+                        D3DVERTEXBUFFER_DESC desc{};
+                        if(!buffer || FAILED(buffer->GetDesc(&desc)) || desc.Type!=D3DRTYPE_VERTEXBUFFER || desc.Size<count*stride ||
+                            FAILED(buffer->Lock(0,count*stride,&mapped,D3DLOCK_READONLY)))return false;
+                        data=static_cast<unsigned char*>(mapped);
+                    }
+                    bool used=false;
+                    for(unsigned v=0;v<count;++v)for(unsigned a=0;a<4;++a)
+                    {
+                        const auto* vertex=data+v*stride;
+                        if(vertex[12+a] && (vertex[16+a]>=size || palette[vertex[16+a]]==bone))used=true;
+                    }
+                    if(mapped)buffer->Unlock();
+                    if(used)return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void PrepareWheelMesh(void* vehicle,bool helicopter=false)
     {
         const auto index=*reinterpret_cast<short*>(static_cast<char*>(vehicle)+0x2E);
         if(index<0) return;
@@ -1284,16 +1419,33 @@ namespace
             {wheelMesh.seat=b;wheelMesh.seatRest=VRMath::AffineXYZ(locals[b]);break;}
         }
         if(wheelMesh.seat<0) return;
-        // Developer-only experiment: palette capacity/ownership still needs
-        // lifecycle verification. Observed CDCD padding is not an allocation
-        // capacity guarantee; ordinary runs do not install this hook.
+        if(!CanBorrowWheelBone(drawable,unsigned(wheelMesh.seat)))return;
+        // Some vehicles skin rigid interior parts to a separate bodyshell
+        // bone. Accept that root-equivalent bind frame, not arbitrary joints.
+        std::vector<bool> rigidBodyBones(count);if(count)rigidBodyBones[0]=true;
+        for(unsigned b=1;b<count;++b)
+        {
+            const auto* name=*reinterpret_cast<const char**>(bones+b*0xE0);
+            if(!name || std::strcmp(name,"bodyshell"))continue;
+            const auto rest=VRMath::AffineXYZ(locals[b]);const auto identity=VRMath::Identity();
+            bool same=true;for(unsigned r=0;r<4;++r)for(unsigned c=0;c<3;++c)
+                same &= std::isfinite(rest[r][c]) && std::abs(rest[r][c]-identity[r][c])<1.e-5f;
+            rigidBodyBones[b]=same;
+        }
+
+        // Keep geometry-owned native allocations intact. A replacement palette
+        // has its own storage and is restored before native geometry cleanup.
         auto* lod=*reinterpret_cast<char**>(drawable+0x40);
         if(!lod) return;
         const unsigned modelCount=*reinterpret_cast<unsigned short*>(lod+4);
         auto** items=*reinterpret_cast<char***>(lod);
         if(!items || modelCount>128) return;
-        struct Candidate {char* geometry;char* vb;VRWheel::Fit fit;};
-        Candidate best{};
+        struct Candidate {char* geometry;char* vb;unsigned base;unsigned vertices;};
+        std::vector<Candidate> candidates;
+        std::vector<VRMath::Vector> assemblyPoints;
+        std::vector<unsigned> assemblyIndices;
+        VRWheel::Selection seed;
+        unsigned seedBase=0;
         for(unsigned item=0;item<modelCount;++item)
         {
             auto* sub=items[item];if(!sub) continue;
@@ -1306,13 +1458,14 @@ namespace
                 auto* palette=*reinterpret_cast<unsigned short**>(geo+0x38);
                 const unsigned size=*reinterpret_cast<unsigned short*>(geo+0x3E);
                 if(!palette || size>64) return;
-                for(unsigned b=0;b<size;++b) if(palette[b]==wheelMesh.seat) return;
                 auto* vb=*reinterpret_cast<char**>(geo+0xC);
-                if(!vb || size==0 || size>=8 || palette[size]!=0xCDCD) continue;
+                if(!vb || size==0 || size>=64) continue;
+                if(std::any_of(candidates.begin(),candidates.end(),[&](const auto& entry){return entry.vb==vb;}))continue;
                 const unsigned vertices=*reinterpret_cast<unsigned short*>(vb+4);
                 const unsigned stride=*reinterpret_cast<unsigned short*>(vb+0xC);
                 auto* data=*reinterpret_cast<char**>(vb+8);
-                if(!data || vertices<40 || (stride!=44 && stride!=52 && stride!=60 && stride!=68)) continue;
+                if(!data)data=*reinterpret_cast<char**>(vb+0x20);
+                if(!data || vertices<3 || (stride!=44 && stride!=52 && stride!=60 && stride!=68)) continue;
                 std::vector<VRMath::Vector> points;points.reserve(vertices);
                 for(unsigned v=0;v<vertices;++v)
                 {
@@ -1320,61 +1473,95 @@ namespace
                     if(!std::isfinite(p[0]+p[1]+p[2])) {points.clear();break;}
                     points.push_back(p);
                 }
-                const auto fit=VRWheel::FindRim(points,wheelMesh.seatRest[3]);
-                if(fit.support>best.fit.support) best={geo,vb,fit};
+                if(points.size()!=vertices)continue;
+                auto* ib=*reinterpret_cast<char**>(geo+0x1C);
+                const unsigned indexCount=ib ? *reinterpret_cast<unsigned*>(ib+4):0;
+                auto* indexData=ib ? *reinterpret_cast<unsigned short**>(ib+0x10):nullptr;
+                if(!indexData || !indexCount || indexCount%3 || indexCount>vertices*12u) continue;
+                const std::vector<unsigned short> indices(indexData,indexData+indexCount);
+                if(std::any_of(indices.begin(),indices.end(),[&](unsigned i){return i>=vertices;}))continue;
+                auto selection=helicopter ? VRWheel::Selection{}:VRWheel::SelectMesh(points,indices,wheelMesh.seatRest[3]);
+                const unsigned base=unsigned(assemblyPoints.size());
+                if(selection.fit.support>seed.fit.support) {seed=std::move(selection);seedBase=base;}
+                for(auto i:indices)assemblyIndices.push_back(base+i);
+                assemblyPoints.insert(assemblyPoints.end(),points.begin(),points.end());
+                candidates.push_back({geo,vb,base,vertices});
             }
         }
-        if(!best.geometry) return;
-        auto* palette=*reinterpret_cast<unsigned short**>(best.geometry+0x38);
-        const unsigned size=*reinterpret_cast<unsigned short*>(best.geometry+0x3E);
-        const unsigned vertices=*reinterpret_cast<unsigned short*>(best.vb+4);
-        const unsigned stride=*reinterpret_cast<unsigned short*>(best.vb+0xC);
-        auto* source=*reinterpret_cast<unsigned char**>(best.vb+8);
-        // CE grcVertexBufferD3D: +1C is the D3D9 interface; +20 is raw
-        // mapped/backing vertex data. Verified on live model164 using DXVK's
-        // vtable GetType (returns VERTEXBUFFER) and GetDesc implementation.
-        auto* buffer=*reinterpret_cast<IDirect3DVertexBuffer9**>(best.vb+0x1C);
-        if(!buffer) return;
-        D3DVERTEXBUFFER_DESC desc{};
-        if(FAILED(buffer->GetDesc(&desc)) || desc.Type!=D3DRTYPE_VERTEXBUFFER || desc.Size<vertices*stride) return;
-        std::vector<unsigned char> data(source,source+vertices*stride);
-        unsigned selected=0;
-        for(unsigned v=0;v<vertices;++v)
+        if(!helicopter && !seed.fit.support) return;
+        std::vector<unsigned char> seedVertices(assemblyPoints.size());
+        std::copy(seed.vertices.begin(),seed.vertices.end(),seedVertices.begin()+seedBase);
+        seed.vertices=std::move(seedVertices);
+        auto selection=helicopter ? VRWheel::Selection{}:VRWheel::SelectMesh(assemblyPoints,assemblyIndices,wheelMesh.seatRest[3],&seed);
+        if(helicopter){selection.vertices=VRWheel::SelectCyclic(assemblyPoints,assemblyIndices,wheelMesh.seatRest[3],&selection.fit);selection.fit.support=unsigned(std::count(selection.vertices.begin(),selection.vertices.end(),1));}
+        if(selection.vertices.size()!=assemblyPoints.size() || !selection.fit.support)return;
+        struct Upload
         {
-            auto* bytes=data.data()+v*stride;
-            VRMath::Vector p{0,0,0,1};std::memcpy(p.data(),bytes,12);
-            if(!VRWheel::OnWheel(p,best.fit)) continue;
-            // The selected vertices must be rigidly bound to chassis. Preserve
-            // unsupported skinning rather than accidentally deforming a car.
-            if(bytes[12]!=0 || bytes[13]!=0 || bytes[14]!=255 || bytes[15]!=0 ||
-                bytes[18]>=size || palette[bytes[18]]!=0) return;
-            // Native skinning supplies inverse bind matrices. These vertices
-            // remain in their original model-space bind pose.
-            bytes[18]=static_cast<unsigned char>(size);
-            ++selected;
+            char* geometry;unsigned short* palette;unsigned size;unsigned char* source;
+            IDirect3DVertexBuffer9* buffer;std::vector<unsigned char> data;
+            std::vector<unsigned short> extended;void* mapped=nullptr;
+        };
+        std::vector<Upload> uploads;
+        unsigned selected=0;
+        for(const auto& candidate:candidates)
+        {
+            auto* palette=*reinterpret_cast<unsigned short**>(candidate.geometry+0x38);
+            const unsigned size=*reinterpret_cast<unsigned short*>(candidate.geometry+0x3E);
+            const unsigned stride=*reinterpret_cast<unsigned short*>(candidate.vb+0xC);
+            auto* source=*reinterpret_cast<unsigned char**>(candidate.vb+8);
+            if(!source)source=*reinterpret_cast<unsigned char**>(candidate.vb+0x20);
+            std::vector<unsigned char> data(source,source+candidate.vertices*stride);
+            unsigned selectedHere=0;
+            for(unsigned v=0;v<candidate.vertices;++v)
+            {
+                if(!selection.vertices[candidate.base+v])continue;
+                auto* bytes=data.data()+v*stride;
+                // Keep native model-space bind positions, and change only
+                // verified rigid chassis weights. All material parts share
+                // the same fitted wheel transform through the spare seat bone.
+                if(bytes[12]!=0 || bytes[13]!=0 || bytes[14]!=255 || bytes[15]!=0 ||
+                    bytes[18]>=size || palette[bytes[18]]>=count || !rigidBodyBones[palette[bytes[18]]]) return;
+                bytes[18]=static_cast<unsigned char>(size);++selectedHere;
+            }
+            if(!selectedHere)continue;
+            if(!EnsureWheelPaletteLifetime(candidate.geometry) || wheelPalettes.contains(candidate.geometry))return;
+            auto* buffer=*reinterpret_cast<IDirect3DVertexBuffer9**>(candidate.vb+0x1C);
+            D3DVERTEXBUFFER_DESC desc{};
+            if(!buffer || FAILED(buffer->GetDesc(&desc)) || desc.Type!=D3DRTYPE_VERTEXBUFFER || desc.Size<data.size())return;
+            std::vector<unsigned short> extended(palette,palette+size);
+            extended.push_back(static_cast<unsigned short>(wheelMesh.seat));
+            uploads.push_back({candidate.geometry,palette,size,source,buffer,std::move(data),std::move(extended)});
+            selected+=selectedHere;
         }
-        if(selected<40) return;
-        void* mapped=nullptr;
-        if(FAILED(buffer->Lock(0,vertices*stride,&mapped,0))) return;
-        std::memcpy(mapped,data.data(),data.size());
-        const auto result=buffer->Unlock();
-        if(FAILED(result)) return;
-        // Keep the native CPU backing copy coherent for later native uploads.
-        std::memcpy(source,data.data(),data.size());
-        palette[size]=static_cast<unsigned short>(wheelMesh.seat);
-        *reinterpret_cast<unsigned short*>(best.geometry+0x3E)=static_cast<unsigned short>(size+1);
-        wheelMesh.fit=best.fit;wheelMesh.vertices=selected;
+        if(selected<40)return;
+        // Validate and acquire every affected buffer before modifying any of
+        // them, so a failed lock leaves the complete assembly untouched.
+        for(auto& upload:uploads)
+            if(FAILED(upload.buffer->Lock(0,UINT(upload.data.size()),&upload.mapped,0)))
+            {for(auto& locked:uploads)if(locked.mapped)locked.buffer->Unlock();return;}
+        for(auto& upload:uploads)
+        {
+            std::memcpy(upload.mapped,upload.data.data(),upload.data.size());
+            std::memcpy(upload.source,upload.data.data(),upload.data.size());
+            auto [it,inserted]=wheelPalettes.emplace(upload.geometry,WheelPalette{
+                drawable,upload.palette,static_cast<unsigned short>(upload.size),std::move(upload.extended)});
+            *reinterpret_cast<unsigned short**>(upload.geometry+0x38)=it->second.extended.data();
+            *reinterpret_cast<unsigned short*>(upload.geometry+0x3E)=static_cast<unsigned short>(upload.size+1);
+            upload.buffer->Unlock();
+        }
+        wheelMesh.fit=selection.fit;wheelMesh.vertices=selected;
     }
 
     uint32_t __fastcall RenderVehicleWheel(void* self,void* edx,uint32_t shader,uint32_t flags,uint32_t alpha,uint32_t unknown)
     {
         AcquireSRWLockShared(&targetLock);
-        const bool selected=trackingVehicle==self && targetAt && GetTickCount64()-targetAt<250;
+        const bool helicopter=trackingHelicopter;
+        const bool selected=trackingVehicle==self && !trackingRail && targetAt && GetTickCount64()-targetAt<250;
         ReleaseSRWLockShared(&targetLock);
         if(!selected || !OpenXRVR::HasFocusedViews())
             return vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
         AcquireSRWLockExclusive(&wheelMeshLock);
-        PrepareWheelMesh(self);
+        PrepareWheelMesh(self,helicopter);
         const auto mesh=wheelMesh;
         ReleaseSRWLockExclusive(&wheelMeshLock);
         auto* instance=*reinterpret_cast<char**>(static_cast<char*>(self)+0x38);
@@ -1389,11 +1576,219 @@ namespace
         const float half=wheelVisualAngle.load()*.5f,p[3]{},q[4]{0,0,std::sin(half),std::cos(half)};
         auto rotation=VRMath::Multiply(VRMath::InverseRigid(mesh.fit.frame),VRMath::Pose(p,q));
         rotation=VRMath::Multiply(rotation,mesh.fit.frame);
+        if(helicopter)
+        {
+            // Rotate the isolated stick about the very same model-space pivot
+            // used for the tracked hand, including touchpad flight fallback.
+            AcquireSRWLockShared(&targetLock);
+            const auto pivot=wheel.cyclicFrame;const bool ready=wheel.vehicle==self && wheel.ready;
+            ReleaseSRWLockShared(&targetLock);
+            if(!ready)return vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
+            const auto at=cyclicAt.load();const bool held=at && GetTickCount64()-at<100;
+            const float travel=cyclicTravelDegrees*.017453293f;
+            const float pitch=held ? -cyclicPitch.load()*travel:-*reinterpret_cast<float*>(static_cast<char*>(self)+0x1EB8)*travel;
+            const float roll=held ? -cyclicRoll.load()*travel:-*reinterpret_cast<float*>(static_cast<char*>(self)+0x1EBC)*travel;
+            auto tilt=VRGrip::CyclicHandle(pitch,roll,cyclicShaftLength);tilt[3]={0,0,0,1};
+            rotation=VRMath::Multiply(VRMath::Multiply(VRMath::InverseRigid(pivot),tilt),pivot);
+        }
         matrices[mesh.seat]=VRMath::Multiply(VRMath::Multiply(mesh.seatRest,rotation),VRMath::AffineXYZ(*root));
         const auto result=vehicleRenderHook.unsafe_fastcall<uint32_t>(self,edx,shader,flags,alpha,unknown);
         matrices[mesh.seat]=original;
         VRDiagnostics::Increment(wheelVisualCalls);
         return result;
+    }
+
+    void ResolveBikeHandles(void* vehicle)
+    {
+        if(wheel.bikeResolved)return;
+        wheel.bikeResolved=true;
+        const int index=*reinterpret_cast<short*>(static_cast<char*>(vehicle)+0x2E);
+        if(index<0)return;
+        auto** models=reinterpret_cast<char**>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0xE95CD8);
+        auto* model=models[index];auto* fragment=model ? *reinterpret_cast<char**>(model+8):nullptr;
+        auto* drawable=fragment ? *reinterpret_cast<char**>(fragment+0xB4):nullptr;
+        auto* definition=drawable ? *reinterpret_cast<char**>(drawable+0xC):nullptr;
+        if(!definition)return;
+        const unsigned count=*reinterpret_cast<unsigned short*>(definition+0x14);
+        auto* bones=*reinterpret_cast<char**>(definition);
+        if(!bones || !count || count>512)return;
+        std::vector<VRMath::Matrix> rest(count);std::vector<bool> valid(count);
+        int handles[2]{-1,-1},fork=-1;
+        // Child-local bind transforms must be composed through their parents;
+        // handlebar positions are not offsets from the vehicle root.
+        for(unsigned pass=0;pass<count;++pass)
+            for(unsigned b=0;b<count;++b)
+            {
+                if(valid[b])continue;
+                auto* descriptor=bones+b*0xE0;
+                auto* parent=*reinterpret_cast<char**>(descriptor+0x10);
+                unsigned parentIndex=0;
+                if(parent)
+                {
+                    const auto distance=reinterpret_cast<uintptr_t>(parent)-reinterpret_cast<uintptr_t>(bones);
+                    if(distance%0xE0 || distance/0xE0>=count)continue;
+                    parentIndex=unsigned(distance/0xE0);if(!valid[parentIndex])continue;
+                }
+                float p[3],q[4];std::memcpy(p,descriptor+0x20,sizeof(p));std::memcpy(q,descriptor+0x40,sizeof(q));
+                bool finite=true;for(float v:p)finite &= std::isfinite(v);for(float v:q)finite &= std::isfinite(v);
+                if(!finite)continue;
+                rest[b]=VRMath::Pose(p,q);
+                if(parent)rest[b]=VRMath::Multiply(rest[b],rest[parentIndex]);
+                valid[b]=true;
+                const auto* name=*reinterpret_cast<const char**>(descriptor);if(!name)continue;
+                if(!std::strcmp(name,"hbgrip_l"))handles[0]=b;
+                if(!std::strcmp(name,"hbgrip_r"))handles[1]=b;
+                if(!std::strcmp(name,"forks_u"))fork=b;
+            }
+        if(fork<0 || handles[0]<0 || handles[1]<0)return;
+        auto* handling=*reinterpret_cast<char**>(static_cast<char*>(vehicle)+0xDC8);
+        if(!handling)return;
+        wheel.bikeLimit=std::abs(*reinterpret_cast<float*>(handling+0x84));
+        if(!std::isfinite(wheel.bikeLimit) || wheel.bikeLimit<=0)return;
+        wheel.bikeForkBone=fork;
+        wheel.meshFrame=rest[fork];
+        for(unsigned hand=0;hand<2;++hand)
+        {
+            wheel.bikeHandleBones[hand]=handles[hand];
+        }
+        wheel.center=wheel.meshFrame[3];wheel.ready=true;
+    }
+
+    void SolveBikeHandles(VRMath::Matrix (&targets)[2],const VRMath::Vector (&palms)[2],bool palmsValid,
+        const VRMath::Matrix& vehicleFrame,const OpenXRVR::ControllerInput& input,const bool (&busy)[2])
+    {
+        ResolveBikeHandles(wheel.vehicle);
+        wheelReady=wheel.ready;
+        if(!wheel.ready || !bikeControlHook)return;
+        auto* skeleton=PlayerSkeleton(wheel.vehicle);
+        auto* matrices=skeleton ? *reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(skeleton)+0x14):nullptr;
+        const unsigned count=skeleton ? *reinterpret_cast<unsigned short*>(static_cast<char*>(skeleton)+0x10):0;
+        if(!matrices || wheel.bikeForkBone<0 || unsigned(wheel.bikeForkBone)>=count)return;
+        VRMath::Matrix handles[2];
+        for(unsigned hand=0;hand<2;++hand)
+        {
+            if(wheel.bikeHandleBones[hand]<0 || unsigned(wheel.bikeHandleBones[hand])>=count)return;
+            handles[hand]=VRMath::AffineXYZ(matrices[wheel.bikeHandleBones[hand]]);
+        }
+        const float limit=wheel.bikeLimit;
+        const auto hinge=VRMath::Multiply(wheel.meshFrame,vehicleFrame);
+        const auto inverse=VRMath::InverseRigid(hinge);
+        float angles[2]{};unsigned held=0;
+        if(!wheel.held[0] && !wheel.held[1])
+        {
+            const auto fork=VRMath::Multiply(VRMath::AffineXYZ(matrices[wheel.bikeForkBone]),inverse);
+            wheel.angle=std::clamp(std::atan2(fork[0][1],fork[0][0]),-limit,limit);
+        }
+        for(unsigned hand=0;hand<2;++hand)
+        {
+            const auto palm=VRMath::Transform(wheel.held[hand] ? wheel.palmOffset[hand]:palms[hand],targets[hand]);
+            const auto point=VRMath::Transform(palm,inverse);
+            angles[hand]=std::atan2(point[1],point[0]);
+            const float distance=VRMath::Length3(VRMath::Difference3(handles[hand][3],palm));
+            if(VRDiagnostics::counters)wheelDistances[hand]=distance;
+            if(!palmsValid || !input.gripPoseValid[hand] || !input.gripped[hand] || busy[hand])wheel.held[hand]=false;
+            else if(!wheel.held[hand] && distance<wheelGripRadius)
+            {
+                wheel.held[hand]=true;wheel.reference[hand]=angles[hand];wheel.acquiredAngle[hand]=wheel.angle;
+                wheel.palmOffset[hand]=palms[hand];
+                wheel.attachment[hand]=VRGrip::PalmAttachment(targets[hand],palms[hand],handles[hand]);
+            }
+            wheelHeld[hand]=wheel.held[hand];if(wheel.held[hand])++held;
+        }
+        if(!held)return;
+        wheel.angle=VRGrip::WheelAngle(angles,wheel.reference,wheel.acquiredAngle,wheel.held,wheel.angle,limit);
+        wheelSteer=-wheel.angle/limit;wheelVisualAngle=wheel.angle;wheelAt=GetTickCount64();
+        bikeRequestedAngle=wheel.angle;
+        for(unsigned hand=0;hand<2;++hand)if(wheel.held[hand])
+            targets[hand]=VRMath::Multiply(wheel.attachment[hand],handles[hand]);
+    }
+
+    void __fastcall ControlBike(void* self,void* edx,void* rider)
+    {
+        // Retain native throttle, brake and lean. Override only the steering
+        // result, after CE CECBE0's smoothing/signed-square pad response.
+        bikeControlHook.unsafe_fastcall(self,edx,rider);
+        const auto at=wheelAt.load();
+        if(!at || GetTickCount64()-at>100 || !wheelBike || !OpenXRVR::HasFocusedViews())return;
+        AcquireSRWLockShared(&targetLock);
+        const bool owned=trackingBike && trackingVehicle==self && targetOwner==rider && targetAt && GetTickCount64()-targetAt<100;
+        ReleaseSRWLockShared(&targetLock);
+        if(!owned)return;
+        auto* vehicle=static_cast<char*>(self);
+        auto* handling=*reinterpret_cast<char**>(vehicle+0xDC8);if(!handling)return;
+        const float limit=std::abs(*reinterpret_cast<float*>(handling+0x84));
+        const float angle=bikeRequestedAngle.load();
+        if(!std::isfinite(limit) || limit<=0 || !std::isfinite(angle))return;
+        const float requested=std::clamp(angle,-limit,limit);
+        *reinterpret_cast<float*>(vehicle+0x1080)=requested/limit;
+        *reinterpret_cast<float*>(vehicle+0x1088)=requested;
+    }
+
+    void SolveHelicopterCyclic(VRMath::Matrix (&targets)[2],const VRMath::Vector (&palms)[2],
+        const VRMath::Vector (&nativePalms)[2],bool palmsValid,const VRMath::Matrix& vehicleFrame,
+        const OpenXRVR::ControllerInput& input,const bool (&busy)[2])
+    {
+        constexpr unsigned hand=1;
+        const auto inverseVehicle=VRMath::InverseRigid(vehicleFrame);
+        if(!wheel.ready && palmsValid && !input.phoneActive && GetTickCount64()-wheel.enteredAt>=500)
+        {
+            // These models have no cyclic bone. Read the native pilot's seated
+            // palm before tracked IK instead of guessing a cockpit position.
+            wheel.cyclicFrame=VRMath::Identity();
+            wheel.cyclicFrame[3]=VRMath::Transform(nativePalms[hand],inverseVehicle);
+            wheel.cyclicFrame[3][2]-=cyclicShaftLength;wheel.cyclicLength=cyclicShaftLength;
+            AcquireSRWLockShared(&wheelMeshLock);
+            if(wheelMesh.vertices && wheelMesh.model==*reinterpret_cast<short*>(static_cast<char*>(wheel.vehicle)+0x2E))
+            {wheel.cyclicFrame=wheelMesh.fit.frame;wheel.cyclicLength=wheelMesh.fit.radius;}
+            ReleaseSRWLockShared(&wheelMeshLock);
+            wheel.ready=true;
+        }
+        wheelReady=wheel.ready;
+        if(!wheel.ready || !helicopterControlHook)return;
+        const auto pivot=VRMath::Multiply(wheel.cyclicFrame,vehicleFrame);
+        const auto inverse=VRMath::InverseRigid(pivot);
+        const float travel=cyclicTravelDegrees*.017453293f;
+        auto handle=VRMath::Multiply(VRGrip::CyclicHandle(wheel.cyclicPitch,wheel.cyclicRoll,wheel.cyclicLength),pivot);
+        const auto palm=VRMath::Transform(wheel.held[hand] ? wheel.palmOffset[hand]:palms[hand],targets[hand]);
+        const auto point=VRMath::Transform(palm,inverse);
+        const auto angles=VRGrip::CyclicAngles(point);
+        const float distance=VRMath::Length3(VRMath::Difference3(palm,handle[3]));
+        if(VRDiagnostics::counters)wheelDistances[hand]=distance;
+        if(!palmsValid || !input.gripPoseValid[hand] || !input.gripped[hand] || busy[hand])wheel.held[hand]=false;
+        else if(!wheel.held[hand] && distance<wheelGripRadius)
+        {
+            wheel.held[hand]=true;wheel.reference[0]=angles[0];wheel.reference[1]=angles[1];
+            wheel.acquiredAngle[0]=wheel.cyclicPitch;wheel.acquiredAngle[1]=wheel.cyclicRoll;
+            wheel.palmOffset[hand]=palms[hand];
+            wheel.attachment[hand]=VRGrip::PalmAttachment(targets[hand],palms[hand],handle);
+        }
+        wheelHeld[hand]=wheel.held[hand];
+        if(!wheel.held[hand]){wheel.cyclicPitch=wheel.cyclicRoll=0;return;}
+        wheel.cyclicPitch=std::clamp(wheel.acquiredAngle[0]+std::remainder(angles[0]-wheel.reference[0],6.283185307f),-travel,travel);
+        wheel.cyclicRoll=std::clamp(wheel.acquiredAngle[1]+std::remainder(angles[1]-wheel.reference[1],6.283185307f),-travel,travel);
+        handle=VRMath::Multiply(VRGrip::CyclicHandle(wheel.cyclicPitch,wheel.cyclicRoll,wheel.cyclicLength),pivot);
+        targets[hand]=VRMath::Multiply(wheel.attachment[hand],handle);
+        cyclicPitch=-wheel.cyclicPitch/travel;cyclicRoll=-wheel.cyclicRoll/travel;cyclicAt=GetTickCount64();
+    }
+
+    void __fastcall ControlHelicopter(void* self,void* edx,void* rider)
+    {
+        helicopterControlHook.unsafe_fastcall(self,edx,rider);
+        if(!OpenXRVR::HasFocusedViews())return;
+        AcquireSRWLockShared(&targetLock);
+        const bool owned=trackingHelicopter && trackingVehicle==self && targetOwner &&
+            *reinterpret_cast<void**>(static_cast<char*>(self)+0xF50)==targetOwner && targetAt && GetTickCount64()-targetAt<100;
+        ReleaseSRWLockShared(&targetLock);
+        OpenXRVR::ControllerInput input{};
+        if(!owned || !OpenXRVR::GetControllerInput(input) || !input.driving)return;
+        const bool usable=!input.phoneActive && !input.scriptMenuActive;
+        const auto at=cyclicAt.load();const bool grabbed=usable && at && GetTickCount64()-at<100;
+        auto* heli=static_cast<char*>(self);
+        // Native lift/hover remains in B6AA00. Replace its cyclic/rudder
+        // outputs, not helicopter forces or angular velocity.
+        *reinterpret_cast<float*>(heli+0x1EB8)=usable ? (grabbed ? cyclicPitch.load():-input.steerForward):0;
+        *reinterpret_cast<float*>(heli+0x1EBC)=usable ? (grabbed ? cyclicRoll.load():-input.steer):0;
+        *reinterpret_cast<float*>(heli+0x1EB4)=grabbed ? input.steer:0;
     }
 
     void __fastcall UpdateIK(void* manager,void*)
@@ -1425,10 +1820,11 @@ namespace
         updateHook.thiscall<void>(manager);
         if(!enabled || !solveArm || !OpenXRVR::HasFocusedViews()) {supportGripping=false; return;}
         VRMath::Matrix transform{},correction[2]{},vehicleFrame{};
-        void* owner=nullptr; void* vehicle=nullptr; uint64_t at=0;
+        void* owner=nullptr; void* vehicle=nullptr; uint64_t at=0;bool bike=false,helicopter=false,rail=false;
         AcquireSRWLockShared(&targetLock);
         transform=trackingToWorld; owner=targetOwner; at=targetAt;
-        vehicle=trackingVehicle; vehicleFrame=trackingVehicleFrame;
+        vehicle=trackingVehicle; vehicleFrame=trackingVehicleFrame;bike=trackingBike;
+        helicopter=trackingHelicopter;rail=trackingRail;
         correction[0]=wristCorrection[0]; correction[1]=wristCorrection[1];
         ReleaseSRWLockShared(&targetLock);
         if(!owner || !at || GetTickCount64()-at>100 ||
@@ -1529,10 +1925,14 @@ namespace
             target=VRMath::Multiply(correction[hand],target);
             targets[hand]=target;
         }
+        bool panelBusy[2]{input.phoneActive || leftWeapon,input.phoneActive};
+        if(vehicle)VRHud::InteractVehiclePanels(targets,vehicleFrame,input,panelBusy);
         wheelAt=0;
+        cyclicAt=0;
+        wheelBike=bike;
         wheelReady=false;
         for(unsigned hand=0;hand<2;++hand) {wheelHeld[hand]=false;{if(VRDiagnostics::counters) wheelDistances[hand]=-1.f;}}
-        if(vehicle)
+        if(vehicle && !rail)
         {
             const auto inverse=VRMath::InverseRigid(vehicleFrame);
             if(wheel.vehicle!=vehicle)
@@ -1542,7 +1942,7 @@ namespace
             AcquireSRWLockShared(&wheelMeshLock);
             const auto mesh=wheelMesh;
             ReleaseSRWLockShared(&wheelMeshLock);
-            if(mesh.vertices && mesh.model==*reinterpret_cast<short*>(static_cast<char*>(vehicle)+0x2E) && !wheel.mesh)
+            if(!bike && !helicopter && mesh.vertices && mesh.model==*reinterpret_cast<short*>(static_cast<char*>(vehicle)+0x2E) && !wheel.mesh)
             {
                 wheel.mesh=true;wheel.ready=true;wheel.meshFrame=mesh.fit.frame;
                 wheel.center=mesh.fit.frame[3];wheel.radius=mesh.fit.radius;
@@ -1572,6 +1972,10 @@ namespace
                 nativePalm[hand][3]=1;
                 palmOffset[hand]=VRMath::Transform(nativePalm[hand],VRMath::InverseRigid(VRMath::AffineXYZ(matrices[wrist])));
             }
+            if(helicopter)SolveHelicopterCyclic(targets,palmOffset,nativePalm,palmsValid,vehicleFrame,input,panelBusy);
+            else if(bike)SolveBikeHandles(targets,palmOffset,palmsValid,vehicleFrame,input,panelBusy);
+            else
+            {
             // The first car-camera frame can still contain the entry pose.
             // Capture native seated contacts after entry has settled, before
             // replacing them with tracked IK. Phone poses are not wheel poses.
@@ -1610,7 +2014,7 @@ namespace
                 angles[hand]=angle;
                 const float distance=std::hypot(radius-wheel.radius,point[2]);
                 {if(VRDiagnostics::counters) wheelDistances[hand]=input.gripPoseValid[hand] && wheel.ready ? distance:-1.f;}
-                if(!wheel.ready || !palmsValid || !input.gripPoseValid[hand] || !input.gripped[hand] || input.phoneActive || (leftWeapon && hand==0))
+                if(!wheel.ready || !palmsValid || !input.gripPoseValid[hand] || !input.gripped[hand] || panelBusy[hand] || input.phoneActive || (leftWeapon && hand==0))
                     wheel.held[hand]=false;
                 else if(!wheel.held[hand] && radius>1.e-5f && distance<wheelGripRadius)
                 {
@@ -1646,6 +2050,7 @@ namespace
                     }
             }
             else wheel.angle=0;
+            }
         }
         else wheel={};
         bool supporting=false;
@@ -1753,8 +2158,15 @@ namespace
             for(const auto& row:target) for(float value:row) finite &= std::isfinite(value);
             if(finite)
             {
+                const bool previousStable=useStableBikeElbow;
+                const auto previousPole=bikeElbowPole;
+                useStableBikeElbow=(bike || helicopter) && elbowPoleHook;
+                if(useStableBikeElbow)
+                    for(unsigned axis=0;axis<3;++axis)
+                        bikeElbowPole[axis]=(hand==0 ? -.7f:.7f)*(*root)[0][axis]-.6f*(*root)[1][axis]-.15f*(*root)[2][axis];
                 if(solveArm(manager,hand==0 ? 1 : 0,offset.data(),target.data()))
                     VRDiagnostics::Increment(solves[hand]);
+                useStableBikeElbow=previousStable;bikeElbowPole=previousPole;
                 // Tracking owns the physics target even if native IK cannot
                 // reach it. A failed solve must not destroy its collider.
                 physicsRig.wrist[hand]=wrist;
@@ -1906,13 +2318,16 @@ namespace
     }
 }
 
-void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* owner,bool active,bool seated)
+void VRHands::PublishTrackingTransform(const VRMath::Matrix& transform,void* owner,bool active,bool seated,bool bike,bool helicopter,bool rail)
 {
     if(!enabled) return;
     if(!active || !seated) drivingWeaponActive=false;
     AcquireSRWLockExclusive(&targetLock);
     trackingToWorld=transform; targetOwner=active ? owner : nullptr;
     trackingVehicle=active && seated && owner ? *reinterpret_cast<void**>(static_cast<char*>(owner)+0xB30):nullptr;
+    trackingBike=trackingVehicle && bike;
+    trackingHelicopter=trackingVehicle && helicopter;
+    trackingRail=trackingVehicle && rail;
     if(trackingVehicle)
         if(auto* root=*reinterpret_cast<VRMath::Matrix**>(static_cast<char*>(trackingVehicle)+0x20))
             trackingVehicleFrame=VRMath::AffineXYZ(*root);
@@ -1934,7 +2349,7 @@ bool VRHands::WheelSteering(float& steering)
 {
     const auto at=wheelAt.load();
     if(!at || GetTickCount64()-at>100 || !OpenXRVR::HasFocusedViews())
-    {wheelVisualAngle=-steering*wheelSteeringDegrees*.017453293f;return false;}
+    {if(!wheelBike)wheelVisualAngle=-steering*wheelSteeringDegrees*.017453293f;return false;}
     steering=wheelSteer.load(); return true;
 }
 
@@ -2199,6 +2614,8 @@ void VRHands::Install()
     CIniReader ini("");
     wheelGripRadius=ini.ReadFloat("VR","WheelGripRadius",.18f);
     wheelSteeringDegrees=ini.ReadFloat("VR","WheelSteeringDegrees",180.f);
+    cyclicTravelDegrees=ini.ReadFloat("VR","HelicopterCyclicTravelDegrees",20.f);
+    cyclicShaftLength=ini.ReadFloat("VR","HelicopterCyclicShaftLength",.32f);
     wheelRadius=ini.ReadFloat("VR","WheelRadius",.17f);
     wheelTiltDegrees=ini.ReadFloat("VR","WheelTiltDegrees",20.f);
     wheelCenterOffset[0]=ini.ReadFloat("VR","WheelCenterRight",0.f);
@@ -2211,6 +2628,8 @@ void VRHands::Install()
     if(!std::isfinite(wheelCenterOffset[1])) wheelCenterOffset[1]=0;
     if(!std::isfinite(wheelCenterOffset[2])) wheelCenterOffset[2]=0;
     if(!std::isfinite(wheelSteeringDegrees) || wheelSteeringDegrees<=0) wheelSteeringDegrees=180.f;
+    if(!std::isfinite(cyclicTravelDegrees) || cyclicTravelDegrees<=0)cyclicTravelDegrees=20.f;
+    if(!std::isfinite(cyclicShaftLength) || cyclicShaftLength<=0)cyclicShaftLength=.32f;
     throwableVelocityScale=ini.ReadFloat("VR","ThrowableVelocityScale",4.f);
     if(!std::isfinite(throwableVelocityScale)) throwableVelocityScale=4.f;
     if(!ini.ReadInteger("VR","ExperimentalHandIK",0) ||
@@ -2222,9 +2641,14 @@ void VRHands::Install()
     updateHook=safetyhook::create_inline(update.get_first(),UpdateIK);
     enabled=static_cast<bool>(updateHook);
     if(!enabled) return;
-    // #019: car-entry crash in the mesh rebinding experiment. Keep this
-    // diagnostic path out of ordinary seated-hand/steering iterations until
-    // the native resource interface and palette ownership are verified.
+    auto elbow=hook::pattern("55 8B EC 83 E4 F0 8B 55 18 8B 45 20 F3 0F 10 3A F3 0F 10 28 F3 0F 10 58 04");
+    if(elbow.size()==1)elbowPoleHook=safetyhook::create_inline(elbow.get_first(),StableBikeElbow);
+    auto bikeControl=hook::pattern("55 8B EC 83 E4 F0 83 EC 38 56 8B F1 8B 4D 08 57 80 B9 18 02 00 00 00 0F 85 ? ? ? ? 80 B9 19 02 00 00 00");
+    if(bikeControl.size()==1)bikeControlHook=safetyhook::create_inline(bikeControl.get_first(),ControlBike);
+    auto helicopterControl=hook::pattern("55 8B EC 83 E4 F0 83 EC 28 56 57 8B F9 8B 4D 08 E8 ? ? ? ? 83 3D ? ? ? ? 01 8B F0 89 74 24 1C 8D 96 08 2A 00 00");
+    if(helicopterControl.size()==1)helicopterControlHook=safetyhook::create_inline(helicopterControl.get_first(),ControlHelicopter);
+    // Optional visual-wheel adapter. Geometry format and ownership checks
+    // retain static rendering for unsupported assets.
     if(ini.ReadInteger("DEVELOPMENT","ExperimentalWheelMesh",0)!=0)
     {
         // CE CVehicle virtual +8C (A3D980), four stack args, RET10.
