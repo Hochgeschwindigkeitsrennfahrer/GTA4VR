@@ -614,9 +614,8 @@ namespace
         BindingSpec faceAndGrip[]={
             {gripValueAction,0,"/input/squeeze/value"},
             {gripValueAction,1,"/input/squeeze/value"},
-            {actions[static_cast<unsigned>(Action::Pause)],0,"/input/x/click"},
-            {actions[static_cast<unsigned>(Action::PhoneOpen)],0,"/input/x/click"},
-            {actions[static_cast<unsigned>(Action::DrivePhoneOpen)],0,"/input/x/click"},
+            // Vice City VR uses the left X button to change the station.
+            {actions[static_cast<unsigned>(Action::DriveRadioNext)],0,"/input/x/click"},
             {actions[static_cast<unsigned>(Action::Interact)],1,"/input/a/click"},
             {actions[static_cast<unsigned>(Action::Exit)],1,"/input/a/click"},
             {actions[static_cast<unsigned>(Action::Back)],1,"/input/a/click"},
@@ -636,7 +635,7 @@ namespace
             return component;
         };
         offer("/interaction_profiles/microsoft/motion_controller",wmr,nullptr,0);
-        offer("/interaction_profiles/hp/mixed_reality_controller",sticks,faceAndGrip,10);
+        offer("/interaction_profiles/hp/mixed_reality_controller",sticks,faceAndGrip,8);
         const char* touchProfiles[]={
             "/interaction_profiles/oculus/touch_controller",
             "/interaction_profiles/meta/touch_plus_controller",
@@ -645,7 +644,7 @@ namespace
             "/interaction_profiles/bytedance/pico4_controller",
             "/interaction_profiles/htc/vive_cosmos_controller",
             "/interaction_profiles/htc/vive_focus3_controller"};
-        for(const char* profile:touchProfiles) offer(profile,touch,faceAndGrip,10);
+        for(const char* profile:touchProfiles) offer(profile,touch,faceAndGrip,8);
         offer("/interaction_profiles/valve/index_controller",[](unsigned hand,const char* component)->const char*{
             if(!component) return nullptr;
             if(std::strcmp(component,"/input/trackpad")==0) return "/input/thumbstick";
@@ -862,8 +861,14 @@ namespace
                     getBool(sample.driving ? Action::DriveContextInteract : Action::ContextInteract,&available);
                     if(!available) sample.contextInteract=true;
                 }
-                // Right stick X turns. A click keeps weapon selection / jump.
-                sample.turn=sample.cycle ? 0.f : sample.trackpad[1][0];
+                // Right stick up opens the phone. Left and right still turn
+                // on foot. A click keeps jump, the horn, and weapon selection.
+                // Radio is the left X button, matching Vice City VR.
+                const float rightX=sample.trackpad[1][0],rightY=sample.trackpad[1][1];
+                const bool vertical=std::abs(rightY)>=std::abs(rightX);
+                sample.turn=sample.cycle || vertical ? 0.f : rightX;
+                if(!menu && !phone && !sample.scriptMenuActive && !sample.cycle && vertical && rightY>0.55f)
+                    sample.phoneOpen=true;
         }
         }
         sample.sampledAt=GetTickCount64();

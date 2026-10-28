@@ -66,7 +66,7 @@ There are also known stereo issues with [traffic-light lamps](https://github.com
 
 `plugins/openvr_api.dll` only answers the Vulkan renderer's extension query. It does not start SteamVR. Source for that helper is `tools/openvr-extension-helper/openvr_stub.cpp`.
 
-Suggested controller profiles include Vive wands, Index, Reverb G2, Windows Mixed Reality, Oculus Touch, and Steam Frame. One grip rotation is used for all of them. Left menu opens pause. The right stick turns on foot. Alt-tab can blank the headset until you click the game window again; VR then starts again without relaunching.
+Suggested controller profiles include Vive wands, Index, Reverb G2, Windows Mixed Reality, Oculus Touch, and Steam Frame. One grip rotation is used for all of them. Left menu opens pause. Push the right stick up to take out the phone. While driving, the left X button changes the radio station. The right stick still turns on foot. Alt-tab can blank the headset until you click the game window again; VR then starts again without relaunching.
 
 The upstream project was developed on a Vive Pro with Vive wands and SteamVR. Other headsets and controllers are not a full compatibility claim.
 
@@ -106,12 +106,12 @@ Bindings are named actions in SteamVR and can be customized. These are the curre
 | --- | --- |
 | Move | Touch the left trackpad; its outer edge jogs. Hold its click to sprint. |
 | Jump / weapon selection | Right trackpad center click jumps; left/right clicks cycle weapons. |
-| Pause / phone | Tap left Menu for pause or to skip a cutscene; hold it to open the phone, including while driving. |
+| Pause / phone | Tap left Menu for pause or to skip a cutscene. Push the right stick up to open the phone, including while driving. |
 | Fire / support | Right trigger fires on foot. Hold left grip near the weapon to support it. |
 | Grab | Grip near an object with a free hand; hold to retain it. |
 | Reload | Right grip ejects supported magazines; left grip over the shoulder retrieves ammunition. Insert it, then manipulate the slide/handle/pump as required by the weapon. Ejected magazine ammunition is discarded. |
-| Vehicle entry/exit | Right Menu. |
-| Driving | Right trigger accelerates; left trigger brakes/reverses. Touch left trackpad to steer, or grip the wheel. Right trackpad center click is handbrake; upper click is horn. |
+| Vehicle entry/exit | Right Menu, or the right A button. |
+| Driving | Right trigger accelerates; left trigger brakes/reverses. Touch the left stick to steer, or grip the wheel. Left X changes the radio station. Right stick click is the handbrake; click it upward for the horn. |
 | Armed driving | Left trigger fires the left-hand weapon; left trackpad click brakes/reverses. Right trackpad side clicks select weapons, including unarmed. |
 | Phone | Right trackpad directional clicks navigate; center confirms. Right Menu goes back. |
 | Pause menus | Point with the right controller and press the trigger; right Menu goes back. |
