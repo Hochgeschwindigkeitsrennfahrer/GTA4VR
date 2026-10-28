@@ -57,6 +57,7 @@ export namespace OpenXRVR
         bool cycle=false,nextWeapon=false,previousWeapon=false;
         float cycleDirection=0;
         bool pause=false,select[2]{},back=false;
+        float turn=0; // Right thumbstick X. Positive is stick-right.
         bool phoneOpen=false,phoneClick=false,phoneBack=false,phoneActive=false;
         float phoneDirection[2]{};
         bool phoneUp=false,phoneDown=false,phoneLeft=false,phoneRight=false,phoneAccept=false;
@@ -140,6 +141,7 @@ namespace
         PFN_xrDestroyActionSet destroyActionSet=nullptr;
         PFN_xrCreateAction createAction=nullptr;
         PFN_xrSuggestInteractionProfileBindings suggestBindings=nullptr;
+        PFN_xrGetCurrentInteractionProfile getCurrentInteractionProfile=nullptr;
         PFN_xrAttachSessionActionSets attachActionSets=nullptr;
         PFN_xrCreateActionSpace createActionSpace=nullptr;
         PFN_xrSyncActions syncActions=nullptr;
@@ -193,7 +195,8 @@ namespace
     std::atomic<bool> scriptMenuInput=false;
     OpenXRVR::PanelPointer panelPointer{};
     XrAction padAction=XR_NULL_HANDLE,clickAction=XR_NULL_HANDLE,aimAction=XR_NULL_HANDLE;
-    XrAction gripPoseAction=XR_NULL_HANDLE,gripAction=XR_NULL_HANDLE;
+    XrAction gripPoseAction=XR_NULL_HANDLE,gripAction=XR_NULL_HANDLE,gripValueAction=XR_NULL_HANDLE;
+    XrPath viveProfile=XR_NULL_PATH;
     XrAction triggerAction=XR_NULL_HANDLE,touchAction=XR_NULL_HANDLE;
     XrAction menuAction=XR_NULL_HANDLE;
     XrPath handPaths[2]{};
@@ -221,7 +224,11 @@ namespace
     }
     HMODULE openvrBootstrap=nullptr; // Retained until process exit: DXVK may use it.
     bool pendingRecreate = false;
+    uint64_t runtimeAttemptAt=0;
+    uint64_t runtimeRetryAt=0;
     bool permanentFailure = false;
+    unsigned sessionRecoveries=0;
+    bool loggedMinimized=false;
     unsigned frameCount = 0;
     std::atomic<float> displayRefreshHz{0};
     std::atomic<unsigned> producerRequest{2};
@@ -260,7 +267,6 @@ namespace
 
     void Log(const char* message)
     {
-        if(!VRDiagnostics::logging) return;
         OutputDebugStringA(message);
         OutputDebugStringA("\n");
         if (logFile == INVALID_HANDLE_VALUE) return;
@@ -363,6 +369,7 @@ namespace
             LOAD_XR(destroyActionSet,xrDestroyActionSet)
             LOAD_XR(createAction,xrCreateAction)
             LOAD_XR(suggestBindings,xrSuggestInteractionProfileBindings)
+            LOAD_XR(getCurrentInteractionProfile,xrGetCurrentInteractionProfile)
             LOAD_XR(attachActionSets,xrAttachSessionActionSets)
             LOAD_XR(createActionSpace,xrCreateActionSpace)
             LOAD_XR(syncActions,xrSyncActions)
@@ -376,7 +383,7 @@ namespace
         return true;
     }
 
-    void DestroyRuntime()
+    void DestroyRuntime(bool abandon=false)
     {
         producerRequest=2;producerActive=false;producerDeadline=0;
         displayRefreshHz=0;
@@ -386,17 +393,10 @@ namespace
         rateWindowLayers=0;
         haveEyeImages=false;
         panelActive=panelAnchored=false;
-        if((panelBridge && !panelBridge->Destroy()) || (vulkanBridge && !vulkanBridge->Destroy()))
-        {
-            // Keep session/images alive until the pending GPU work completes.
-            // A timed-out command must not leave the runtime holding freed memory.
-            running=false; permanentFailure=true;
-            AcquireSRWLockExclusive(&eyeLock);
-            eyeViewsValid=focusedEyeViews=false;
-            ReleaseSRWLockExclusive(&eyeLock);
-            Log("Vulkan copy still pending; quarantining runtime resources until process exit");
-            return;
-        }
+        // A copy can still be in flight when alt-tab resets the device. Drop
+        // that work and release the headset session; keeping it leaves a black view.
+        if(panelBridge && !panelBridge->Destroy(abandon)) panelBridge->Destroy(true);
+        if(vulkanBridge && !vulkanBridge->Destroy(abandon)) vulkanBridge->Destroy(true);
         delete vulkanBridge; vulkanBridge=nullptr;
         delete panelBridge;panelBridge=nullptr;
         if(panelChain)
@@ -454,7 +454,8 @@ namespace
         AcquireSRWLockExclusive(&eyeLock);panelPointer={};ReleaseSRWLockExclusive(&eyeLock);
         inputActions=XR_NULL_HANDLE;
         padAction=clickAction=aimAction=XR_NULL_HANDLE;
-        gripPoseAction=gripAction=XR_NULL_HANDLE;
+        gripPoseAction=gripAction=gripValueAction=XR_NULL_HANDLE;
+        viveProfile=XR_NULL_PATH;
         triggerAction=touchAction=XR_NULL_HANDLE;
         menuAction=XR_NULL_HANDLE;
         handPaths[0]=handPaths[1]=XR_NULL_PATH;
@@ -486,28 +487,24 @@ namespace
             !makeSet("phone","Phone",2,phoneActions)) return false;
         if(!Check("left hand path",api.stringToPath(instance,"/user/hand/left",&handPaths[0])) ||
             !Check("right hand path",api.stringToPath(instance,"/user/hand/right",&handPaths[1]))) return false;
-        std::vector<XrActionSuggestedBinding> bindings;
-        auto bind=[&](XrAction action,unsigned hand,const char* component){
-            if(!component) return true; // Rebindable actions without a default physical input.
-            const std::string path=std::string(hand ? "/user/hand/right":"/user/hand/left")+component;
-            XrPath xrPath=XR_NULL_PATH;
-            if(!Check("Vive binding path",api.stringToPath(instance,path.c_str(),&xrPath))) return false;
-            bindings.push_back({action,xrPath});return true;
-        };
+        struct BindingSpec { XrAction action; unsigned hand; const char* component; };
+        std::vector<BindingSpec> specs;
         auto create=[&](XrActionSet set,const char* name,const char* label,XrActionType type,XrAction& action,
             int hand,const char* component){
             XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
             strcpy_s(info.actionName,name);strcpy_s(info.localizedActionName,label);info.actionType=type;
             if(hand<0){info.countSubactionPaths=2;info.subactionPaths=handPaths;}
             if(!Check(name,api.createAction(set,&info,&action))) return false;
-            return hand<0 ? bind(action,0,component)&&bind(action,1,component):bind(action,hand,component);
+            auto remember=[&](unsigned side){ if(component) specs.push_back({action,side,component}); return true; };
+            return hand<0 ? remember(0)&&remember(1) : remember(static_cast<unsigned>(hand));
         };
         if(!create(inputActions,"thumb_direction","Thumb pose direction",XR_ACTION_TYPE_VECTOR2F_INPUT,padAction,-1,"/input/trackpad") ||
             !create(inputActions,"point_pose","Pointing pose",XR_ACTION_TYPE_POSE_INPUT,aimAction,-1,"/input/aim/pose") ||
             !create(inputActions,"hand_pose","Hand pose",XR_ACTION_TYPE_POSE_INPUT,gripPoseAction,-1,"/input/grip/pose") ||
             !create(inputActions,"close_hand","Close free hand",XR_ACTION_TYPE_BOOLEAN_INPUT,gripAction,-1,"/input/squeeze/click") ||
             !create(inputActions,"curl_index","Curl index finger",XR_ACTION_TYPE_FLOAT_INPUT,triggerAction,-1,"/input/trigger/value") ||
-            !create(inputActions,"thumb_contact","Rest thumb",XR_ACTION_TYPE_BOOLEAN_INPUT,touchAction,-1,"/input/trackpad/touch")) return false;
+            !create(inputActions,"thumb_contact","Rest thumb",XR_ACTION_TYPE_BOOLEAN_INPUT,touchAction,-1,"/input/trackpad/touch") ||
+            !create(inputActions,"grip_value","Grip analog",XR_ACTION_TYPE_FLOAT_INPUT,gripValueAction,-1,nullptr)) return false;
         auto game=[&](Action id,XrActionSet set,const char* name,const char* label,XrActionType type,int hand,const char* component){
             return create(set,name,label,type,actions[static_cast<unsigned>(id)],hand,component);
         };
@@ -566,10 +563,108 @@ namespace
             !game(Action::ScriptBack,menuActions,"interaction_back","Back / leave interaction",boolean,1,"/input/menu/click") ||
             !game(Action::Select,menuActions,"select","Select / drag",boolean,-1,"/input/trigger/click") ||
             !game(Action::Back,menuActions,"back","Back",boolean,1,"/input/menu/click")) return false;
-        XrInteractionProfileSuggestedBinding suggest{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-        if(!Check("Vive profile path",api.stringToPath(instance,"/interaction_profiles/htc/vive_controller",&suggest.interactionProfile))) return false;
-        suggest.countSuggestedBindings=static_cast<uint32_t>(bindings.size()); suggest.suggestedBindings=bindings.data();
-        if(!Check("Vive suggested bindings",api.suggestBindings(instance,&suggest))) return false;
+        // Hand poses always stay on /input/grip/pose and /input/aim/pose. Those are
+        // the runtime's palm and aim positions for that controller, so Index, Touch,
+        // Frame and the others do not reuse a Vive wand offset.
+        auto suggest=[&](const char* profile,auto map,const BindingSpec* extra,unsigned extraCount){
+            std::vector<XrActionSuggestedBinding> list;
+            auto add=[&](XrAction action,unsigned hand,const char* component){
+                if(!component) return true;
+                const char* mapped=map(hand,component);
+                if(!mapped) return true;
+                const std::string path=std::string(hand ? "/user/hand/right":"/user/hand/left")+mapped;
+                XrPath xrPath=XR_NULL_PATH;
+                if(!Check(profile,api.stringToPath(instance,path.c_str(),&xrPath))) return false;
+                list.push_back({action,xrPath});
+                return true;
+            };
+            for(const auto& spec:specs) if(!add(spec.action,spec.hand,spec.component)) return false;
+            for(unsigned index=0;index<extraCount;++index) if(!add(extra[index].action,extra[index].hand,extra[index].component)) return false;
+            if(list.empty()) return true;
+            XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+            if(!Check(profile,api.stringToPath(instance,profile,&suggested.interactionProfile))) return false;
+            suggested.countSuggestedBindings=static_cast<uint32_t>(list.size());
+            suggested.suggestedBindings=list.data();
+            return Check(profile,api.suggestBindings(instance,&suggested));
+        };
+        // Original Vive actions. Sticks replace the trackpad. Left menu still
+        // opens pause and right menu still enters a car. Touch-style controllers
+        // also accept the face buttons SteamVR uses when it remaps a Vive menu.
+        auto same=[](unsigned,const char* component){return component;};
+        auto sticks=[](unsigned,const char* component)->const char*{
+            if(!component) return nullptr;
+            if(std::strcmp(component,"/input/trackpad")==0) return "/input/thumbstick";
+            if(std::strcmp(component,"/input/trackpad/click")==0) return "/input/thumbstick/click";
+            if(std::strcmp(component,"/input/trackpad/touch")==0) return nullptr;
+            if(std::strcmp(component,"/input/squeeze/click")==0) return nullptr;
+            if(std::strcmp(component,"/input/trigger/click")==0) return nullptr;
+            return component;
+        };
+        auto touch=[](unsigned hand,const char* component)->const char*{
+            if(!component) return nullptr;
+            if(std::strcmp(component,"/input/menu/click")==0 && hand==1) return nullptr;
+            if(std::strcmp(component,"/input/trackpad")==0) return "/input/thumbstick";
+            if(std::strcmp(component,"/input/trackpad/click")==0) return "/input/thumbstick/click";
+            if(std::strcmp(component,"/input/trackpad/touch")==0) return nullptr;
+            if(std::strcmp(component,"/input/squeeze/click")==0) return nullptr;
+            if(std::strcmp(component,"/input/trigger/click")==0) return nullptr;
+            return component;
+        };
+        BindingSpec gripAnalog[2]{{gripValueAction,0,"/input/squeeze/value"},{gripValueAction,1,"/input/squeeze/value"}};
+        BindingSpec faceAndGrip[]={
+            {gripValueAction,0,"/input/squeeze/value"},
+            {gripValueAction,1,"/input/squeeze/value"},
+            {actions[static_cast<unsigned>(Action::Pause)],0,"/input/x/click"},
+            {actions[static_cast<unsigned>(Action::PhoneOpen)],0,"/input/x/click"},
+            {actions[static_cast<unsigned>(Action::DrivePhoneOpen)],0,"/input/x/click"},
+            {actions[static_cast<unsigned>(Action::Interact)],1,"/input/a/click"},
+            {actions[static_cast<unsigned>(Action::Exit)],1,"/input/a/click"},
+            {actions[static_cast<unsigned>(Action::Back)],1,"/input/a/click"},
+            {actions[static_cast<unsigned>(Action::PhoneBack)],1,"/input/a/click"},
+            {actions[static_cast<unsigned>(Action::ScriptBack)],1,"/input/a/click"}};
+        auto offer=[&](const char* profile,auto map,const BindingSpec* extra,unsigned extraCount){
+            if(!suggest(profile,map,extra,extraCount)) Log(profile);
+        };
+        if(!Check("Vive profile path",api.stringToPath(instance,"/interaction_profiles/htc/vive_controller",&viveProfile)) ||
+            !suggest("/interaction_profiles/htc/vive_controller",same,nullptr,0)) return false;
+        auto wmr=[](unsigned,const char* component)->const char*{
+            if(!component) return nullptr;
+            if(std::strcmp(component,"/input/trackpad")==0) return "/input/thumbstick";
+            if(std::strcmp(component,"/input/trackpad/click")==0) return "/input/thumbstick/click";
+            if(std::strcmp(component,"/input/trackpad/touch")==0) return nullptr;
+            if(std::strcmp(component,"/input/trigger/click")==0) return nullptr;
+            return component;
+        };
+        offer("/interaction_profiles/microsoft/motion_controller",wmr,nullptr,0);
+        offer("/interaction_profiles/hp/mixed_reality_controller",sticks,faceAndGrip,10);
+        const char* touchProfiles[]={
+            "/interaction_profiles/oculus/touch_controller",
+            "/interaction_profiles/meta/touch_plus_controller",
+            "/interaction_profiles/meta/touch_pro_controller",
+            "/interaction_profiles/bytedance/pico_neo3_controller",
+            "/interaction_profiles/bytedance/pico4_controller",
+            "/interaction_profiles/htc/vive_cosmos_controller",
+            "/interaction_profiles/htc/vive_focus3_controller"};
+        for(const char* profile:touchProfiles) offer(profile,touch,faceAndGrip,10);
+        offer("/interaction_profiles/valve/index_controller",[](unsigned hand,const char* component)->const char*{
+            if(!component) return nullptr;
+            if(std::strcmp(component,"/input/trackpad")==0) return "/input/thumbstick";
+            if(std::strcmp(component,"/input/trackpad/click")==0) return "/input/thumbstick/click";
+            if(std::strcmp(component,"/input/trackpad/touch")==0) return nullptr;
+            if(std::strcmp(component,"/input/squeeze/click")==0) return nullptr;
+            if(std::strcmp(component,"/input/menu/click")==0) return hand==0 ? "/input/system/click" : "/input/a/click";
+            return component;
+        },gripAnalog,2);
+        offer("/interaction_profiles/valve/frame_controller_valve",[](unsigned hand,const char* component)->const char*{
+            if(!component) return nullptr;
+            if(std::strcmp(component,"/input/trackpad")==0) return "/input/thumbstick";
+            if(std::strcmp(component,"/input/trackpad/click")==0) return "/input/thumbstick/click";
+            if(std::strcmp(component,"/input/trackpad/touch")==0) return nullptr;
+            if(std::strcmp(component,"/input/squeeze/click")==0) return nullptr;
+            if(std::strcmp(component,"/input/trigger/click")==0) return nullptr;
+            if(std::strcmp(component,"/input/menu/click")==0) return hand==0 ? "/input/view/click" : "/input/menu/click";
+            return component;
+        },gripAnalog,2);
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         XrActionSet sets[]{inputActions,gameplayActions,drivingActions,menuActions,systemActions,phoneActions};
         attach.countActionSets=6; attach.actionSets=sets;
@@ -583,7 +678,7 @@ namespace
             if(!Check("xrCreateActionSpace(grip)",api.createActionSpace(session,&space,&gripSpaces[hand]))) return false;
         }
         inputReady=true;
-        Log("Semantic gameplay, driving, menu and hand actions attached with Vive defaults");
+        Log("Controller grip/aim poses attached for Vive, Index, Touch, WMR, Reverb G2, Pico and Steam Frame");
         return true;
     }
 
@@ -686,7 +781,6 @@ namespace
                     sample.jump=sample.cycle=sample.nextWeapon=sample.previousWeapon=sample.interact=false;
                     sample.exitVehicle=sample.handbrake=sample.horn=sample.fireActive=false;sample.fire=sample.accelerate=0;
                 }
-                for(unsigned hand=0;hand<2;++hand)sample.select[hand]=getBool(Action::Select,nullptr,handPaths[hand]);
                 for(unsigned hand=0;hand<2;++hand)
                 {
                     XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO}; get.subactionPath=handPaths[hand];
@@ -711,6 +805,13 @@ namespace
                     {
                         sample.gripActive[hand]=true;
                         sample.gripped[hand]=grip.currentState;
+                    }
+                    XrActionStateFloat gripAnalog{XR_TYPE_ACTION_STATE_FLOAT}; get.action=gripValueAction;
+                    if(gripValueAction && api.getFloat(session,&get,&gripAnalog)==XR_SUCCESS && gripAnalog.isActive &&
+                        std::isfinite(gripAnalog.currentState))
+                    {
+                        if(!sample.gripActive[hand]) sample.gripActive[hand]=true;
+                        if(!sample.gripped[hand]) sample.gripped[hand]=gripAnalog.currentState>=0.55f;
                     }
                     XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE}; get.action=aimAction;
                     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
@@ -747,6 +848,22 @@ namespace
                         }
                     }
                 }
+                for(unsigned hand=0;hand<2;++hand)
+                {
+                    bool available=false;
+                    const bool pressed=getBool(Action::Select,&available,handPaths[hand]);
+                    sample.select[hand]=available ? pressed : sample.triggerActive[hand] && sample.trigger[hand]>=0.7f;
+                    if(!sample.padTouched[hand] && std::hypot(sample.trackpad[hand][0],sample.trackpad[hand][1])>0.2f)
+                        sample.padTouched[hand]=true;
+                }
+                if(!menu && !phone && sample.triggerActive[0] && sample.trigger[0]>=0.7f)
+                {
+                    bool available=false;
+                    getBool(sample.driving ? Action::DriveContextInteract : Action::ContextInteract,&available);
+                    if(!available) sample.contextInteract=true;
+                }
+                // Right stick X turns. A click keeps weapon selection / jump.
+                sample.turn=sample.cycle ? 0.f : sample.trackpad[1][0];
         }
         }
         sample.sampledAt=GetTickCount64();
@@ -804,11 +921,12 @@ namespace
         for (auto& item : extensions) item.type = XR_TYPE_EXTENSION_PROPERTIES;
         if (!Check("xrEnumerateInstanceExtensionProperties(list)",
             xrEnumerateInstanceExtensionProperties(nullptr, count, &count, extensions.data()))) return false;
-        bool hasD3D11 = false, hasRefreshRate=false;
+        bool hasD3D11 = false, hasRefreshRate=false, hasFrameControllers=false;
         for (const auto& item : extensions)
         {
             hasD3D11 |= std::strcmp(item.extensionName, vulkanEnabled ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
             hasRefreshRate |= std::strcmp(item.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0;
+            hasFrameControllers |= std::strcmp(item.extensionName, "XR_VALVE_frame_controller_interaction") == 0;
         }
         if (!hasD3D11) { Log("OpenXR fallback: required graphics binding unavailable"); return false; }
 
@@ -818,8 +936,12 @@ namespace
         strcpy_s(create.applicationInfo.engineName, "FusionFix");
         create.applicationInfo.engineVersion = 1;
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        const char* names[] = {vulkanEnabled ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_D3D11_ENABLE_EXTENSION_NAME,XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
-        create.enabledExtensionCount = hasRefreshRate ? 2 : 1;
+        const char* names[3]{};
+        uint32_t nameCount=0;
+        names[nameCount++]=vulkanEnabled ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
+        if(hasRefreshRate) names[nameCount++]=XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
+        if(hasFrameControllers) names[nameCount++]="XR_VALVE_frame_controller_interaction";
+        create.enabledExtensionCount = nameCount;
         create.enabledExtensionNames = names;
         if (!Check("xrCreateInstance", xrCreateInstance(&create, &instance))) return false;
         if(hasRefreshRate)
@@ -972,9 +1094,26 @@ namespace
     void Fallback(const char* reason)
     {
         Log(reason);
-        DestroyRuntime();
+        DestroyRuntime(true);
         permanentFailure = true;
         Log("OpenXR disabled for this process; flat-screen game continues");
+    }
+
+    // Focus loss and a device reset used to disable VR for the rest of the
+    // process. Tear the session down and let the next EndScene start it again.
+    void Recreate(const char* reason)
+    {
+        Log(reason);
+        if(++sessionRecoveries>8)
+        {
+            Fallback("OpenXR recovery stopped after repeated failures");
+            return;
+        }
+        DestroyRuntime(true);
+        runtimeAttemptAt=0;
+        runtimeRetryAt=0;
+        pendingRecreate=true;
+        Log("OpenXR session will be recreated");
     }
 
     void OnEndScene()
@@ -1017,8 +1156,20 @@ namespace
         if (pendingRecreate)
         {
             if(vulkanEnabled && (!RageDirect3DDevice9::m_pRealDevice || !*RageDirect3DDevice9::m_pRealDevice)) return;
+            const auto now=GetTickCount64();
+            if(!runtimeAttemptAt) runtimeAttemptAt=now;
+            if(now<runtimeRetryAt) return;
+            if (!CreateRuntime())
+            {
+                // SteamVR is often still starting when the first frame arrives.
+                // Giving up here leaves the rest of the session on the monitor.
+                DestroyRuntime(true);
+                if(now-runtimeAttemptAt<20000) {runtimeRetryAt=now+500; Log("OpenXR not ready; retrying"); return;}
+                pendingRecreate = false;
+                Fallback("OpenXR reset recreation failed");
+                return;
+            }
             pendingRecreate = false;
-            if (!CreateRuntime()) { Fallback("OpenXR reset recreation failed"); return; }
         }
         XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
         XrResult result;
@@ -1037,13 +1188,13 @@ namespace
                     XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
                     begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     if (!Check("xrBeginSession", xrBeginSession(session, &begin)))
-                    { Fallback("OpenXR begin session failed"); return; }
+                    { Recreate("OpenXR begin session failed"); return; }
                     running = true;
                 }
                 else if (sessionState == XR_SESSION_STATE_STOPPING && running)
                 {
                     if (!Check("xrEndSession", xrEndSession(session)))
-                    { Fallback("OpenXR end session failed"); return; }
+                    { Recreate("OpenXR end session failed"); return; }
                     running = false;
                     gameplayPacing=false;
                     AcquireSRWLockExclusive(&eyeLock);
@@ -1054,10 +1205,10 @@ namespace
                 }
                 else if (sessionState == XR_SESSION_STATE_LOSS_PENDING ||
                     sessionState == XR_SESSION_STATE_EXITING)
-                { Fallback("OpenXR session lost or exiting"); return; }
+                { Recreate("OpenXR session lost or exiting"); return; }
             }
             else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
-            { Fallback("OpenXR instance loss pending"); return; }
+            { Recreate("OpenXR instance loss pending"); return; }
             else if(event.type==XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB && api.getDisplayRefreshRate)
             {
                 const auto hz=reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&event)->toDisplayRefreshRate;
@@ -1066,7 +1217,7 @@ namespace
             event = {XR_TYPE_EVENT_DATA_BUFFER};
         }
         if (result != XR_EVENT_UNAVAILABLE)
-        { Fallback("xrPollEvent failed"); return; }
+        { Recreate("xrPollEvent failed"); return; }
         if (!running) return;
         auto diagnostic=producerRequest.exchange(2);
         if(producerActive && (GetTickCount64()>=producerDeadline.load() || sessionState!=XR_SESSION_STATE_FOCUSED || !haveEyeImages))diagnostic=0;
@@ -1090,7 +1241,7 @@ namespace
             result = xrWaitFrame(session, &wait, &state);
         }
         if (XR_FAILED(result))
-        { Check("xrWaitFrame", result); Fallback("OpenXR frame wait failed"); return; }
+        { Check("xrWaitFrame", result); Recreate("OpenXR frame wait failed"); return; }
         SampleControllerInput(state.predictedDisplayTime);
         if(!panelActive || !panelAnchored || sessionState!=XR_SESSION_STATE_FOCUSED) UpdatePanelPointer();
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
@@ -1105,7 +1256,7 @@ namespace
             result = api.locateViews(session, &locate, &viewState, 2, &viewCount, views);
         }
         if (XR_FAILED(result))
-        { Check("xrLocateViews", result); Fallback("OpenXR eye locate failed"); return; }
+        { Check("xrLocateViews", result); Recreate("OpenXR eye locate failed"); return; }
         const auto required = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
         AcquireSRWLockExclusive(&eyeLock);
         eyeViewsValid = viewCount == 2 && (viewState.viewStateFlags & required) == required;
@@ -1130,7 +1281,7 @@ namespace
             result = RuntimeQueueCall(VRProfile::Metric::XRQueueBegin,[&](){return xrBeginFrame(session, &begin);});
         }
         if (XR_FAILED(result))
-        { Check("xrBeginFrame", result); Fallback("OpenXR frame begin failed"); return; }
+        { Check("xrBeginFrame", result); Recreate("OpenXR frame begin failed"); return; }
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = state.predictedDisplayTime;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1140,6 +1291,26 @@ namespace
         XrCompositionLayerQuad panel{XR_TYPE_COMPOSITION_LAYER_QUAD},ray{XR_TYPE_COMPOSITION_LAYER_QUAD};
         const XrCompositionLayerBaseHeader* layers[2]{};
         bool copied=haveEyeImages && state.shouldRender && !panelActive;
+        bool windowUsable=true;
+        if(copied && RageDirect3DDevice9::m_pRealDevice && *RageDirect3DDevice9::m_pRealDevice)
+        {
+            Microsoft::WRL::ComPtr<IDirect3DSurface9> back;
+            D3DSURFACE_DESC backDesc{};
+            auto* device9=*RageDirect3DDevice9::m_pRealDevice;
+            windowUsable=SUCCEEDED(device9->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&back)) &&
+                SUCCEEDED(back->GetDesc(&backDesc)) && backDesc.Width>=640 && backDesc.Height>=480;
+            // Exclusive fullscreen alt-tab shrinks the window to 160x28.
+            // Skip the copy instead of treating that frame as a headset failure.
+            if(!windowUsable)
+            {
+                copied=false;
+                if(!loggedMinimized)
+                {
+                    loggedMinimized=true;
+                    Log("Headset picture paused while the game window is minimized");
+                }
+            }
+        }
         gameplayPacing=haveEyeImages && state.shouldRender;
         for(unsigned eye=0;eye<2 && copied;++eye)
         {
@@ -1215,11 +1386,15 @@ namespace
             layer.views=projectionViews;
             layers[0]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
             end.layerCount=1; end.layers=layers;
+            sessionRecoveries=0;
+            loggedMinimized=false;
         }
-        else if(haveEyeImages && state.shouldRender && !panelActive)
+        else if(haveEyeImages && state.shouldRender && !panelActive && windowUsable)
         {
-            // Destroying the session releases any outstanding acquisition.
-            Fallback("OpenXR eye transfer failed; returning to desktop"); return;
+            // The copy can return with a swapchain image still acquired.
+            // Destroying the session releases it, and the next frame starts again.
+            Recreate("OpenXR eye transfer failed; recreating the headset session");
+            return;
         }
         if(panelActive && panelChain && state.shouldRender && eyeViewsValid)
         {
@@ -1240,10 +1415,10 @@ namespace
             XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             if(!CheckImageStep("xrAcquireSwapchainImage(panel)",RuntimeQueueCall(VRProfile::Metric::XRQueueAcquire,
                 [&](){return api.acquireSwapchainImage(panelChain->handle,&acquire,&index);})))
-                {Fallback("Panel acquisition failed");return;}
+                {end.layerCount=0;end.layers=nullptr;xrEndFrame(session,&end);Recreate("Panel acquisition failed");return;}
             XrSwapchainImageWaitInfo waitImage{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};waitImage.timeout=1000000000;
             if(!CheckImageStep("xrWaitSwapchainImage(panel)",api.waitSwapchainImage(panelChain->handle,&waitImage)))
-                {Fallback("Panel image wait failed");return;}
+                {end.layerCount=0;end.layers=nullptr;xrEndFrame(session,&end);Recreate("Panel image wait failed");return;}
             bool done=false;
             if(vulkanEnabled)
                 done=index<panelChain->vulkanImages.size() && panelBridge->Copy(0,panelChain->vulkanImages[index].image);
@@ -1263,7 +1438,7 @@ namespace
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             if(!done || !CheckImageStep("xrReleaseSwapchainImage(panel)",RuntimeQueueCall(VRProfile::Metric::XRQueueRelease,
                 [&](){return api.releaseSwapchainImage(panelChain->handle,&release);})))
-                {Fallback("Panel transfer failed");return;}
+                {end.layerCount=0;end.layers=nullptr;xrEndFrame(session,&end);Recreate("Panel transfer failed");return;}
             panel.space=localSpace;panel.eyeVisibility=XR_EYE_VISIBILITY_BOTH;panel.pose=panelPose;
             panel.size={2.4f,2.4f*(panelHeight-4)/panelWidth};
             panel.subImage.swapchain=panelChain->handle;
@@ -1301,7 +1476,7 @@ namespace
             result = RuntimeQueueCall(VRProfile::Metric::XRQueueEnd,[&](){return xrEndFrame(session, &end);});
         }
         if (XR_FAILED(result))
-        { Check("xrEndFrame", result); Fallback("OpenXR frame end failed"); return; }
+        { Check("xrEndFrame", result); Recreate("OpenXR frame end failed"); return; }
         if(copied)
         {
             if(imagePoseTime>0 && state.predictedDisplayTime>=imagePoseTime)
@@ -1593,7 +1768,7 @@ bool OpenXRVR::SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsign
     if(haveEyeImages && (imageWidth!=width || imageHeight!=height)) return false;
     if(!haveEyeImages)
     {
-        if(!vulkanBridge->SetTextures(textures,width,height)) {Fallback("Vulkan eye texture interop incompatible");return false;}
+        if(!vulkanBridge->SetTextures(textures,width,height)) {Recreate("Vulkan eye texture interop incompatible");return false;}
         if(!eyeChains) eyeChains=new EyeSwapchain[2];
         uint32_t count=0;
         if(XR_FAILED(api.enumerateSwapchainFormats(session,0,&count,nullptr))) return false;
@@ -1608,7 +1783,7 @@ bool OpenXRVR::SetVulkanEyeImages(IDirect3DTexture9* const (&textures)[2],unsign
             create.format=VK_FORMAT_B8G8R8A8_SRGB; create.sampleCount=1;
             create.width=width; create.height=height; create.faceCount=1; create.arraySize=1; create.mipCount=1;
             if(!Check("xrCreateSwapchain(Vulkan eye)",api.createSwapchain(session,&create,&chain.handle)))
-                {Fallback("Vulkan swapchain creation failed");return false;}
+                {Recreate("Vulkan swapchain creation failed");return false;}
             uint32_t images=0;
             if(XR_FAILED(api.enumerateSwapchainImages(chain.handle,0,&images,nullptr))) return false;
             chain.vulkanImages.resize(images);
@@ -1638,28 +1813,28 @@ bool OpenXRVR::SetPanelImage(IDirect3DTexture9* texture,HANDLE shared,unsigned w
             panelBridge=new DxvkVulkan::Bridge;
             IDirect3DTexture9* textures[2]{texture,texture};
             if(!panelBridge->Attach(*RageDirect3DDevice9::m_pRealDevice) || !panelBridge->SetTextures(textures,width,height))
-                {Fallback("Panel Vulkan interop unavailable");return false;}
+                {Recreate("Panel Vulkan interop unavailable");return false;}
         }
         else if(!shared || FAILED(device->OpenSharedResource(shared,__uuidof(ID3D11Texture2D),
             reinterpret_cast<void**>(panelChain->shared.GetAddressOf()))))
-                {Fallback("Panel D3D11 shared texture unavailable");return false;}
+                {Recreate("Panel D3D11 shared texture unavailable");return false;}
         uint32_t count=0;
         if(XR_FAILED(api.enumerateSwapchainFormats(session,0,&count,nullptr)))
-            {Fallback("Panel formats unavailable");return false;}
+            {Recreate("Panel formats unavailable");return false;}
         std::vector<int64_t> formats(count);
         const int64_t format=vulkanEnabled ? static_cast<int64_t>(VK_FORMAT_B8G8R8A8_SRGB):static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
         if(XR_FAILED(api.enumerateSwapchainFormats(session,count,&count,formats.data())) ||
             std::find(formats.begin(),formats.end(),format)==formats.end())
-                {Fallback("Panel texture format unavailable");return false;}
+                {Recreate("Panel texture format unavailable");return false;}
         XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         create.format=format;create.sampleCount=1;create.width=width;create.height=height;
         create.faceCount=1;create.arraySize=1;create.mipCount=1;
         if(!Check("xrCreateSwapchain(panel)",api.createSwapchain(session,&create,&panelChain->handle)))
-            {Fallback("Panel swapchain unavailable");return false;}
+            {Recreate("Panel swapchain unavailable");return false;}
         uint32_t images=0;
         if(XR_FAILED(api.enumerateSwapchainImages(panelChain->handle,0,&images,nullptr)) || !images)
-            {Fallback("Panel images unavailable");return false;}
+            {Recreate("Panel images unavailable");return false;}
         XrResult result;
         if(vulkanEnabled)
         {
@@ -1675,7 +1850,7 @@ bool OpenXRVR::SetPanelImage(IDirect3DTexture9* texture,HANDLE shared,unsigned w
             result=api.enumerateSwapchainImages(panelChain->handle,images,&images,
                 reinterpret_cast<XrSwapchainImageBaseHeader*>(panelChain->images.data()));
         }
-        if(XR_FAILED(result)) {Fallback("Panel image enumeration failed");return false;}
+        if(XR_FAILED(result)) {Recreate("Panel image enumeration failed");return false;}
         Log("World-space loading/menu screen ready before stereo-world targets");
     }
     if(!panelActive)panelAnchored=false;
@@ -1710,7 +1885,7 @@ void OpenXRVR::Install()
     catch(...) {eyeRenderScale=1.f;Log("Invalid EyeRenderScale; using 1.0");}
     if (!enabled) return;
     wchar_t path[MAX_PATH]{};
-    if (VRDiagnostics::logging && GetModuleFileNameW(nullptr, path, MAX_PATH))
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH))
     {
         wchar_t* name = wcsrchr(path, L'\\');
         if (name)
@@ -1732,57 +1907,32 @@ void OpenXRVR::Install()
             SetEnvironmentVariableA("DXVK_DEBUG",diagnostic.c_str());
             Log("DXVK diagnostics enabled for this process; do not use for performance comparisons");
         }
-        auto bootstrap=std::filesystem::path(ini.ReadString("VR","VulkanOpenVRBootstrap",""));
-        if(bootstrap.empty())
-        {
-            // SteamVR's manifest lives beneath its installation. Respect the
-            // loader's environment override before inspecting registered runtimes.
-            wchar_t manifest[32768]{};
-            const auto length=GetEnvironmentVariableW(L"XR_RUNTIME_JSON",manifest,_countof(manifest));
-            auto findBootstrap=[](const wchar_t* runtime)->std::filesystem::path
-            {
-                auto directory=std::filesystem::path(runtime).parent_path();
-                if(!directory.is_absolute()) return {};
-                while(!directory.empty())
-                {
-                    auto candidate=directory/L"bin"/L"win32"/L"openvr_api.dll";
-                    const auto attributes=GetFileAttributesW(candidate.c_str());
-                    if(attributes!=INVALID_FILE_ATTRIBUTES && !(attributes&FILE_ATTRIBUTE_DIRECTORY)) return candidate;
-                    const auto parent=directory.parent_path();
-                    if(parent==directory) break;
-                    directory=parent;
-                }
-                return {};
-            };
-            if(length && length<_countof(manifest)) bootstrap=findBootstrap(manifest);
-            if(!length)
-            {
-                for(const auto view:{RRF_SUBKEY_WOW6432KEY,RRF_SUBKEY_WOW6464KEY})
-                {
-                    DWORD bytes=sizeof(manifest);
-                    if(RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Khronos\\OpenXR\\1",L"ActiveRuntime",
-                        RRF_RT_REG_SZ|view,nullptr,manifest,&bytes)==ERROR_SUCCESS)
-                        bootstrap=findBootstrap(manifest);
-                    if(!bootstrap.empty()) break;
-                }
-            }
-        }
-        if(!bootstrap.empty())
-        {
-            if(!bootstrap.is_absolute()) {Fallback("Vulkan bootstrap DLL path must be absolute"); return;}
-            openvrBootstrap=LoadLibraryExW(bootstrap.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-            if(!openvrBootstrap) {Fallback("Vulkan OpenVR bootstrap preload failed"); return;}
-        }
+        // DXVK only enables the Vulkan extensions OpenXR needs when it can
+        // query an OpenVR compositor. This local library answers that query
+        // and does not start SteamVR. The OpenXR loader then uses the runtime
+        // selected in Windows.
+        wchar_t gameDir[MAX_PATH]{};
+        if(!GetModuleFileNameW(nullptr,gameDir,MAX_PATH))
+            {Fallback("Could not locate the game folder for OpenXR Vulkan support"); return;}
+        wchar_t* slash=wcsrchr(gameDir,L'\\');
+        if(!slash) {Fallback("Could not locate the game folder for OpenXR Vulkan support"); return;}
+        slash[1]=L'\0';
+        if(wcscat_s(gameDir,L"plugins\\openvr_api.dll")!=0)
+            {Fallback("Could not locate the game folder for OpenXR Vulkan support"); return;}
+        openvrBootstrap=LoadLibraryW(gameDir);
+        if(!openvrBootstrap) {Fallback("OpenXR Vulkan extension helper failed to load"); return;}
         pendingRecreate=true; // Bind the actual game device on first EndScene.
-        Log("Experimental Vulkan bridge selected; waiting for game DXVK device");
+        Log("Vulkan eye copy selected; OpenXR runtime comes from Windows, not SteamVR");
     }
     else if (!CreateRuntime()) Fallback("OpenXR initialization failed");
     FusionFix::onEndScene() += []() { OnEndScene(); };
     FusionFix::onBeforeReset() += []()
     {
-        if (!enabled || permanentFailure || pendingRecreate) return;
+        if (!enabled || permanentFailure) return;
         Log("D3D9 reset: recreating OpenXR session on next EndScene");
-        DestroyRuntime();
+        DestroyRuntime(true);
+        runtimeAttemptAt=0;
+        runtimeRetryAt=0;
         pendingRecreate = true;
     };
     FusionFix::onShutdownEvent() += []()

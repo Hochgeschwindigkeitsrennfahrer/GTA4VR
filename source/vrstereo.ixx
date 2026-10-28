@@ -357,6 +357,7 @@ namespace
     unsigned completedFrame=0,completedEyes=0;
     bool captured=false;
     bool submit=false;
+    bool rebuildAfterReset=false;
     bool mirror=true;
     unsigned publishedFrame=0;
     OpenXRVR::EyeView completedViews[2]{};
@@ -3536,6 +3537,9 @@ namespace
         if(!Check("back buffer",device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&owned->originalBack))) return;
         D3DSURFACE_DESC back{};
         if(!Check("back description",owned->originalBack->GetDesc(&back)) || back.MultiSampleType!=D3DMULTISAMPLE_NONE) return;
+        // A minimized exclusive-fullscreen window is 160x28. Eye targets built
+        // from it stay black after the window returns.
+        if(back.Width<640 || back.Height<480) return;
         owned->desktopSize={back.Width,back.Height};owned->eyeSize=owned->desktopSize;
         unsigned eyeWidth=0,eyeHeight=0;
         if(OpenXRVR::GetEyeResolution(eyeWidth,eyeHeight)) owned->eyeSize={eyeWidth,eyeHeight};
@@ -4635,12 +4639,17 @@ void VRStereo::Install()
     CRenderPhaseDeferredLighting_LightsToScreen::OnAfterBuildRenderList() += [](){Marker(2,false);};
     CRenderPhaseDrawScene::OnBuildRenderList() += [](){Marker(3,true);};
     CRenderPhaseDrawScene::OnAfterBuildRenderList() += [](){Marker(3,false);};
-    FusionFix::onBeforeReset() += [](){const bool wanted=enabled; Shutdown(); enabled=wanted; stereoFrames=0;};
+    FusionFix::onBeforeReset() += [](){const bool wanted=enabled; Shutdown(); enabled=wanted; stereoFrames=0; rebuildAfterReset=true;};
     FusionFix::onEndScene() += []()
     {
         static unsigned frames=0;
         if(!enabled || !RageDirect3DDevice9::m_pRealDevice) return;
         auto* device=*RageDirect3DDevice9::m_pRealDevice;
+        if(!ready && rebuildAfterReset && device)
+        {
+            CreateResources(device);
+            if(ready) rebuildAfterReset=false;
+        }
         if(ready) {if(device && !VRHud::WantsScreen(false)) {CaptureEyes(device); PublishEyes(device);} return;}
         if(maxFrames && stereoFrames>=maxFrames) return;
         if(!CTimer::ms_bUserPause || !CTimer::ms_bScriptPause || *CTimer::ms_bUserPause || *CTimer::ms_bScriptPause) return;

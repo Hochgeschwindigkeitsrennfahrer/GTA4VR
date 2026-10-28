@@ -7,14 +7,14 @@ try {
     foreach ($entry in $archive.Entries) { $entries[$entry.FullName.Replace('\','/')] = $entry }
     $required = @('dinput8.dll', 'd3d9.dll', 'vulkan.dll', 'd3d9.cfg',
         'plugins/GTAIV.EFLC.FusionFix.asi', 'plugins/GTAIV.EFLC.FusionFix.ini',
-        'plugins/openxr_loader.dll', 'plugins/VRWeapons/pistol.ini',
+        'plugins/openxr_loader.dll', 'plugins/openvr_api.dll', 'plugins/GTAIV.EFLC.FusionFix.cfg', 'plugins/VRWeapons/pistol.ini',
         'update/01.AnimatedWeaponsVanilla/weapons.img',
         'GTA4VR-notices/DXVK-LICENSE.txt', 'GTA4VR-notices/GPL-3.0.txt',
         'GTA4VR-notices/OpenXR-LICENSE.txt', 'GTA4VR-notices/AnimatedWeapons-NOTICE.md')
     foreach ($name in $required) {
         if (-not $entries.ContainsKey($name) -or $entries[$name].Length -eq 0) { throw "Missing/empty package file: $name" }
     }
-    foreach ($name in @('dinput8.dll','d3d9.dll','vulkan.dll','plugins/GTAIV.EFLC.FusionFix.asi','plugins/openxr_loader.dll')) {
+    foreach ($name in @('dinput8.dll','d3d9.dll','vulkan.dll','plugins/GTAIV.EFLC.FusionFix.asi','plugins/openxr_loader.dll','plugins/openvr_api.dll')) {
         $stream = $entries[$name].Open()
         $buffer = [System.IO.MemoryStream]::new()
         try {

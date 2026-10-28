@@ -11,6 +11,11 @@ if not exist build\openxr-loader-win32\src\loader\Release\openxr_loader.dll (
 )
 copy /Y build\openxr-loader-win32\src\loader\Release\openxr_loader.dll data\plugins\openxr_loader.dll
 copy /Y external\openxr-sdk\LICENSE data\plugins\openxr_loader.LICENSE.txt
+if not exist tools\openvr-extension-helper\openvr_api.dll (
+    echo Missing x86 plugins\openvr_api.dll helper. Build tools\openvr-extension-helper\openvr_stub.cpp first.
+    exit /b 1
+)
+copy /Y tools\openvr-extension-helper\openvr_api.dll data\plugins\openvr_api.dll
 
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-vr-package.ps1
 if ERRORLEVEL 1 exit /b 1

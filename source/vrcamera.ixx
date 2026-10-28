@@ -89,6 +89,8 @@ namespace
     void AudioListenerSpatial(SafetyHookContext& regs) {AudioListenerInput(regs,0);}
     void AudioListenerDistance(SafetyHookContext& regs) {AudioListenerInput(regs,1);}
     std::atomic<bool> recenter{true};
+    float stickYawDegrees=0;
+    uint64_t stickTurnAt=0;
     VRMath::Matrix referenceInverse{};
     bool probeAnchor=false;
     bool firstPerson=false;
@@ -750,7 +752,8 @@ namespace
         // its own skip handler owns skip eligibility and mission bookkeeping.
         if(inCutscene && down && !leftHeld && input.pause)
         {cutsceneSkipUntil=now+100;holdConsumed=true;}
-        const bool directPause=!inCutscene && down && !leftHeld && input.pause && (inMenu || !input.phoneOpen);
+        // Left menu opens pause on the press. Phone still waits for a hold.
+        const bool directPause=!inCutscene && down && !leftHeld && input.pause;
         // A runtime long-press binding delivers PhoneOpen separately. Execute
         // immediately; only the shared suggested click needs our fallback timer.
         if(down && !inMenu && !inCutscene && input.phoneOpen && !holdConsumed &&
@@ -1743,6 +1746,8 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
         std::memcpy(gameCamera.data(),base.mViewInverseMatrix,sizeof(gameCamera));
         if (recenter.exchange(false))
         {
+            stickYawDegrees=0;
+            stickTurnAt=0;
             float center[3]{};
             for(unsigned i=0;i<3;++i) center[i]=(eyes[0].position[i]+eyes[1].position[i])*.5f;
             // Initial prototype uses the first eye orientation as the center
@@ -1828,6 +1833,35 @@ bool VRCamera::Generate(const rage::grcViewport& base, const OpenXRVR::EyeView (
             for(unsigned axis=0;axis<2;++axis)
                 gameCamera[3][axis]=bodyAnchor[axis]-processedRoomPosition[axis];
             ReleaseSRWLockExclusive(&roomLock);
+        }
+        if(useFirstPerson && !vehicle && !animated && !ragdoll)
+        {
+            const bool menu=CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+            OpenXRVR::ControllerInput input{};
+            if(!menu && OpenXRVR::GetControllerInput(input))
+            {
+                const auto now=GetTickCount64();
+                float dt=stickTurnAt ? static_cast<float>(now-stickTurnAt)/1000.f : 0.f;
+                stickTurnAt=now;
+                if(dt>0.05f) dt=0.05f;
+                const float axis=input.turn;
+                const float magnitude=std::fabs(axis);
+                if(magnitude>0.22f && dt>0.f)
+                {
+                    const float shaped=std::copysign((magnitude-0.22f)/0.78f,axis);
+                    // Positive heading is a left turn. Stick-right turns right.
+                    stickYawDegrees-=shaped*110.f*dt;
+                }
+            }
+            if(stickYawDegrees!=0.f)
+            {
+                float heading=0;
+                if(VRMath::LevelHeading(gameCamera,heading))
+                {
+                    const auto position=gameCamera[3];
+                    gameCamera=VRMath::UprightGameCamera(heading*57.2957795f+stickYawDegrees,position);
+                }
+            }
         }
         for(const auto& row:gameCamera)
             for(float value:row)

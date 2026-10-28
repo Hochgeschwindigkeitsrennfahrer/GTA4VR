@@ -800,6 +800,7 @@ bool VRHud::PublishScreen(IDirect3DDevice9* device,bool loading)
     ComPtr<IDirect3DSurface9> source;
     D3DSURFACE_DESC desc{};
     if(FAILED(device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&source)) || FAILED(source->GetDesc(&desc))) return true;
+    if(desc.Width<640 || desc.Height<480) return false;
     if(!screenTexture)
     {
         if(FAILED(device->CreateTexture(desc.Width,desc.Height+4,1,D3DUSAGE_RENDERTARGET,D3DFMT_A8R8G8B8,

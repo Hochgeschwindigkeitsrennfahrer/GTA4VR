@@ -2751,7 +2751,10 @@ void VRHands::Install()
     }
     for(unsigned hand=0;hand<2;++hand)
     {
-        const auto value=ini.ReadString("VR",hand==0 ? "HandGripRotationLeft" : "HandGripRotationRight","");
+        // Quest 3 grip-to-wrist offsets. Touch-style controllers share this layout.
+        const char* fallback=hand==0 ? "0.5 0.5 -0.5 0.5" : "-0.5 0.5 0.5 0.5";
+        auto value=ini.ReadString("VR",hand==0 ? "HandGripRotationLeft" : "HandGripRotationRight","");
+        if(value.find_first_of("0123456789-+.")==std::string::npos) value=fallback;
         float quaternion[4]{}; char trailing=0;
         if(sscanf_s(value.c_str(),"%f %f %f %f %c",&quaternion[0],&quaternion[1],&quaternion[2],&quaternion[3],&trailing,1u)!=4) continue;
         bool finite=true;

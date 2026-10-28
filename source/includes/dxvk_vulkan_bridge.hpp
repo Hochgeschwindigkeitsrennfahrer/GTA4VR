@@ -144,10 +144,20 @@ struct Bridge {
         if(completed!=VK_SUCCESS) return false;
         restore(); return true;
     }
-    bool Destroy() {
+    // abandon=true is the device-reset path. The fence cannot signal while D3D9
+    // is inside Reset, and waiting here leaves the headset session stuck on black.
+    bool Destroy(bool abandon=false) {
         if(pending) {
-            const auto done=WaitForFences(device,1,&fence,VK_TRUE,1'000'000'000);
-            if(done!=VK_SUCCESS && done!=VK_ERROR_DEVICE_LOST) return false;
+            const auto done=WaitForFences(device,1,&fence,VK_TRUE,abandon ? 0ull : 1'000'000'000ull);
+            if(done!=VK_SUCCESS && done!=VK_ERROR_DEVICE_LOST) {
+                if(!abandon) return false;
+                pending=false;
+                fence=VK_NULL_HANDLE; pool=VK_NULL_HANDLE; command=VK_NULL_HANDLE;
+                for(unsigned i=0;i<2;++i) {textureInterop[i].Reset();textures[i].Reset();sources[i]=0;}
+                interop.Reset(); instance=nullptr; physical=nullptr; device=nullptr; queue=nullptr;
+                if(loader) FreeLibrary(loader); loader=nullptr;
+                return true;
+            }
             pending=false;
         }
         if(fence) DestroyFence(device,fence,nullptr);

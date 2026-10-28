@@ -62,23 +62,29 @@ There are also known stereo issues with [traffic-light lamps](https://github.com
 
 ## Headsets and controllers
 
-**VR testing has only been done with a Vive headset and Vive Wands, using SteamVR on Windows.** The recorded development setup is a VIVE Pro at 90 Hz, GTA IV Complete Edition 1.2.0.59 and the DXVK/Vulkan rendering path.
+**This fork was used with an HP Reverb G2 and Windows Mixed Reality as the OpenXR runtime.** The game renders with Vulkan. Windows Mixed Reality does not accept Vulkan frames, so install the [Vulkan-to-Direct3D 12 OpenXR API layer](https://github.com/mbucchia/OpenXR-Vk-D3D12) first. SteamVR does not have to be running, and it does not have to be the Windows OpenXR runtime.
+
+`plugins/openvr_api.dll` only answers the Vulkan renderer's extension query. It does not start SteamVR. Source for that helper is `tools/openvr-extension-helper/openvr_stub.cpp`.
+
+Suggested controller profiles include Vive wands, Index, Reverb G2, Windows Mixed Reality, Oculus Touch, and Steam Frame. One grip rotation is used for all of them. Left menu opens pause. The right stick turns on foot. Alt-tab can blank the headset until you click the game window again; VR then starts again without relaunching.
+
+The upstream project was developed on a Vive Pro with Vive wands and SteamVR. Other headsets and controllers are not a full compatibility claim.
 
 | Configuration | What to expect |
 | --- | --- |
-| Tested Vive + Wands + SteamVR setup | The reference configuration for the features described above; known limitations still apply. |
-| Other headsets through SteamVR | Headset rendering and tracking are plausible because the mod uses OpenXR. This is an engineering expectation, **not tested compatibility**. |
-| Index, Touch or other controllers | Untested. The code currently supplies default bindings only for the Vive controller profile. Expect custom SteamVR bindings and possibly code changes or hand/weapon pose calibration; plug-and-play support is not promised. |
-| Other OpenXR runtimes, standalone headsets without PC streaming, or Linux/Proton | Untested. The current Vulkan bootstrap is SteamVR-specific; OpenXR support alone does not establish compatibility. |
+| Reverb G2 + Windows Mixed Reality + the Vulkan API layer | The setup used for this fork. |
+| SteamVR as the OpenXR runtime | Still possible. Quit SteamVR first if you want Windows Mixed Reality to own the headset. |
+| Index, Touch, Steam Frame, and other listed controllers | Profiles are suggested. Hand orientation uses the shared grip rotation. Not each profile was played through a full session. |
+| Runtimes without Vulkan and without the API layer | The headset stays flat. |
 
 There is not enough testing to give a meaningful percentage chance that another configuration will work. Other SteamVR headsets are a more plausible first experiment than changing both the runtime and controllers. Headset compatibility and usable controller bindings are separate questions. See the [OpenXR interaction-profile specification](https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html#semantic-paths-interaction-profiles) for the underlying input model.
 
 ## Installation
 
-1. Install the official Windows **GTA IV: The Complete Edition** and [SteamVR](https://store.steampowered.com/app/250820/SteamVR/). In SteamVR settings, make SteamVR the active OpenXR runtime.
-2. Download **GTA4VR.zip** from [Releases](https://github.com/bordplate/GTA4VR/releases/latest).
-3. Extract its contents directly into the game folder containing **GTAIV.exe**. For Steam, this is normally `steamapps/common/Grand Theft Auto IV/GTAIV`. Allow the mod files to merge/replace after backing up any existing mod installation.
-4. Start SteamVR, turn on your headset/controllers, then launch the game normally.
+1. Install the official Windows **GTA IV: The Complete Edition**. Use the OpenXR runtime already selected in Windows. For Windows Mixed Reality, install the [Vulkan-to-Direct3D 12 OpenXR API layer](https://github.com/mbucchia/OpenXR-Vk-D3D12). Quit SteamVR if it is running and you want that runtime to keep the headset.
+2. Download **GTA4VR.zip** from [Releases](https://github.com/Hochgeschwindigkeitsrennfahrer/GTA4VR/releases/latest).
+3. Extract its contents directly into the game folder containing **GTAIV.exe**. For Steam, this is normally `steamapps/common/Grand Theft Auto IV/GTAIV`. Allow the mod files to merge/replace after backing up any existing mod installation. Your `plugins/GTAIV.EFLC.FusionFix.ini` height and crouch values are replaced by the package defaults if you overwrite that file.
+4. Put the headset on, then launch the game normally.
 
 **You do not need a separate FusionFix.** The package includes the FusionFix base, ASI loader, DXVK, OpenXR loader, and VR configuration.
 
